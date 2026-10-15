@@ -2,15 +2,40 @@
 //!
 //! 对上暴露统一的 Git 能力接口，对下按操作类型路由到三种实现：
 //!
-//! - [`BackendRoute::Gix`]：进程内纯 Rust 读热路径（packfile 走 mmap，不产生进程）；
-//! - [`BackendRoute::Git2`]：libgit2 绑定，承担 gix 尚未覆盖的写操作；
-//! - [`BackendRoute::Cli`]：git 可执行文件子进程，作为语义完整性的兜底与真相标准。
+//! - [`GitRepo`]：进程内 `gix` 读热路径（packfile 走 mmap，不产生进程）；
+//! - `git2`：libgit2 绑定，承担 `gix` 尚未覆盖的写操作（M2 引入）；
+//! - [`GitCli`]：git 可执行文件子进程，作为语义完整性的兜底与真相标准。
 //!
 //! 路由表见架构规划 3.2 节。该 crate 独立存在的核心理由是：内核路由是本项目最大的
 //! 技术风险，独立后可在不启动 GUI 的前提下对真实仓库执行
-//! "gix 结果 vs git CLI 结果"的对比测试（架构规划 4.4、7.1）。
+//! "gix 结果 vs git CLI 结果"的对比测试（架构规划 4.4、7.1）——
+//! `tests/consistency.rs` 即该测试套件。
 //!
-//! 本 crate 在阶段 0 仅完成骨架，读路径实现按实施计划 M1 任务 1-2 落地。
+//! # M1 覆盖范围
+//!
+//! | 能力 | 实现 | 需求 |
+//! |---|---|---|
+//! | 打开 / 发现仓库（含 worktree） | [`GitRepo::open`] | FR-MR-01 |
+//! | HEAD 与引用列表 | [`GitRepo::head`]、[`GitRepo::refs`] | FR-LOG-02 |
+//! | revwalk 与提交元数据 | [`GitRepo::walk_ids`]、[`GitRepo::commit_metas`] | FR-LOG-01 |
+//! | 工作区状态（porcelain 口径） | [`GitRepo::status`] | FR-LC-01 |
+//! | 树差异与 blob 读取 | [`GitRepo::tree_changes`]、[`GitRepo::blob_at`] | FR-DIF-01/03 |
+//! | 进行中操作探测 | [`GitRepo::repo_state`] | FR-STA-02 |
+//! | git 可执行文件探测与执行 | [`GitCli`] | FR-STA-04、FR-RMT-05 |
+//! | 命令审计记录 | [`CommandRecord`]、[`CommandObserver`] | FR-CON-01 |
+
+pub mod cli;
+pub mod error;
+pub mod record;
+pub mod repo;
+
+pub use cli::{CliOutput, GitCli, LOCAL_TIMEOUT, NETWORK_TIMEOUT};
+pub use error::{BackendError, Result};
+pub use record::{
+    noop_observer, CommandObserver, CommandRecord, CommandRoute, NoopObserver, SharedObserver,
+    MAX_CAPTURE_BYTES,
+};
+pub use repo::{BlobPair, GitRepo, RepoLocation, SharedGitRepo};
 
 use gt_core::RepoId;
 
@@ -29,10 +54,22 @@ pub enum BackendRoute {
     Cli,
 }
 
+impl BackendRoute {
+    /// 转换为审计记录使用的路由标签。
+    #[must_use]
+    pub const fn as_command_route(self) -> CommandRoute {
+        match self {
+            Self::Gix => CommandRoute::Gix,
+            Self::Git2 => CommandRoute::Git2,
+            Self::Cli => CommandRoute::Cli,
+        }
+    }
+}
+
 /// 一次 Git 操作的执行上下文。
 ///
-/// 阶段 0 仅含最小字段；M1 将扩展为"请求代次 + 取消令牌 + 仓库句柄"的组合，
-/// 以支撑架构规划 4.3 的非阻塞请求生命周期。
+/// M2 起扩展为"请求代次 + 取消令牌 + 仓库句柄"的组合，以支撑架构规划 4.3
+/// 的非阻塞请求生命周期；M1 只承载仓库与路由。
 #[derive(Debug, Clone, Copy)]
 pub struct RequestContext {
     /// 目标仓库。
@@ -53,5 +90,6 @@ mod tests {
             route: BackendRoute::Cli,
         };
         assert_eq!(ctx.route, BackendRoute::Cli);
+        assert_eq!(ctx.route.as_command_route().label(), "git 子进程");
     }
 }

@@ -39,6 +39,20 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
+# ---- Git 内核（M1 引入，路由表见架构规划 3.2）----
+# 默认特性已含 basic（blob-diff / revision / index）、extras（status / blame /
+# merge / dirwalk 等）与 max-performance-safe，无需再显式挑选子特性。
+gix = "0.87"
+# Histogram 差异算法（gt-diff）。比 Myers 快 10%–100%，比 similar 快至多 30×。
+imara-diff = "0.2"
+
+# ---- 服务调度层（M1 引入）----
+# 请求代次通道：需要"合并同代次结果"与有界队列（架构规划 3.3 / 附录 A）。
+crossbeam-channel = "0.5"
+# 文件变更监听：notify 8 为稳定线，notify-debouncer-full 0.7 依赖 notify ^8.2。
+notify = "8.2"
+notify-debouncer-full = "0.7"
+
 # ---- GUI（阶段 0 验证软件渲染与多窗口路径）----
 # 使用 Slint 默认特性：已同时包含 renderer-software（软件渲染，低内存路线前提，
 # 架构规划 2.3）与 renderer-femtovg（GPU 后端，保留用于内存 A/B 对比），
@@ -46,16 +60,11 @@ toml = "0.8"
 slint = { version = "1" }
 slint-build = "1"
 
-# ---- 后续里程碑引入（M1 起，此处仅登记意图，避免过早锁定版本）----
-# gix            —— Git 读热路径（架构规划 3.2）
-# git2           —— Git 写补充
-# imara-diff     —— Histogram 差异算法（gt-diff）
-# notify         —— 文件变更监听 + 去抖（gt-service）
-# crossbeam-channel —— 请求代次通道（gt-service）
-# parking_lot    —— 仓库级锁（gt-service）
+# ---- 后续里程碑引入（此处仅登记意图，避免过早锁定版本）----
+# git2           —— Git 写补充（M2 起：暂存 / merge / cherry-pick）
+# parking_lot    —— 仓库级锁（M2 起）
 # keyring        —— 凭据存储（M3）
 # syntect        —— 语法高亮（M5）
-# sysinfo        —— 内存基线采集（M0 POC-1）
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -70,3 +79,14 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
+
+# ---- 发布构建（架构规划 5.10）----
+# 这几项不是"可选的优化开关"，而是低内存 + 小体积路线的架构约束：
+[profile.release]
+# 跨 crate 内联：`gt-*` 之间是薄封装，不开启会让调用链留在原地。
+lto = "fat"
+codegen-units = 1
+# 必须保留 unwind —— 工作线程靠 `catch_unwind` 做崩溃隔离（FR-STA-01）。
+# 改成 "abort" 会让"单个仓库的对象库损坏"直接带走整个进程。
+panic = "unwind"
+strip = true

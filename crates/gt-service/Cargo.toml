@@ -12,3 +12,10 @@ workspace = true
 
 [dependencies]
 gt-core.workspace = true
+gt-backend.workspace = true
+gt-diff.workspace = true
+crossbeam-channel.workspace = true
+notify.workspace = true
+notify-debouncer-full.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

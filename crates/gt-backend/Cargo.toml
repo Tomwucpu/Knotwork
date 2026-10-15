@@ -1,6 +1,6 @@
 [package]
 name = "gt-backend"
-description = "Git 内核抽象层：统一 trait，路由到 gix / git2 / git CLI"
+description = "Git 内核抽象层：gix 读路径、CLI 兜底与命令审计"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,3 +12,6 @@ workspace = true
 
 [dependencies]
 gt-core.workspace = true
+gix.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

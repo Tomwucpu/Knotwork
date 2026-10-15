@@ -22,6 +22,7 @@ gt-diff.workspace = true
 gt-graph.workspace = true
 gt-config.workspace = true
 gt-ui.workspace = true
+crossbeam-channel.workspace = true
 slint.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -12,3 +12,14 @@ workspace = true
 
 [dependencies]
 gt-core.workspace = true
+gt-backend.workspace = true
+gt-service.workspace = true
+gt-diff.workspace = true
+gt-graph.workspace = true
+gt-config.workspace = true
+crossbeam-channel.workspace = true
+slint.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true

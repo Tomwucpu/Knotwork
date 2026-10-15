@@ -1,0 +1,927 @@
+// Knotwork 主窗口（M1：只读纵切）。
+//
+// 结构自上而下：标题栏 → 横幅 → 主体（左：引用列表；右：Log + Diff）→ 底部面板 → 状态栏。
+//
+// 三条渲染纪律（架构规划第 5 节）：
+//   1. 列表全虚拟化 —— 用 ListView，只创建视口内的行；
+//   2. 泳道图按行自绘 —— Rust 侧把布局算成"每列一个格子"，界面只负责画；
+//   3. 词级高亮按"分段文本"传入 —— 界面不做文本测量，避免每帧重排。
+
+import { ListView } from "std-widgets.slint";
+
+// ---------------------------------------------------------------- 数据结构
+
+// 尺寸常量。Slint 1.x 没有文件级 `const`，因此用只读的 global 承载；
+// 布局里一律引用它，避免"同一个数字散落在多处、改一处漏一处"。
+global Metrics {
+    out property <length> lane-width: 12px;
+    out property <length> log-row-height: 24px;
+}
+
+// 引用列表的一行。
+export struct RefEntry {
+    name: string,
+    kind: string,
+    is-head: bool,
+    sync: string,
+}
+
+// 泳道图的一列：0 = 空，1 = 竖向连线，2 = 本行节点。
+export struct GraphCell {
+    kind: int,
+    color: color,
+}
+
+// 日志列表的一行。
+export struct LogRow {
+    short-id: string,
+    subject: string,
+    author: string,
+    when: string,
+    refs-text: string,
+    is-selected: bool,
+    graph: [GraphCell],
+}
+
+// 本地更改列表的一行。
+export struct ChangeRow {
+    path: string,
+    code: string,
+    bucket: string,
+    note: string,
+    is-selected: bool,
+}
+
+// Diff 的一行：`segments` 与 `changed` 一一对应（词级高亮的分段文本）。
+export struct DiffRow {
+    kind: int,
+    old-no: string,
+    new-no: string,
+    segments: [string],
+    changed: [bool],
+    is-hunk-header: bool,
+}
+
+// Console 的一行。
+export struct ConsoleRow {
+    route: string,
+    summary: string,
+    detail: string,
+    ok: bool,
+}
+
+// 最近仓库的一项。
+export struct RecentRow {
+    name: string,
+    path: string,
+}
+
+// ---------------------------------------------------------------- 子组件
+
+component FlatButton inherits Rectangle {
+    in property <string> text;
+    callback clicked();
+
+    width: max(48px, label.preferred-width + 16px);
+    height: 22px;
+    background: touch.pressed ? #3d3f42 : (touch.has-hover ? #35373a : #303236);
+    border-radius: 3px;
+
+    label := Text {
+        text: root.text;
+        color: #dfe1e5;
+        font-size: 11px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+component TabButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked();
+
+    width: max(120px, label.preferred-width + 20px);
+    height: 28px;
+    background: root.active ? #26272b : transparent;
+
+    label := Text {
+        text: root.text;
+        color: root.active ? #e8eaed : #9aa0a6;
+        font-size: 12px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    Rectangle {
+        width: 100%;
+        height: 2px;
+        y: 26px;
+        background: #4a8cff;
+        visible: root.active;
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// 日志行：左侧泳道图 + 提交信息。
+component LogRowView inherits Rectangle {
+    in property <string> short-id;
+    in property <string> subject;
+    in property <string> author;
+    in property <string> when;
+    in property <string> refs-text;
+    in property <[GraphCell]> graph;
+    in property <bool> is-selected;
+    callback clicked();
+
+    background: root.is-selected ? #35507a : (touch.has-hover ? #2b2d30 : transparent);
+
+    HorizontalLayout {
+        spacing: 0px;
+
+        // 泳道图：每列一个格子，格子内部自绘连线与节点。
+        Rectangle {
+            width: root.graph.length * Metrics.lane-width;
+            height: 100%;
+
+            HorizontalLayout {
+                spacing: 0px;
+
+                for cell in root.graph: Rectangle {
+                    width: Metrics.lane-width;
+
+                    // 竖向连线：节点所在列也画，看起来才是连续的一条线。
+                    Rectangle {
+                        x: 5px;
+                        width: 2px;
+                        height: 100%;
+                        background: cell.color;
+                        visible: cell.kind == 1 || cell.kind == 2;
+                    }
+
+                    // 本行节点圆点（行高 24px、圆点 9px → 上下各留 7px 与 8px）。
+                    Rectangle {
+                        x: 1px;
+                        y: 7px;
+                        width: 9px;
+                        height: 9px;
+                        border-radius: 5px;
+                        background: cell.color;
+                        visible: cell.kind == 2;
+                    }
+                }
+            }
+        }
+
+        Text {
+            width: 62px;
+            text: root.short-id;
+            color: #8b9198;
+            font-size: 11px;
+            vertical-alignment: center;
+            font-family: "Consolas";
+        }
+
+        Text {
+            width: 150px;
+            text: root.refs-text;
+            color: #f0b429;
+            font-size: 11px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            horizontal-stretch: 1;
+            text: root.subject;
+            color: #e8eaed;
+            font-size: 12px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            width: 120px;
+            text: root.author;
+            color: #9aa0a6;
+            font-size: 11px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            width: 130px;
+            text: root.when;
+            color: #8b9198;
+            font-size: 11px;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// Diff 行：行号槽 + 分段文本（词级高亮靠分段着色，不做文本测量）。
+component DiffRowView inherits Rectangle {
+    in property <int> kind;
+    in property <string> old-no;
+    in property <string> new-no;
+    in property <[string]> segments;
+    in property <[bool]> changed;
+    in property <bool> is-hunk-header;
+
+    // kind: 0 上下文、1 新增、2 删除、3 元信息
+    background: root.kind == 1 ? #1f3a24 : (root.kind == 2 ? #3a1f22 : (root.is-hunk-header ? #2b2d30 : transparent));
+
+    HorizontalLayout {
+        spacing: 0px;
+
+        Text {
+            width: 46px;
+            text: root.old-no;
+            color: #6b7075;
+            font-size: 11px;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            font-family: "Consolas";
+        }
+
+        Text {
+            width: 46px;
+            text: root.new-no;
+            color: #6b7075;
+            font-size: 11px;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            font-family: "Consolas";
+        }
+
+        Rectangle { width: 6px; }
+
+        // 分段文本：每段单独着色，段边界由 Rust 侧算出。
+        HorizontalLayout {
+            horizontal-stretch: 1;
+            spacing: 0px;
+
+            for segment[i] in root.segments: Text {
+                text: segment;
+                color: root.changed[i] ? #ffd166 : (root.kind == 2 ? #f2a6ab : (root.kind == 1 ? #a6e3b5 : #c8ccd1));
+                font-size: 12px;
+                vertical-alignment: center;
+                font-family: "Consolas";
+            }
+        }
+    }
+}
+
+// 本地更改行。
+component ChangeRowView inherits Rectangle {
+    in property <string> path;
+    in property <string> code;
+    in property <string> bucket;
+    in property <string> note;
+    in property <bool> is-selected;
+    callback clicked();
+
+    background: root.is-selected ? #35507a : (touch.has-hover ? #2b2d30 : transparent);
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 8px;
+
+        Text {
+            width: 130px;
+            text: root.bucket;
+            color: #9aa0a6;
+            font-size: 11px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            width: 26px;
+            text: root.code;
+            color: #f0b429;
+            font-size: 11px;
+            vertical-alignment: center;
+            font-family: "Consolas";
+        }
+
+        Text {
+            horizontal-stretch: 1;
+            text: root.path;
+            color: #dfe1e5;
+            font-size: 12px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            width: 150px;
+            text: root.note;
+            color: #8b9198;
+            font-size: 11px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// Console 行。
+component ConsoleRowView inherits Rectangle {
+    in property <string> route;
+    in property <string> summary;
+    in property <string> detail;
+    in property <bool> ok;
+
+    background: transparent;
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 8px;
+
+        Text {
+            width: 92px;
+            text: root.route;
+            color: root.ok ? #6ee7b7 : #f2a6ab;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+
+        Text {
+            horizontal-stretch: 1;
+            text: root.summary;
+            color: #c8ccd1;
+            font-size: 11px;
+            vertical-alignment: center;
+            overflow: elide;
+            font-family: "Consolas";
+        }
+
+        Text {
+            width: 240px;
+            text: root.detail;
+            color: #8b9198;
+            font-size: 11px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+// ---------------------------------------------------------------- 主窗口
+
+export component MainWindow inherits Window {
+    // ---- 仓库与状态 ----
+    in-out property <string> repo-title: "Knotwork";
+    in-out property <string> repo-path: "";
+    in-out property <string> branch-text: "—";
+    in-out property <string> head-text: "—";
+    in-out property <string> git-text: "";
+    in-out property <string> state-text: "";
+    in-out property <bool> state-banner-visible: false;
+
+    // ---- 侧栏 ----
+    in-out property <[RefEntry]> sidebar-refs: [];
+
+    // ---- 空状态（未打开仓库）----
+    in-out property <bool> has-repo: false;
+    in-out property <string> open-path: "";
+    in-out property <string> empty-message: "输入仓库路径后打开，或从下方最近仓库中选择。";
+    in-out property <[RecentRow]> recent: [];
+
+    // ---- 日志面板 ----
+    in-out property <[LogRow]> log-rows: [];
+    in-out property <string> log-summary: "";
+    in-out property <int> log-total: 0;
+    in-out property <bool> log-loading: false;
+
+    // ---- Diff 面板 ----
+    in-out property <[DiffRow]> diff-rows: [];
+    in-out property <string> diff-title: "差异";
+    in-out property <string> diff-stats: "";
+    in-out property <bool> diff-loading: false;
+
+    // ---- 本地更改 ----
+    in-out property <[ChangeRow]> change-rows: [];
+    in-out property <string> change-summary: "";
+
+    // ---- Console ----
+    in-out property <[ConsoleRow]> console-rows: [];
+    in-out property <string> console-summary: "";
+
+    // ---- 底部面板标签：0 = 本地更改，1 = Console ----
+    in-out property <int> bottom-tab: 0;
+
+    // ---- 能力提示（FR-STA-04）----
+    in-out property <bool> cli-missing: false;
+    in-out property <string> cli-missing-reason: "";
+
+    callback poll();
+    callback refresh();
+    callback open-repo(string);
+    callback select-log(int);
+    callback select-change(int);
+    callback export-console();
+    callback clear-console();
+    callback use-recent(string);
+
+    title: repo-title;
+    width: 1180px;
+    height: 780px;
+    background: #1e1f22;
+
+    // 每 100ms 向 Rust 侧要一次异步结果（UI 线程只做搬运，不做 I/O）。
+    Timer {
+        interval: 100ms;
+        running: true;
+        triggered => { root.poll(); }
+    }
+
+    VerticalLayout {
+        padding: 0px;
+        spacing: 0px;
+
+        // ---------------------------------------------------- 标题栏
+        Rectangle {
+            height: 44px;
+            background: #2b2d30;
+
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 10px;
+                spacing: 10px;
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 1px;
+
+                    Text {
+                        text: root.repo-title;
+                        color: #e8eaed;
+                        font-size: 15px;
+                        font-weight: 600;
+                    }
+
+                    Text {
+                        text: root.repo-path;
+                        color: #8b9198;
+                        font-size: 11px;
+                        overflow: elide;
+                    }
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                Text {
+                    text: root.branch-text;
+                    color: #6ee7b7;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.head-text;
+                    color: #8b9198;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+
+                FlatButton {
+                    text: "刷新";
+                    clicked => { root.refresh(); }
+                }
+            }
+        }
+
+        // ---------------------------------------------------- 进行中操作横幅
+        Rectangle {
+            height: root.state-banner-visible ? 30px : 0px;
+            background: #7a5c00;
+            visible: root.state-banner-visible;
+
+            Text {
+                x: 14px;
+                text: root.state-text;
+                color: #ffe9a8;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+        }
+
+        // ---------------------------------------------------- git 缺失降级提示
+        Rectangle {
+            height: root.cli-missing ? 46px : 0px;
+            background: #5a2a2a;
+            visible: root.cli-missing;
+
+            Text {
+                x: 14px;
+                y: 6px;
+                width: parent.width - 28px;
+                text: root.cli-missing-reason;
+                color: #ffd4d4;
+                font-size: 12px;
+                vertical-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+
+        // ---------------------------------------------------- 主体
+        HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: 0px;
+
+            // 左：引用列表
+            Rectangle {
+                width: 240px;
+                background: #26272b;
+                visible: root.has-repo;
+
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 8px;
+
+                    Text {
+                        text: "分支与标签";
+                        color: #bdc1c6;
+                        font-size: 12px;
+                        font-weight: 600;
+                    }
+
+                    Rectangle { height: 1px; background: #3c3f41; }
+
+                    ListView {
+                        vertical-stretch: 1;
+                        for entry in root.sidebar-refs: Rectangle {
+                            height: 22px;
+                            background: entry.is-head ? #35507a : transparent;
+
+                            Text {
+                                x: 6px;
+                                text: entry.name + entry.sync;
+                                color: entry.is-head ? #ffffff : #c8ccd1;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 右：Log + Diff
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 0px;
+
+                // Log 面板
+                VerticalLayout {
+                    vertical-stretch: 3;
+                    spacing: 0px;
+
+                    Rectangle {
+                        height: 28px;
+                        background: #2b2d30;
+
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 10px;
+
+                            Text {
+                                text: "提交历史";
+                                color: #e8eaed;
+                                font-size: 12px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+
+                            Text {
+                                text: root.log-summary;
+                                color: #9aa0a6;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+
+                            Rectangle { horizontal-stretch: 1; }
+
+                            Text {
+                                text: root.log-loading ? "加载中…" : "";
+                                color: #f5c451;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: #3c3f41; }
+
+                    ListView {
+                        vertical-stretch: 1;
+                        for row[index] in root.log-rows: LogRowView {
+                            height: Metrics.log-row-height;
+                            short-id: row.short-id;
+                            subject: row.subject;
+                            author: row.author;
+                            when: row.when;
+                            refs-text: row.refs-text;
+                            graph: row.graph;
+                            is-selected: row.is-selected;
+                            clicked => { root.select-log(index); }
+                        }
+                    }
+                }
+
+                Rectangle { height: 1px; background: #3c3f41; }
+
+                // Diff 面板
+                VerticalLayout {
+                    vertical-stretch: 2;
+                    spacing: 0px;
+
+                    Rectangle {
+                        height: 28px;
+                        background: #2b2d30;
+
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 10px;
+
+                            Text {
+                                text: root.diff-title;
+                                color: #e8eaed;
+                                font-size: 12px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                text: root.diff-stats;
+                                color: #9aa0a6;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+
+                            Rectangle { horizontal-stretch: 1; }
+
+                            Text {
+                                text: root.diff-loading ? "计算中…" : "";
+                                color: #f5c451;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: #3c3f41; }
+
+                    ListView {
+                        vertical-stretch: 1;
+                        for row in root.diff-rows: DiffRowView {
+                            height: 18px;
+                            kind: row.kind;
+                            old-no: row.old-no;
+                            new-no: row.new-no;
+                            segments: row.segments;
+                            changed: row.changed;
+                            is-hunk-header: row.is-hunk-header;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------- 空状态
+        Rectangle {
+            vertical-stretch: 1;
+            background: #1e1f22;
+            visible: !root.has-repo;
+
+            VerticalLayout {
+                padding: 28px;
+                spacing: 12px;
+                alignment: center;
+
+                Text {
+                    text: "未打开仓库";
+                    color: #e8eaed;
+                    font-size: 18px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: root.empty-message;
+                    color: #9aa0a6;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: center;
+
+                    Rectangle {
+                        width: 460px;
+                        height: 30px;
+                        background: #2b2d30;
+                        border-color: #4a4d50;
+                        border-width: 1px;
+                        border-radius: 3px;
+
+                        TextInput {
+                            x: 8px;
+                            width: parent.width - 16px;
+                            height: parent.height;
+                            text <=> root.open-path;
+                            single-line: true;
+                            color: #e8eaed;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    FlatButton {
+                        text: "打开";
+                        clicked => { root.open-repo(root.open-path); }
+                    }
+                }
+
+                Text {
+                    text: "最近仓库";
+                    color: #bdc1c6;
+                    font-size: 12px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+
+                Rectangle {
+                    width: 520px;
+                    height: 200px;
+                    background: #26272b;
+                    border-color: #3c3f41;
+                    border-width: 1px;
+
+                    ListView {
+                        for entry in root.recent: Rectangle {
+                            height: 26px;
+                            background: recent-touch.has-hover ? #303134 : transparent;
+
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                spacing: 10px;
+
+                                Text {
+                                    text: entry.name;
+                                    color: #dfe1e5;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: entry.path;
+                                    color: #8b9198;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+
+                            recent-touch := TouchArea {
+                                clicked => { root.use-recent(entry.path); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle { height: 1px; background: #3c3f41; }
+
+        // ---------------------------------------------------- 底部面板
+        Rectangle {
+            height: root.has-repo ? 210px : 0px;
+            background: #26272b;
+            visible: root.has-repo;
+
+            VerticalLayout {
+                padding: 0px;
+                spacing: 0px;
+
+                Rectangle {
+                    height: 28px;
+                    background: #2b2d30;
+
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        spacing: 4px;
+
+                        TabButton {
+                            text: "本地更改 " + root.change-summary;
+                            active: root.bottom-tab == 0;
+                            clicked => { root.bottom-tab = 0; }
+                        }
+
+                        TabButton {
+                            text: "Console " + root.console-summary;
+                            active: root.bottom-tab == 1;
+                            clicked => { root.bottom-tab = 1; }
+                        }
+
+                        Rectangle { horizontal-stretch: 1; }
+
+                        FlatButton {
+                            text: "导出日志";
+                            visible: root.bottom-tab == 1;
+                            clicked => { root.export-console(); }
+                        }
+
+                        FlatButton {
+                            text: "清空";
+                            visible: root.bottom-tab == 1;
+                            clicked => { root.clear-console(); }
+                        }
+                    }
+                }
+
+                // 本地更改
+                ListView {
+                    vertical-stretch: 1;
+                    visible: root.bottom-tab == 0;
+                    for row[index] in root.change-rows: ChangeRowView {
+                        height: 22px;
+                        path: row.path;
+                        code: row.code;
+                        bucket: row.bucket;
+                        note: row.note;
+                        is-selected: row.is-selected;
+                        clicked => { root.select-change(index); }
+                    }
+                }
+
+                // Console
+                ListView {
+                    vertical-stretch: 1;
+                    visible: root.bottom-tab == 1;
+                    for row in root.console-rows: ConsoleRowView {
+                        height: 20px;
+                        route: row.route;
+                        summary: row.summary;
+                        detail: row.detail;
+                        ok: row.ok;
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------- 状态栏
+        Rectangle {
+            height: 22px;
+            background: #2b2d30;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 12px;
+
+                Text {
+                    text: root.git-text;
+                    color: #8b9198;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                Text {
+                    text: root.has-repo ? root.branch-text : "";
+                    color: #8b9198;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
+

@@ -1,6 +1,6 @@
 [package]
 name = "gt-diff"
-description = "差异计算与 hunk 模型（gix-diff + imara-diff，Histogram 算法）"
+description = "差异计算与 hunk 模型（imara-diff Histogram 算法）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,3 +12,4 @@ workspace = true
 
 [dependencies]
 gt-core.workspace = true
+imara-diff.workspace = true
