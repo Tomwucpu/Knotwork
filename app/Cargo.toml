@@ -1,0 +1,30 @@
+[package]
+name = "knotwork-app"
+description = "应用入口：窗口管理、单实例守卫"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "knotwork"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+gt-core.workspace = true
+gt-backend.workspace = true
+gt-service.workspace = true
+gt-diff.workspace = true
+gt-graph.workspace = true
+gt-config.workspace = true
+gt-ui.workspace = true
+slint.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true

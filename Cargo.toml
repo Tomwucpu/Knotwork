@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gt-core",
+    "crates/gt-backend",
+    "crates/gt-service",
+    "crates/gt-diff",
+    "crates/gt-graph",
+    "crates/gt-config",
+    "crates/gt-ui",
+    "app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+authors = ["Knotwork"]
+
+[workspace.dependencies]
+# ---- 内部 crate（依赖图见架构规划 4.4 节）----
+gt-core = { path = "crates/gt-core" }
+gt-backend = { path = "crates/gt-backend" }
+gt-service = { path = "crates/gt-service" }
+gt-diff = { path = "crates/gt-diff" }
+gt-graph = { path = "crates/gt-graph" }
+gt-config = { path = "crates/gt-config" }
+gt-ui = { path = "crates/gt-ui" }
+
+# ---- 基础库（阶段 0 实际使用）----
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# ---- GUI（阶段 0 验证软件渲染与多窗口路径）----
+# 使用 Slint 默认特性：已同时包含 renderer-software（软件渲染，低内存路线前提，
+# 架构规划 2.3）与 renderer-femtovg（GPU 后端，保留用于内存 A/B 对比），
+# 以及 Windows 平台的 winit 后端。默认后端由应用侧通过 SLINT_BACKEND 选择。
+slint = { version = "1" }
+slint-build = "1"
+
+# ---- 后续里程碑引入（M1 起，此处仅登记意图，避免过早锁定版本）----
+# gix            —— Git 读热路径（架构规划 3.2）
+# git2           —— Git 写补充
+# imara-diff     —— Histogram 差异算法（gt-diff）
+# notify         —— 文件变更监听 + 去抖（gt-service）
+# crossbeam-channel —— 请求代次通道（gt-service）
+# parking_lot    —— 仓库级锁（gt-service）
+# keyring        —— 凭据存储（M3）
+# syntect        —— 语法高亮（M5）
+# sysinfo        —— 内存基线采集（M0 POC-1）
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"

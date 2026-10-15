@@ -1,0 +1,16 @@
+[package]
+name = "gt-config"
+description = "TOML 配置、主题、快捷键与外部工具绑定"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gt-core.workspace = true
+serde.workspace = true
+toml.workspace = true

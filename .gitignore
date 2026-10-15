@@ -1,0 +1,17 @@
+# Rust 构建产物
+/target
+
+# 备份文件
+**/*.rs.bk
+*.pdb
+
+# 基准测试仓库（体积大，不入库；见 test-repos/README.md）
+/test-repos/repos/
+
+# 本地探查产物
+*.log
+/logs/
+
+# IDE 与本地工作区状态（不参与版本控制）
+/.idea/
+/.workbuddy/

@@ -1,0 +1,43 @@
+// Knotwork 阶段 0 探针窗口。
+//
+// 目的：验证 Slint 编译管线、渲染后端选择与"单进程多窗口"创建路径可用
+// （实施计划任务 0-4）。正式视图自 M1 起按模块拆分到各自 .slint 文件。
+
+export component ProbeWindow inherits Window {
+    in property <string> heading: "Knotwork 探针";
+    in property <string> info: "";
+
+    title: heading;
+    width: 560px;
+    height: 420px;
+    background: #1e1f22;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 10px;
+
+        Text {
+            text: heading;
+            font-size: 20px;
+            color: #e8eaed;
+        }
+
+        Text {
+            text: info;
+            font-size: 13px;
+            color: #9aa0a6;
+        }
+
+        Rectangle {
+            height: 1px;
+            background: #303134;
+        }
+
+        Text {
+            text: "能看到本窗口，即表示 Slint 编译管线、渲染后端选择与单进程多窗口创建路径均正常。";
+            font-size: 13px;
+            color: #bdc1c6;
+            wrap: word-wrap;
+        }
+    }
+}

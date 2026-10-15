@@ -1,0 +1,13 @@
+[package]
+name = "gt-core"
+description = "领域模型层：Commit / Ref / Change / RepoId，无 I/O 依赖"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

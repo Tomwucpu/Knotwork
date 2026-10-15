@@ -1,0 +1,14 @@
+[package]
+name = "gt-service"
+description = "工作线程池、请求代次、取消令牌、LRU 缓存与文件监听"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gt-core.workspace = true
