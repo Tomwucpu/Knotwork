@@ -1,0 +1,17 @@
+[package]
+name = "poc-1-memory"
+description = "POC-1：Slint 软件渲染多窗口内存基线"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "poc1-memory"
+path = "src/main.rs"
+
+[dependencies]
+slint.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true

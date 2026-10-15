@@ -1,5 +1,9 @@
 [workspace]
 resolver = "2"
+# M0 阶段的 4 项 POC 各自独立成 demo，刻意不并入主 workspace
+# （实施计划 M0 节：不在主 workspace 强行集成）。它们共用 target/ 以复用
+# 已编译的 Slint/gix 依赖产物。
+exclude = ["pocs"]
 members = [
     "crates/gt-core",
     "crates/gt-backend",

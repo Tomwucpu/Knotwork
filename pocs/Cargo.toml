@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "poc-1-memory",
+    "poc-2-scroll",
+    "poc-3-consistency",
+    "poc-4-graph",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+authors = ["Knotwork"]
+
+# M0 POC 为一次性验证工程，不套用主 workspace 的严格 lint；
+# 通过的算法/脚本再按 M1 任务工程化进 gt-* crate。
+[workspace.dependencies]
+slint = { version = "1" }
+slint-build = "1"
+
+# gix：读热路径内核（架构规划 3.2）。显式补齐 POC 所需能力：
+#   revision  —— revwalk / 提交图遍历（POC-2、POC-3）
+#   status    —— 工作区状态（POC-3 porcelain v1 对比）
+#   blob-diff —— 树/内容差异（POC-3 numstat 对比）
+#   dirwalk   —— 目录遍历（status 依赖）
+gix = { version = "0.87", features = ["revision", "status", "blob-diff", "dirwalk"] }

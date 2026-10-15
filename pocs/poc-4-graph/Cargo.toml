@@ -1,0 +1,11 @@
+[package]
+name = "poc-4-graph"
+description = "POC-4：泳道图增量布局算法离线验证"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "poc4-graph"
+path = "src/main.rs"

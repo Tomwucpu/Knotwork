@@ -1,0 +1,18 @@
+[package]
+name = "poc-2-scroll"
+description = "POC-2：gix 大仓库虚拟化滚动帧时间"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "poc2-scroll"
+path = "src/main.rs"
+
+[dependencies]
+slint.workspace = true
+gix.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true

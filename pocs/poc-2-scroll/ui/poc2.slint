@@ -1,0 +1,57 @@
+// POC-2：以 gix revwalk 为数据源的虚拟化提交列表。
+//
+// 关键：model 行数为百万级，但 Slint ListView 只实例化可见元素，
+// 因此内存不随行数线性增长。滚动偏移通过 `content-y` 双向绑定暴露给 Rust，
+// 由 Rust 侧定时器驱动连续滚动并采样帧耗时。
+
+import { ListView } from "std-widgets.slint";
+
+export component Poc2Window inherits Window {
+    in property <string> heading: "POC-2";
+    in property <string> info: "";
+    in-out property <length> scroll-y <=> list.content-y;
+    in property <[string]> graph: [];
+    in property <[string]> rows: [];
+
+    title: heading;
+    width: 1000px;
+    height: 640px;
+    background: #1e1f22;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 6px;
+
+        Text { text: heading; font-size: 16px; color: #e8eaed; }
+        Text { text: info; font-size: 12px; color: #9aa0a6; }
+
+        Rectangle { height: 1px; background: #303134; }
+
+        list := ListView {
+            for row[index] in rows: Rectangle {
+                height: 24px;
+                background: #1e1f22;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: graph[index];
+                        font-family: "Consolas";
+                        font-size: 13px;
+                        color: #9ece6a;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: row;
+                        font-family: "Consolas";
+                        font-size: 12px;
+                        color: #d0d3d6;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+    }
+}
