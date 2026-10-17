@@ -340,6 +340,52 @@ impl FileDiff {
         format!("{}\t{path}", self.stats.numstat_columns())
     }
 
+    /// 本次差异内容的指纹（FNV-1a，64 位）。
+    ///
+    /// 用途见 `gt-service` 的 hunk 落库校验：界面把"它看到的那份差异"的指纹
+    /// 一并带上来，落库前重新计算并比对。文件在用户选择期间被外部改动时，
+    /// 旧下标可能指向错误的位置 —— 这时必须拒绝，而不是"尽量打上去"。
+    ///
+    /// 不追求密码学强度：这是同机同进程的乐观校验，不是防篡改。
+    #[must_use]
+    pub fn fingerprint(&self) -> u64 {
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        let mut hash = OFFSET;
+        {
+            let mut feed = |bytes: &[u8]| {
+                for byte in bytes {
+                    hash ^= u64::from(*byte);
+                    hash = hash.wrapping_mul(PRIME);
+                }
+            };
+
+            feed(self.old_path.as_bytes());
+            feed(&[0]);
+            feed(self.new_path.as_bytes());
+            match &self.payload {
+                DiffPayload::Text(hunks) => {
+                    for hunk in hunks {
+                        feed(hunk.header().as_bytes());
+                        for line in &hunk.lines {
+                            feed(&[line.kind.prefix() as u8]);
+                            feed(line.text.as_bytes());
+                            feed(b"\n");
+                        }
+                    }
+                }
+                DiffPayload::Binary => feed(b"binary"),
+                DiffPayload::TooLarge {
+                    old_bytes,
+                    new_bytes,
+                } => feed(format!("too-large:{old_bytes}:{new_bytes}").as_bytes()),
+                DiffPayload::Empty => feed(b"empty"),
+            }
+        }
+        hash
+    }
+
     /// unified 视图的完整文本（占位载荷返回说明行）。
     #[must_use]
     pub fn unified_text(&self) -> String {

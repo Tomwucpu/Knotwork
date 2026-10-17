@@ -84,6 +84,33 @@ pub enum BackendError {
     /// 输出无法按预期解析。
     #[error("命令输出解析失败：{0}")]
     Parse(String),
+
+    /// 该操作依赖 git 可执行文件，但启动时未探测到（FR-STA-04 的写侧降级）。
+    #[error("该操作需要 git 可执行文件支持：{operation}（当前未检测到 git）")]
+    CliRequired {
+        /// 操作的中文名称。
+        operation: &'static str,
+    },
+
+    /// 仓库以只读模式打开（写锁被其他实例持有，FR-MR-04）。
+    #[error("仓库以只读模式打开：{reason}")]
+    ReadOnly {
+        /// 只读原因（含占用者 PID）。
+        reason: String,
+    },
+
+    /// 操作被仓库侧规则拒绝（hook 失败、分支受保护、非快进等）。
+    #[error("{summary}")]
+    Rejected {
+        /// 面向用户的结论。
+        summary: String,
+        /// git 的原始输出（可能为空），供 Console 与详情展示。
+        detail: String,
+    },
+
+    /// 操作被取消（取消令牌在子进程等待期间被触发）。
+    #[error("操作已取消")]
+    Cancelled,
 }
 
 /// 便捷别名。

@@ -1,29 +1,68 @@
-// Knotwork 主窗口（M1：只读纵切）。
+// Knotwork 主窗口（M2：本地写入）。
 //
-// 结构自上而下：标题栏 → 横幅 → 主体（左：引用列表；右：Log + Diff）→ 底部面板 → 状态栏。
+// 结构自上而下：标题栏 → 横幅（进行中 / 只读 / git 缺失）→ 主体（左：引用+分支操作；右：Log + Diff）
+//               → 底部面板（本地更改 + 提交 / Console）→ 状态栏；另有两个遮罩层（确认 / 设置）。
 //
 // 三条渲染纪律（架构规划第 5 节）：
 //   1. 列表全虚拟化 —— 用 ListView，只创建视口内的行；
 //   2. 泳道图按行自绘 —— Rust 侧把布局算成"每列一个格子"，界面只负责画；
 //   3. 词级高亮按"分段文本"传入 —— 界面不做文本测量，避免每帧重排。
+//
+// 主题：所有颜色都取自 Palette。Palette.dark 由窗口在 init 与属性变更时写入，
+// 因此主题切换是"改一个布尔值"，没有任何重建逻辑。Slint 的 global 是进程级单例，
+// 多窗口共享同一主题 —— 这正是我们想要的语义（一个应用一套主题）。
 
-import { ListView } from "std-widgets.slint";
+import { CheckBox, ListView } from "std-widgets.slint";
 
-// ---------------------------------------------------------------- 数据结构
+// ---------------------------------------------------------------- 主题
 
-// 尺寸常量。Slint 1.x 没有文件级 `const`，因此用只读的 global 承载；
-// 布局里一律引用它，避免"同一个数字散落在多处、改一处漏一处"。
+global Palette {
+    // 由窗口写入（init / 主题切换时），不作为绑定源，避免多窗口绑定冲突。
+    in-out property <bool> dark: true;
+
+    out property <color> bg: dark ? #1e1f22 : #f7f8fa;
+    out property <color> panel: dark ? #26272b : #eef0f4;
+    out property <color> bar: dark ? #2b2d30 : #e4e7ec;
+    out property <color> line: dark ? #3c3f41 : #d7dbe1;
+    out property <color> text: dark ? #e8eaed : #1f2328;
+    out property <color> text-dim: dark ? #bdc1c6 : #3d4450;
+    out property <color> text-faint: dark ? #8b9198 : #6a7280;
+    out property <color> accent: dark ? #35507a : #d3e3ff;
+    out property <color> accent-text: dark ? #ffffff : #12325e;
+    out property <color> green: dark ? #6ee7b7 : #0d7350;
+    out property <color> amber: dark ? #f0b429 : #8a5a00;
+    out property <color> red: dark ? #f2a6ab : #a01b26;
+    out property <color> add-bg: dark ? #1f3a24 : #e6ffed;
+    out property <color> del-bg: dark ? #3a1f22 : #ffeef0;
+    out property <color> hover: dark ? #2f3136 : #e9ecf1;
+    out property <color> border: dark ? #4a4d50 : #c7ccd4;
+    out property <color> danger-bg: dark ? #5a2a2a : #ffe1e1;
+    out property <color> danger-text: dark ? #ffd4d4 : #8b1111;
+    out property <color> warn-bg: dark ? #6b5100 : #fff2cc;
+    out property <color> warn-text: dark ? #ffe9a8 : #6b4b00;
+    out property <color> seg-changed: dark ? #ffd166 : #a15c00;
+    out property <string> mono-font: "Consolas";
+    out property <length> mono-size: 11px;
+    out property <length> body-size: 12px;
+}
+
+// 尺寸常量。
 global Metrics {
     out property <length> lane-width: 12px;
     out property <length> log-row-height: 24px;
 }
 
-// 引用列表的一行。
+// ---------------------------------------------------------------- 数据结构
+
+// 引用列表 / 分支面板的一行。
 export struct RefEntry {
     name: string,
     kind: string,
     is-head: bool,
     sync: string,
+    selected: bool,
+    // 0 = 本地分支，1 = 远程分支，2 = 标签
+    kind-id: int,
 }
 
 // 泳道图的一列：0 = 空，1 = 竖向连线，2 = 本行节点。
@@ -40,6 +79,9 @@ export struct LogRow {
     when: string,
     refs-text: string,
     is-selected: bool,
+    // FR-LOG-06：我的提交加粗、合并提交置灰。
+    is-mine: bool,
+    is-merge: bool,
     graph: [GraphCell],
 }
 
@@ -50,9 +92,14 @@ export struct ChangeRow {
     bucket: string,
     note: string,
     is-selected: bool,
+    is-conflict: bool,
+    is-untracked: bool,
 }
 
-// Diff 的一行：`segments` 与 `changed` 一一对应（词级高亮的分段文本）。
+// Diff 的一行。
+//
+// `hunk-index` / `line-index` 是"这一行对应哪一块、哪一行"，-1 表示不可选
+// （hunk 头、占位行）。Rust 侧据它把点击换算成补丁选择，界面不需要懂 diff 结构。
 export struct DiffRow {
     kind: int,
     old-no: string,
@@ -60,6 +107,10 @@ export struct DiffRow {
     segments: [string],
     changed: [bool],
     is-hunk-header: bool,
+    hunk-index: int,
+    line-index: int,
+    selectable: bool,
+    selected: bool,
 }
 
 // Console 的一行。
@@ -80,22 +131,33 @@ export struct RecentRow {
 
 component FlatButton inherits Rectangle {
     in property <string> text;
+    in property <bool> enabled: true;
+    in property <bool> danger: false;
     callback clicked();
 
     width: max(48px, label.preferred-width + 16px);
     height: 22px;
-    background: touch.pressed ? #3d3f42 : (touch.has-hover ? #35373a : #303236);
+    background: !root.enabled
+        ? (Palette.dark ? #33353a : #e6e8ec)
+        : (touch.pressed
+            ? (Palette.dark ? #3d3f42 : #d0d4da)
+            : (touch.has-hover ? (Palette.dark ? #35373a : #dfe3e9) : Palette.bar));
     border-radius: 3px;
+    border-width: 1px;
+    border-color: root.danger ? Palette.red : Palette.border;
 
     label := Text {
         text: root.text;
-        color: #dfe1e5;
+        color: !root.enabled
+            ? Palette.text-faint
+            : (root.danger ? Palette.red : Palette.text);
         font-size: 11px;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
 
     touch := TouchArea {
+        enabled: root.enabled;
         clicked => { root.clicked(); }
     }
 }
@@ -107,11 +169,11 @@ component TabButton inherits Rectangle {
 
     width: max(120px, label.preferred-width + 20px);
     height: 28px;
-    background: root.active ? #26272b : transparent;
+    background: root.active ? Palette.panel : transparent;
 
     label := Text {
         text: root.text;
-        color: root.active ? #e8eaed : #9aa0a6;
+        color: root.active ? Palette.text : Palette.text-faint;
         font-size: 12px;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -121,12 +183,63 @@ component TabButton inherits Rectangle {
         width: 100%;
         height: 2px;
         y: 26px;
-        background: #4a8cff;
+        background: Palette.green;
         visible: root.active;
     }
 
     touch := TouchArea {
         clicked => { root.clicked(); }
+    }
+}
+
+component Field inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder: "";
+    in property <bool> monospace: false;
+    callback edited(string);
+
+    height: 26px;
+    background: Palette.bg;
+    border-color: Palette.border;
+    border-width: 1px;
+    border-radius: 3px;
+
+    input := TextInput {
+        x: 6px;
+        width: parent.width - 12px;
+        height: parent.height;
+        text <=> root.text;
+        single-line: true;
+        color: Palette.text;
+        font-size: 11px;
+        font-family: root.monospace ? Palette.mono-font : "";
+        vertical-alignment: center;
+        edited => { root.edited(root.text); }
+    }
+}
+
+component OptionToggle inherits Rectangle {
+    in property <string> text;
+    in property <bool> checked;
+    callback toggled();
+
+    width: max(72px, label.preferred-width + 22px);
+    height: 22px;
+    background: root.checked ? Palette.accent : transparent;
+    border-radius: 3px;
+    border-width: 1px;
+    border-color: root.checked ? Palette.accent : Palette.line;
+
+    label := Text {
+        text: (root.checked ? "✓ " : "") + root.text;
+        color: root.checked ? Palette.accent-text : Palette.text-faint;
+        font-size: 11px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        clicked => { root.toggled(); }
     }
 }
 
@@ -139,9 +252,13 @@ component LogRowView inherits Rectangle {
     in property <string> refs-text;
     in property <[GraphCell]> graph;
     in property <bool> is-selected;
+    in property <bool> is-mine;
+    in property <bool> is-merge;
     callback clicked();
 
-    background: root.is-selected ? #35507a : (touch.has-hover ? #2b2d30 : transparent);
+    background: root.is-selected
+        ? (Palette.dark ? #35507a : #cfe0ff)
+        : (touch.has-hover ? Palette.hover : transparent);
 
     HorizontalLayout {
         spacing: 0px;
@@ -157,7 +274,6 @@ component LogRowView inherits Rectangle {
                 for cell in root.graph: Rectangle {
                     width: Metrics.lane-width;
 
-                    // 竖向连线：节点所在列也画，看起来才是连续的一条线。
                     Rectangle {
                         x: 5px;
                         width: 2px;
@@ -166,7 +282,6 @@ component LogRowView inherits Rectangle {
                         visible: cell.kind == 1 || cell.kind == 2;
                     }
 
-                    // 本行节点圆点（行高 24px、圆点 9px → 上下各留 7px 与 8px）。
                     Rectangle {
                         x: 1px;
                         y: 7px;
@@ -183,16 +298,16 @@ component LogRowView inherits Rectangle {
         Text {
             width: 62px;
             text: root.short-id;
-            color: #8b9198;
+            color: Palette.text-faint;
             font-size: 11px;
             vertical-alignment: center;
-            font-family: "Consolas";
+            font-family: Palette.mono-font;
         }
 
         Text {
             width: 150px;
             text: root.refs-text;
-            color: #f0b429;
+            color: Palette.amber;
             font-size: 11px;
             vertical-alignment: center;
             overflow: elide;
@@ -201,8 +316,10 @@ component LogRowView inherits Rectangle {
         Text {
             horizontal-stretch: 1;
             text: root.subject;
-            color: #e8eaed;
-            font-size: 12px;
+            // FR-LOG-06：合并提交置灰；我的提交加粗。
+            color: root.is-merge ? Palette.text-faint : Palette.text;
+            font-size: Palette.body-size;
+            font-weight: root.is-mine ? 700 : 400;
             vertical-alignment: center;
             overflow: elide;
         }
@@ -210,7 +327,7 @@ component LogRowView inherits Rectangle {
         Text {
             width: 120px;
             text: root.author;
-            color: #9aa0a6;
+            color: Palette.text-faint;
             font-size: 11px;
             vertical-alignment: center;
             overflow: elide;
@@ -219,7 +336,7 @@ component LogRowView inherits Rectangle {
         Text {
             width: 130px;
             text: root.when;
-            color: #8b9198;
+            color: Palette.text-faint;
             font-size: 11px;
             vertical-alignment: center;
             horizontal-alignment: right;
@@ -231,7 +348,7 @@ component LogRowView inherits Rectangle {
     }
 }
 
-// Diff 行：行号槽 + 分段文本（词级高亮靠分段着色，不做文本测量）。
+// Diff 行：行号槽 + 分段文本 + 选择高亮。
 component DiffRowView inherits Rectangle {
     in property <int> kind;
     in property <string> old-no;
@@ -239,9 +356,22 @@ component DiffRowView inherits Rectangle {
     in property <[string]> segments;
     in property <[bool]> changed;
     in property <bool> is-hunk-header;
+    in property <bool> selectable;
+    in property <bool> selected;
+    callback clicked();
 
     // kind: 0 上下文、1 新增、2 删除、3 元信息
-    background: root.kind == 1 ? #1f3a24 : (root.kind == 2 ? #3a1f22 : (root.is-hunk-header ? #2b2d30 : transparent));
+    background: root.is-hunk-header
+        ? Palette.bar
+        : (root.kind == 1 ? Palette.add-bg : (root.kind == 2 ? Palette.del-bg : transparent));
+
+    // 选中态用左侧色条 + 底色叠加表示，避免盖掉增删行的底色语义。
+    Rectangle {
+        width: 3px;
+        height: 100%;
+        background: Palette.amber;
+        visible: root.selected;
+    }
 
     HorizontalLayout {
         spacing: 0px;
@@ -249,38 +379,44 @@ component DiffRowView inherits Rectangle {
         Text {
             width: 46px;
             text: root.old-no;
-            color: #6b7075;
+            color: Palette.text-faint;
             font-size: 11px;
             vertical-alignment: center;
             horizontal-alignment: right;
-            font-family: "Consolas";
+            font-family: Palette.mono-font;
         }
 
         Text {
             width: 46px;
             text: root.new-no;
-            color: #6b7075;
+            color: Palette.text-faint;
             font-size: 11px;
             vertical-alignment: center;
             horizontal-alignment: right;
-            font-family: "Consolas";
+            font-family: Palette.mono-font;
         }
 
-        Rectangle { width: 6px; }
+        Rectangle { width: 12px; }
 
-        // 分段文本：每段单独着色，段边界由 Rust 侧算出。
         HorizontalLayout {
             horizontal-stretch: 1;
             spacing: 0px;
 
             for segment[i] in root.segments: Text {
                 text: segment;
-                color: root.changed[i] ? #ffd166 : (root.kind == 2 ? #f2a6ab : (root.kind == 1 ? #a6e3b5 : #c8ccd1));
-                font-size: 12px;
+                color: root.changed[i]
+                    ? Palette.seg-changed
+                    : (root.kind == 2 ? Palette.red : (root.kind == 1 ? Palette.green : Palette.text-dim));
+                font-size: Palette.body-size;
                 vertical-alignment: center;
-                font-family: "Consolas";
+                font-family: Palette.mono-font;
             }
         }
+    }
+
+    touch := TouchArea {
+        enabled: root.selectable;
+        clicked => { root.clicked(); }
     }
 }
 
@@ -291,9 +427,12 @@ component ChangeRowView inherits Rectangle {
     in property <string> bucket;
     in property <string> note;
     in property <bool> is-selected;
+    in property <bool> is-conflict;
     callback clicked();
 
-    background: root.is-selected ? #35507a : (touch.has-hover ? #2b2d30 : transparent);
+    background: root.is-selected
+        ? (Palette.dark ? #35507a : #cfe0ff)
+        : (touch.has-hover ? Palette.hover : transparent);
 
     HorizontalLayout {
         padding-left: 8px;
@@ -301,9 +440,9 @@ component ChangeRowView inherits Rectangle {
         spacing: 8px;
 
         Text {
-            width: 130px;
+            width: 120px;
             text: root.bucket;
-            color: #9aa0a6;
+            color: root.is-conflict ? Palette.red : Palette.text-faint;
             font-size: 11px;
             vertical-alignment: center;
             overflow: elide;
@@ -312,17 +451,17 @@ component ChangeRowView inherits Rectangle {
         Text {
             width: 26px;
             text: root.code;
-            color: #f0b429;
+            color: Palette.amber;
             font-size: 11px;
             vertical-alignment: center;
-            font-family: "Consolas";
+            font-family: Palette.mono-font;
         }
 
         Text {
             horizontal-stretch: 1;
             text: root.path;
-            color: #dfe1e5;
-            font-size: 12px;
+            color: Palette.text;
+            font-size: Palette.body-size;
             vertical-alignment: center;
             overflow: elide;
         }
@@ -330,7 +469,7 @@ component ChangeRowView inherits Rectangle {
         Text {
             width: 150px;
             text: root.note;
-            color: #8b9198;
+            color: Palette.text-faint;
             font-size: 11px;
             vertical-alignment: center;
             overflow: elide;
@@ -359,7 +498,7 @@ component ConsoleRowView inherits Rectangle {
         Text {
             width: 92px;
             text: root.route;
-            color: root.ok ? #6ee7b7 : #f2a6ab;
+            color: root.ok ? Palette.green : Palette.red;
             font-size: 11px;
             vertical-alignment: center;
         }
@@ -367,23 +506,24 @@ component ConsoleRowView inherits Rectangle {
         Text {
             horizontal-stretch: 1;
             text: root.summary;
-            color: #c8ccd1;
+            color: Palette.text-dim;
             font-size: 11px;
             vertical-alignment: center;
             overflow: elide;
-            font-family: "Consolas";
+            font-family: Palette.mono-font;
         }
 
         Text {
             width: 240px;
             text: root.detail;
-            color: #8b9198;
+            color: Palette.text-faint;
             font-size: 11px;
             vertical-alignment: center;
             overflow: elide;
         }
     }
 }
+
 // ---------------------------------------------------------------- 主窗口
 
 export component MainWindow inherits Window {
@@ -396,8 +536,17 @@ export component MainWindow inherits Window {
     in-out property <string> state-text: "";
     in-out property <bool> state-banner-visible: false;
 
+    // ---- 主题（FR-SET-02 外观组）----
+    in-out property <bool> dark-theme: true;
+
+    // ---- 只读模式（FR-MR-04）----
+    in-out property <bool> read-only: false;
+    in-out property <string> read-only-reason: "";
+
     // ---- 侧栏 ----
     in-out property <[RefEntry]> sidebar-refs: [];
+    in-out property <string> branch-input: "";
+    in-out property <int> selected-ref: -1;
 
     // ---- 空状态（未打开仓库）----
     in-out property <bool> has-repo: false;
@@ -410,16 +559,37 @@ export component MainWindow inherits Window {
     in-out property <string> log-summary: "";
     in-out property <int> log-total: 0;
     in-out property <bool> log-loading: false;
+    in-out property <string> search-query: "";
+    in-out property <bool> search-regex: false;
+    in-out property <bool> search-active: false;
+    in-out property <bool> opt-topo: false;
+    in-out property <bool> opt-first-parent: false;
+    in-out property <bool> opt-hide-merges: false;
+    in-out property <bool> opt-collapse: false;
 
     // ---- Diff 面板 ----
     in-out property <[DiffRow]> diff-rows: [];
     in-out property <string> diff-title: "差异";
     in-out property <string> diff-stats: "";
     in-out property <bool> diff-loading: false;
+    in-out property <string> diff-hint: "";
+    // 当前差异是否来自"已暂存"一侧（决定按钮语义）。
+    in-out property <bool> diff-staged-view: false;
+    // 当前差异是否支持按块落库（新增/未跟踪文件只能整文件暂存）。
+    in-out property <bool> diff-selectable: false;
 
     // ---- 本地更改 ----
     in-out property <[ChangeRow]> change-rows: [];
     in-out property <string> change-summary: "";
+    in-out property <bool> selection-is-untracked: false;
+
+    // ---- 提交（FR-CMT-01/02）----
+    in-out property <string> commit-message: "";
+    in-out property <bool> commit-amend: false;
+    in-out property <bool> commit-reset-author: false;
+    in-out property <string> commit-hint: "";
+    in-out property <bool> commit-enabled: true;
+    in-out property <bool> staging-mode: true;
 
     // ---- Console ----
     in-out property <[ConsoleRow]> console-rows: [];
@@ -432,19 +602,81 @@ export component MainWindow inherits Window {
     in-out property <bool> cli-missing: false;
     in-out property <string> cli-missing-reason: "";
 
+    // ---- 提示条 ----
+    in-out property <string> toast: "";
+
+    // ---- 二次确认遮罩（FR-LC-02 / D4）----
+    in-out property <bool> confirm-visible: false;
+    in-out property <string> confirm-title: "确认操作";
+    in-out property <string> confirm-detail: "";
+    in-out property <bool> confirm-danger: true;
+
+    // ---- 设置遮罩（FR-SET-01/02）----
+    in-out property <bool> settings-visible: false;
+    in-out property <bool> set-warn-detached: true;
+    in-out property <bool> set-warn-crlf: true;
+    in-out property <int> set-update-strategy: 0;
+    in-out property <int> set-cache-mib: 32;
+    in-out property <string> set-protected: "";
+    in-out property <string> set-diff-tool: "";
+    in-out property <string> set-merge-tool: "";
+    in-out property <int> set-log-level: 2;
+    in-out property <string> set-status: "";
+
     callback poll();
     callback refresh();
     callback open-repo(string);
     callback select-log(int);
     callback select-change(int);
+    callback select-ref(int);
     callback export-console();
     callback clear-console();
     callback use-recent(string);
 
-    title: repo-title;
-    width: 1180px;
-    height: 780px;
-    background: #1e1f22;
+    // 写操作
+    callback stage-selected();
+    callback unstage-selected();
+    callback discard-selected();
+    callback delete-selected();
+    callback ignore-selected(int);
+    callback commit();
+    callback set-commit-message(string);
+    callback toggle-amend(bool);
+    callback toggle-reset-author(bool);
+    callback toggle-diff-row(int);
+    callback stage-hunks();
+    callback unstage-hunks();
+    callback discard-hunks();
+    callback set-branch-input(string);
+    callback branch-create(bool);
+    callback branch-checkout();
+    callback branch-rename();
+    callback branch-delete(bool);
+    callback branch-upstream();
+    callback checkout-selected-commit();
+
+    // 搜索与图选项
+    callback set-search(string);
+    callback toggle-search-regex(bool);
+    callback run-search();
+    callback clear-search();
+    callback toggle-option(int);
+
+    // 遮罩
+    callback confirm-yes();
+    callback confirm-no();
+    callback open-settings();
+    callback close-settings();
+    callback apply-settings();
+    callback toggle-theme(bool);
+
+    title: repo-title + (read-only ? "（只读）" : "");
+    width: 1280px;
+    height: 860px;
+    background: Palette.bg;
+
+    init => { Palette.dark = root.dark-theme; }
+    changed dark-theme => { Palette.dark = root.dark-theme; }
 
     // 每 100ms 向 Rust 侧要一次异步结果（UI 线程只做搬运，不做 I/O）。
     Timer {
@@ -460,7 +692,7 @@ export component MainWindow inherits Window {
         // ---------------------------------------------------- 标题栏
         Rectangle {
             height: 44px;
-            background: #2b2d30;
+            background: Palette.bar;
 
             HorizontalLayout {
                 padding-left: 14px;
@@ -473,14 +705,14 @@ export component MainWindow inherits Window {
 
                     Text {
                         text: root.repo-title;
-                        color: #e8eaed;
+                        color: Palette.text;
                         font-size: 15px;
                         font-weight: 600;
                     }
 
                     Text {
                         text: root.repo-path;
-                        color: #8b9198;
+                        color: Palette.text-faint;
                         font-size: 11px;
                         overflow: elide;
                     }
@@ -490,16 +722,21 @@ export component MainWindow inherits Window {
 
                 Text {
                     text: root.branch-text;
-                    color: #6ee7b7;
+                    color: Palette.green;
                     font-size: 13px;
                     vertical-alignment: center;
                 }
 
                 Text {
                     text: root.head-text;
-                    color: #8b9198;
+                    color: Palette.text-faint;
                     font-size: 11px;
                     vertical-alignment: center;
+                }
+
+                FlatButton {
+                    text: "设置";
+                    clicked => { root.open-settings(); }
                 }
 
                 FlatButton {
@@ -511,14 +748,41 @@ export component MainWindow inherits Window {
 
         // ---------------------------------------------------- 进行中操作横幅
         Rectangle {
-            height: root.state-banner-visible ? 30px : 0px;
-            background: #7a5c00;
+            height: root.state-banner-visible ? 28px : 0px;
+            background: Palette.warn-bg;
             visible: root.state-banner-visible;
+
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 14px;
+                spacing: 10px;
+
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.state-text;
+                    color: Palette.warn-text;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                FlatButton {
+                    text: "查看命令";
+                    clicked => { root.bottom-tab = 1; }
+                }
+            }
+        }
+
+        // ---------------------------------------------------- 只读横幅（FR-MR-04）
+        Rectangle {
+            height: root.read-only ? 28px : 0px;
+            background: Palette.danger-bg;
+            visible: root.read-only;
 
             Text {
                 x: 14px;
-                text: root.state-text;
-                color: #ffe9a8;
+                text: root.read-only-reason;
+                color: Palette.danger-text;
                 font-size: 12px;
                 vertical-alignment: center;
             }
@@ -526,8 +790,8 @@ export component MainWindow inherits Window {
 
         // ---------------------------------------------------- git 缺失降级提示
         Rectangle {
-            height: root.cli-missing ? 46px : 0px;
-            background: #5a2a2a;
+            height: root.cli-missing ? 44px : 0px;
+            background: Palette.danger-bg;
             visible: root.cli-missing;
 
             Text {
@@ -535,7 +799,7 @@ export component MainWindow inherits Window {
                 y: 6px;
                 width: parent.width - 28px;
                 text: root.cli-missing-reason;
-                color: #ffd4d4;
+                color: Palette.danger-text;
                 font-size: 12px;
                 vertical-alignment: center;
                 wrap: word-wrap;
@@ -547,40 +811,113 @@ export component MainWindow inherits Window {
             vertical-stretch: 1;
             spacing: 0px;
 
-            // 左：引用列表
+            // 左：引用列表 + 分支操作
             Rectangle {
-                width: 240px;
-                background: #26272b;
+                width: 258px;
+                background: Palette.panel;
                 visible: root.has-repo;
 
                 VerticalLayout {
-                    padding: 10px;
-                    spacing: 8px;
+                    padding: 8px;
+                    spacing: 6px;
 
                     Text {
                         text: "分支与标签";
-                        color: #bdc1c6;
+                        color: Palette.text-dim;
                         font-size: 12px;
                         font-weight: 600;
                     }
 
-                    Rectangle { height: 1px; background: #3c3f41; }
+                    Rectangle { height: 1px; background: Palette.line; }
 
                     ListView {
                         vertical-stretch: 1;
-                        for entry in root.sidebar-refs: Rectangle {
+                        for entry[index] in root.sidebar-refs: Rectangle {
                             height: 22px;
-                            background: entry.is-head ? #35507a : transparent;
+                            background: entry.is-head
+                                ? Palette.accent
+                                : (entry.selected ? Palette.hover : transparent);
 
                             Text {
                                 x: 6px;
-                                text: entry.name + entry.sync;
-                                color: entry.is-head ? #ffffff : #c8ccd1;
+                                width: parent.width - 60px;
+                                text: entry.name;
+                                color: entry.is-head ? Palette.accent-text : Palette.text-dim;
                                 font-size: 12px;
                                 vertical-alignment: center;
                                 overflow: elide;
                             }
+
+                            Text {
+                                x: parent.width - 52px;
+                                width: 46px;
+                                text: entry.sync;
+                                color: Palette.text-faint;
+                                font-size: 10px;
+                                vertical-alignment: center;
+                                horizontal-alignment: right;
+                            }
+
+                            TouchArea {
+                                clicked => { root.select-ref(index); }
+                            }
                         }
+                    }
+
+                    Rectangle { height: 1px; background: Palette.line; }
+
+                    Field {
+                        // 双向绑定：Rust 侧选中分支时会回填名称，用户输入也要能写回属性。
+                        text <=> root.branch-input;
+                        placeholder: "新分支名 / 新名称";
+                        edited(v) => { root.set-branch-input(v); }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 4px;
+
+                        FlatButton {
+                            text: "新建";
+                            enabled: !root.read-only;
+                            clicked => { root.branch-create(true); }
+                        }
+                        FlatButton {
+                            text: "仅建";
+                            enabled: !root.read-only;
+                            clicked => { root.branch-create(false); }
+                        }
+                        FlatButton {
+                            text: "检出";
+                            enabled: !root.read-only;
+                            clicked => { root.branch-checkout(); }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 4px;
+
+                        FlatButton {
+                            text: "重命名";
+                            enabled: !root.read-only;
+                            clicked => { root.branch-rename(); }
+                        }
+                        FlatButton {
+                            text: "删除";
+                            enabled: !root.read-only;
+                            danger: true;
+                            clicked => { root.branch-delete(false); }
+                        }
+                        FlatButton {
+                            text: "设上游";
+                            enabled: !root.read-only;
+                            clicked => { root.branch-upstream(); }
+                        }
+                    }
+
+                    FlatButton {
+                        text: "检出所选提交（分离）";
+                        enabled: !root.read-only;
+                        clicked => { root.checkout-selected-commit(); }
                     }
                 }
             }
@@ -596,17 +933,17 @@ export component MainWindow inherits Window {
                     spacing: 0px;
 
                     Rectangle {
-                        height: 28px;
-                        background: #2b2d30;
+                        height: 30px;
+                        background: Palette.bar;
 
                         HorizontalLayout {
                             padding-left: 10px;
                             padding-right: 10px;
-                            spacing: 10px;
+                            spacing: 6px;
 
                             Text {
                                 text: "提交历史";
-                                color: #e8eaed;
+                                color: Palette.text;
                                 font-size: 12px;
                                 font-weight: 600;
                                 vertical-alignment: center;
@@ -614,23 +951,89 @@ export component MainWindow inherits Window {
 
                             Text {
                                 text: root.log-summary;
-                                color: #9aa0a6;
+                                color: Palette.text-faint;
                                 font-size: 11px;
                                 vertical-alignment: center;
                             }
 
                             Rectangle { horizontal-stretch: 1; }
 
+                            Field {
+                                width: 200px;
+                                text <=> root.search-query;
+                                placeholder: "搜索提交消息 / 哈希";
+                                monospace: true;
+                                edited(v) => { root.set-search(v); }
+                            }
+
+                            OptionToggle {
+                                text: "正则";
+                                checked: root.search-regex;
+                                toggled => { root.toggle-search-regex(!root.search-regex); }
+                            }
+
+                            FlatButton {
+                                text: "搜索";
+                                clicked => { root.run-search(); }
+                            }
+
+                            FlatButton {
+                                text: "清除";
+                                enabled: root.search-active;
+                                clicked => { root.clear-search(); }
+                            }
+                        }
+                    }
+
+                    // 图选项条（FR-LOG-05/06）
+                    Rectangle {
+                        height: 26px;
+                        background: Palette.panel;
+
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            spacing: 6px;
+
+                            Text {
+                                text: "图选项";
+                                color: Palette.text-faint;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+
+                            OptionToggle {
+                                text: "拓扑排序";
+                                checked: root.opt-topo;
+                                toggled => { root.toggle-option(0); }
+                            }
+                            OptionToggle {
+                                text: "仅第一父";
+                                checked: root.opt-first-parent;
+                                toggled => { root.toggle-option(1); }
+                            }
+                            OptionToggle {
+                                text: "隐藏合并";
+                                checked: root.opt-hide-merges;
+                                toggled => { root.toggle-option(2); }
+                            }
+                            OptionToggle {
+                                text: "折叠线性";
+                                checked: root.opt-collapse;
+                                toggled => { root.toggle-option(3); }
+                            }
+
+                            Rectangle { horizontal-stretch: 1; }
+
                             Text {
                                 text: root.log-loading ? "加载中…" : "";
-                                color: #f5c451;
+                                color: Palette.amber;
                                 font-size: 11px;
                                 vertical-alignment: center;
                             }
                         }
                     }
 
-                    Rectangle { height: 1px; background: #3c3f41; }
+                    Rectangle { height: 1px; background: Palette.line; }
 
                     ListView {
                         vertical-stretch: 1;
@@ -643,12 +1046,14 @@ export component MainWindow inherits Window {
                             refs-text: row.refs-text;
                             graph: row.graph;
                             is-selected: row.is-selected;
+                            is-mine: row.is-mine;
+                            is-merge: row.is-merge;
                             clicked => { root.select-log(index); }
                         }
                     }
                 }
 
-                Rectangle { height: 1px; background: #3c3f41; }
+                Rectangle { height: 1px; background: Palette.line; }
 
                 // Diff 面板
                 VerticalLayout {
@@ -656,17 +1061,18 @@ export component MainWindow inherits Window {
                     spacing: 0px;
 
                     Rectangle {
-                        height: 28px;
-                        background: #2b2d30;
+                        height: 30px;
+                        background: Palette.bar;
 
                         HorizontalLayout {
                             padding-left: 10px;
                             padding-right: 10px;
-                            spacing: 10px;
+                            spacing: 6px;
 
                             Text {
+                                width: 210px;
                                 text: root.diff-title;
-                                color: #e8eaed;
+                                color: Palette.text;
                                 font-size: 12px;
                                 font-weight: 600;
                                 vertical-alignment: center;
@@ -675,7 +1081,7 @@ export component MainWindow inherits Window {
 
                             Text {
                                 text: root.diff-stats;
-                                color: #9aa0a6;
+                                color: Palette.text-faint;
                                 font-size: 11px;
                                 vertical-alignment: center;
                             }
@@ -683,19 +1089,37 @@ export component MainWindow inherits Window {
                             Rectangle { horizontal-stretch: 1; }
 
                             Text {
-                                text: root.diff-loading ? "计算中…" : "";
-                                color: #f5c451;
+                                text: root.diff-hint;
+                                color: Palette.text-faint;
                                 font-size: 11px;
                                 vertical-alignment: center;
+                            }
+
+                            FlatButton {
+                                text: "暂存所选";
+                                enabled: !root.read-only && root.diff-selectable
+                                    && !root.diff-staged-view && root.staging-mode;
+                                clicked => { root.stage-hunks(); }
+                            }
+                            FlatButton {
+                                text: "反暂存所选";
+                                enabled: !root.read-only && root.diff-selectable && root.diff-staged-view;
+                                clicked => { root.unstage-hunks(); }
+                            }
+                            FlatButton {
+                                text: "丢弃所选";
+                                enabled: !root.read-only && root.diff-selectable && !root.diff-staged-view;
+                                danger: true;
+                                clicked => { root.discard-hunks(); }
                             }
                         }
                     }
 
-                    Rectangle { height: 1px; background: #3c3f41; }
+                    Rectangle { height: 1px; background: Palette.line; }
 
                     ListView {
                         vertical-stretch: 1;
-                        for row in root.diff-rows: DiffRowView {
+                        for row[index] in root.diff-rows: DiffRowView {
                             height: 18px;
                             kind: row.kind;
                             old-no: row.old-no;
@@ -703,6 +1127,9 @@ export component MainWindow inherits Window {
                             segments: row.segments;
                             changed: row.changed;
                             is-hunk-header: row.is-hunk-header;
+                            selectable: row.selectable;
+                            selected: row.selected;
+                            clicked => { root.toggle-diff-row(index); }
                         }
                     }
                 }
@@ -712,7 +1139,7 @@ export component MainWindow inherits Window {
         // ---------------------------------------------------- 空状态
         Rectangle {
             vertical-stretch: 1;
-            background: #1e1f22;
+            background: Palette.bg;
             visible: !root.has-repo;
 
             VerticalLayout {
@@ -722,7 +1149,7 @@ export component MainWindow inherits Window {
 
                 Text {
                     text: "未打开仓库";
-                    color: #e8eaed;
+                    color: Palette.text;
                     font-size: 18px;
                     font-weight: 600;
                     horizontal-alignment: center;
@@ -730,7 +1157,7 @@ export component MainWindow inherits Window {
 
                 Text {
                     text: root.empty-message;
-                    color: #9aa0a6;
+                    color: Palette.text-faint;
                     font-size: 12px;
                     horizontal-alignment: center;
                     wrap: word-wrap;
@@ -743,8 +1170,8 @@ export component MainWindow inherits Window {
                     Rectangle {
                         width: 460px;
                         height: 30px;
-                        background: #2b2d30;
-                        border-color: #4a4d50;
+                        background: Palette.panel;
+                        border-color: Palette.border;
                         border-width: 1px;
                         border-radius: 3px;
 
@@ -754,7 +1181,7 @@ export component MainWindow inherits Window {
                             height: parent.height;
                             text <=> root.open-path;
                             single-line: true;
-                            color: #e8eaed;
+                            color: Palette.text;
                             font-size: 12px;
                             vertical-alignment: center;
                         }
@@ -768,7 +1195,7 @@ export component MainWindow inherits Window {
 
                 Text {
                     text: "最近仓库";
-                    color: #bdc1c6;
+                    color: Palette.text-dim;
                     font-size: 12px;
                     font-weight: 600;
                     horizontal-alignment: center;
@@ -777,14 +1204,14 @@ export component MainWindow inherits Window {
                 Rectangle {
                     width: 520px;
                     height: 200px;
-                    background: #26272b;
-                    border-color: #3c3f41;
+                    background: Palette.panel;
+                    border-color: Palette.line;
                     border-width: 1px;
 
                     ListView {
                         for entry in root.recent: Rectangle {
                             height: 26px;
-                            background: recent-touch.has-hover ? #303134 : transparent;
+                            background: recent-touch.has-hover ? Palette.hover : transparent;
 
                             HorizontalLayout {
                                 padding-left: 8px;
@@ -793,7 +1220,7 @@ export component MainWindow inherits Window {
 
                                 Text {
                                     text: entry.name;
-                                    color: #dfe1e5;
+                                    color: Palette.text;
                                     font-size: 12px;
                                     vertical-alignment: center;
                                 }
@@ -801,7 +1228,7 @@ export component MainWindow inherits Window {
                                 Text {
                                     horizontal-stretch: 1;
                                     text: entry.path;
-                                    color: #8b9198;
+                                    color: Palette.text-faint;
                                     font-size: 11px;
                                     vertical-alignment: center;
                                     overflow: elide;
@@ -817,12 +1244,12 @@ export component MainWindow inherits Window {
             }
         }
 
-        Rectangle { height: 1px; background: #3c3f41; }
+        Rectangle { height: 1px; background: Palette.line; }
 
         // ---------------------------------------------------- 底部面板
         Rectangle {
-            height: root.has-repo ? 210px : 0px;
-            background: #26272b;
+            height: root.has-repo ? 300px : 0px;
+            background: Palette.panel;
             visible: root.has-repo;
 
             VerticalLayout {
@@ -831,7 +1258,7 @@ export component MainWindow inherits Window {
 
                 Rectangle {
                     height: 28px;
-                    background: #2b2d30;
+                    background: Palette.bar;
 
                     HorizontalLayout {
                         padding-left: 8px;
@@ -865,22 +1292,145 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                // 本地更改
-                ListView {
+                // ---- 本地更改
+                HorizontalLayout {
                     vertical-stretch: 1;
                     visible: root.bottom-tab == 0;
-                    for row[index] in root.change-rows: ChangeRowView {
-                        height: 22px;
-                        path: row.path;
-                        code: row.code;
-                        bucket: row.bucket;
-                        note: row.note;
-                        is-selected: row.is-selected;
-                        clicked => { root.select-change(index); }
+                    spacing: 0px;
+
+                    // 左：操作栏 + 列表
+                    VerticalLayout {
+                        horizontal-stretch: 3;
+                        spacing: 0px;
+
+                        Rectangle {
+                            height: 26px;
+                            background: Palette.panel;
+
+                            HorizontalLayout {
+                                padding-left: 6px;
+                                spacing: 4px;
+
+                                FlatButton {
+                                    text: "暂存";
+                                    enabled: !root.read-only;
+                                    clicked => { root.stage-selected(); }
+                                }
+                                FlatButton {
+                                    text: "反暂存";
+                                    enabled: !root.read-only;
+                                    clicked => { root.unstage-selected(); }
+                                }
+                                FlatButton {
+                                    text: "丢弃";
+                                    enabled: !root.read-only;
+                                    danger: true;
+                                    clicked => { root.discard-selected(); }
+                                }
+                                FlatButton {
+                                    text: "删除未跟踪";
+                                    enabled: !root.read-only && root.selection-is-untracked;
+                                    danger: true;
+                                    clicked => { root.delete-selected(); }
+                                }
+                                FlatButton {
+                                    text: "加入 .gitignore";
+                                    enabled: !root.read-only && root.selection-is-untracked;
+                                    clicked => { root.ignore-selected(0); }
+                                }
+                                FlatButton {
+                                    text: "加入 exclude";
+                                    enabled: !root.read-only && root.selection-is-untracked;
+                                    clicked => { root.ignore-selected(1); }
+                                }
+
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                        }
+
+                        ListView {
+                            vertical-stretch: 1;
+                            for row[index] in root.change-rows: ChangeRowView {
+                                height: 22px;
+                                path: row.path;
+                                code: row.code;
+                                bucket: row.bucket;
+                                note: row.note;
+                                is-selected: row.is-selected;
+                                is-conflict: row.is-conflict;
+                                clicked => { root.select-change(index); }
+                            }
+                        }
+                    }
+
+                    Rectangle { width: 1px; background: Palette.line; }
+
+                    // 右：提交面板
+                    VerticalLayout {
+                        width: 330px;
+                        padding: 8px;
+                        spacing: 6px;
+
+                        Text {
+                            text: "提交消息";
+                            color: Palette.text-dim;
+                            font-size: 11px;
+                        }
+
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: Palette.bg;
+                            border-color: Palette.border;
+                            border-width: 1px;
+                            border-radius: 3px;
+
+                            TextInput {
+                                x: 6px;
+                                y: 4px;
+                                width: parent.width - 12px;
+                                height: parent.height - 8px;
+                                text <=> root.commit-message;
+                                single-line: false;
+                                wrap: word-wrap;
+                                color: Palette.text;
+                                font-size: 12px;
+                                font-family: Palette.mono-font;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+
+                            CheckBox {
+                                text: "修订上次提交";
+                                checked: root.commit-amend;
+                                toggled => { root.toggle-amend(!root.commit-amend); }
+                            }
+
+                            CheckBox {
+                                text: "重置作者";
+                                checked: root.commit-reset-author;
+                                enabled: root.commit-amend;
+                                toggled => { root.toggle-reset-author(!root.commit-reset-author); }
+                            }
+                        }
+
+                        Text {
+                            text: root.commit-hint;
+                            color: Palette.text-faint;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+
+                        FlatButton {
+                            text: root.commit-amend ? "修订提交" : "提交";
+                            enabled: !root.read-only && root.commit-enabled && root.cli-missing == false;
+                            clicked => { root.commit(); }
+                        }
                     }
                 }
 
-                // Console
+                // ---- Console
                 ListView {
                     vertical-stretch: 1;
                     visible: root.bottom-tab == 1;
@@ -895,10 +1445,26 @@ export component MainWindow inherits Window {
             }
         }
 
+        // ---------------------------------------------------- 提示条
+        Rectangle {
+            height: root.toast == "" ? 0px : 24px;
+            background: Palette.warn-bg;
+            visible: root.toast != "";
+
+            Text {
+                x: 12px;
+                text: root.toast;
+                color: Palette.warn-text;
+                font-size: 11px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
         // ---------------------------------------------------- 状态栏
         Rectangle {
             height: 22px;
-            background: #2b2d30;
+            background: Palette.bar;
 
             HorizontalLayout {
                 padding-left: 10px;
@@ -907,7 +1473,7 @@ export component MainWindow inherits Window {
 
                 Text {
                     text: root.git-text;
-                    color: #8b9198;
+                    color: Palette.text-faint;
                     font-size: 11px;
                     vertical-alignment: center;
                 }
@@ -916,12 +1482,248 @@ export component MainWindow inherits Window {
 
                 Text {
                     text: root.has-repo ? root.branch-text : "";
-                    color: #8b9198;
+                    color: Palette.text-faint;
                     font-size: 11px;
                     vertical-alignment: center;
                 }
             }
         }
     }
-}
 
+    // ---------------------------------------------------- 二次确认遮罩
+    Rectangle {
+        visible: root.confirm-visible;
+        background: #00000099;
+
+        // 吃掉遮罩层的点击，避免点穿到底下的列表上。
+        TouchArea {}
+
+        Rectangle {
+            width: min(parent.width - 80px, 520px);
+            height: min(parent.height - 80px, 240px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Palette.panel;
+            border-color: root.confirm-danger ? Palette.red : Palette.border;
+            border-width: 1px;
+            border-radius: 6px;
+
+            VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+
+                Text {
+                    text: root.confirm-title;
+                    color: root.confirm-danger ? Palette.red : Palette.text;
+                    font-size: 15px;
+                    font-weight: 600;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { height: 1px; background: Palette.line; }
+
+                Text {
+                    vertical-stretch: 1;
+                    text: root.confirm-detail;
+                    color: Palette.text-dim;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+
+                    FlatButton {
+                        text: "取消";
+                        clicked => { root.confirm-no(); }
+                    }
+                    FlatButton {
+                        text: "确认执行";
+                        danger: root.confirm-danger;
+                        clicked => { root.confirm-yes(); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------- 设置遮罩（FR-SET）
+    Rectangle {
+        visible: root.settings-visible;
+        background: #00000099;
+
+        TouchArea {}
+
+        Rectangle {
+            width: min(parent.width - 80px, 620px);
+            height: min(parent.height - 60px, 540px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Palette.panel;
+            border-color: Palette.border;
+            border-width: 1px;
+            border-radius: 6px;
+
+            VerticalLayout {
+                padding: 18px;
+                spacing: 10px;
+
+                Text {
+                    text: "设置";
+                    color: Palette.text;
+                    font-size: 15px;
+                    font-weight: 600;
+                }
+
+                Rectangle { height: 1px; background: Palette.line; }
+
+                // 外观
+                Text { text: "外观"; color: Palette.text-dim; font-size: 12px; font-weight: 600; }
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    CheckBox {
+                        text: "深色主题（即时生效）";
+                        checked: root.dark-theme;
+                        toggled => { root.toggle-theme(!root.dark-theme); }
+                    }
+                }
+
+                // Git 行为
+                Text { text: "Git 行为"; color: Palette.text-dim; font-size: 12px; font-weight: 600; }
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    CheckBox {
+                        text: "staging 模式（hunk 级暂存）";
+                        checked: root.staging-mode;
+                        toggled => { root.staging-mode = !root.staging-mode; }
+                    }
+                    CheckBox {
+                        text: "分离头指针提交告警";
+                        checked: root.set-warn-detached;
+                        toggled => { root.set-warn-detached = !root.set-warn-detached; }
+                    }
+                    CheckBox {
+                        text: "CRLF 告警";
+                        checked: root.set-warn-crlf;
+                        toggled => { root.set-warn-crlf = !root.set-warn-crlf; }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Text {
+                        text: "更新策略";
+                        color: Palette.text-faint;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                    OptionToggle {
+                        text: "merge";
+                        checked: root.set-update-strategy == 0;
+                        toggled => { root.set-update-strategy = 0; }
+                    }
+                    OptionToggle {
+                        text: "rebase";
+                        checked: root.set-update-strategy == 1;
+                        toggled => { root.set-update-strategy = 1; }
+                    }
+                }
+
+                // 受保护分支 / 缓存
+                Text { text: "受保护分支（正则，逗号分隔）"; color: Palette.text-dim; font-size: 12px; font-weight: 600; }
+                Field {
+                    text <=> root.set-protected;
+                    placeholder: "^main$,^release/";
+                    monospace: true;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Text {
+                        text: "缓存预算 (MiB)";
+                        color: Palette.text-faint;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+
+                    OptionToggle {
+                        text: "8";
+                        checked: root.set-cache-mib == 8;
+                        toggled => { root.set-cache-mib = 8; }
+                    }
+                    OptionToggle {
+                        text: "16";
+                        checked: root.set-cache-mib == 16;
+                        toggled => { root.set-cache-mib = 16; }
+                    }
+                    OptionToggle {
+                        text: "32";
+                        checked: root.set-cache-mib == 32;
+                        toggled => { root.set-cache-mib = 32; }
+                    }
+                    OptionToggle {
+                        text: "64";
+                        checked: root.set-cache-mib == 64;
+                        toggled => { root.set-cache-mib = 64; }
+                    }
+
+                    Text {
+                        text: "日志级别";
+                        color: Palette.text-faint;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                    OptionToggle {
+                        text: "info";
+                        checked: root.set-log-level == 2;
+                        toggled => { root.set-log-level = 2; }
+                    }
+                    OptionToggle {
+                        text: "debug";
+                        checked: root.set-log-level == 3;
+                        toggled => { root.set-log-level = 3; }
+                    }
+                }
+
+                // 外部工具
+                Text { text: "外部工具（留空则用内置视图）"; color: Palette.text-dim; font-size: 12px; font-weight: 600; }
+                Field {
+                    text <=> root.set-diff-tool;
+                    placeholder: "外部 diff 命令";
+                    monospace: true;
+                }
+                Field {
+                    text <=> root.set-merge-tool;
+                    placeholder: "外部 merge 命令";
+                    monospace: true;
+                }
+
+                Text {
+                    text: root.set-status;
+                    color: Palette.text-faint;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+
+                    FlatButton {
+                        text: "取消";
+                        clicked => { root.close-settings(); }
+                    }
+                    FlatButton {
+                        text: "保存并应用";
+                        clicked => { root.apply-settings(); }
+                    }
+                }
+            }
+        }
+    }
+}

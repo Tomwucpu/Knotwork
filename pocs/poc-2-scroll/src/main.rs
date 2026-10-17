@@ -164,6 +164,14 @@ fn main() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("打开仓库失败: {e}");
+            eprintln!(
+                "提示：POC-2 必须用 large 档（滚动帧时间的意义就在规模）。\
+                 若目录不存在，按需生成："
+            );
+            eprintln!(
+                "  ./scripts/gen-synthetic-repo.sh test-repos/repos/large --commits 1000000 --branches 50"
+            );
+            eprintln!("日常一致性验证不需要 large，跑 poc3-consistency 的默认档位即可。");
             return;
         }
     };

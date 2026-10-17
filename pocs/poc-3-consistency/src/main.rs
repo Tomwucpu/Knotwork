@@ -9,7 +9,15 @@
 //!   C. 工作区状态（等价 `git status --porcelain=v1`，在专用 fixture 仓库上）
 //!   D. 树差异（等价 `git diff --name-status <a> <b>`）
 //!
-//! 用法：`poc3-consistency [基准仓库根目录]`，默认指向 `../../test-repos/repos`。
+//! 用法：`poc3-consistency [基准仓库根目录] [--include-large]`，
+//! 默认指向 `../../test-repos/repos`，默认只跑 `small` + `medium` 两档。
+//!
+//! # 为什么不默认跑 large
+//!
+//! `large`（100 万提交）与 `small`（1 千）/`medium`（5 万）走的是**同一条代码路径**：
+//! rev-list 遍历、元数据抽样、树差异。规模不带来额外的分支覆盖，只带来等待时间与
+//! 磁盘压力。因此它退化为**按需的规模验证**：日常与回归跑中小两档即可，
+//! 需要确认"大仓库下依然一致"时显式加 `--include-large`。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -372,25 +380,78 @@ fn build_fixture(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 默认参与对比的档位。
+///
+/// 两档合起来已覆盖全部代码路径：`small` 的 1060 个提交足以产生数十个合并气泡
+/// （泳道切换 / 多父遍历），`medium` 的 5 万个提交覆盖分页与抽样边界。
+const DEFAULT_TIERS: &[&str] = &["small", "medium"];
+
+/// 需要显式开启的规模档位（100 万提交）。
+const OPT_IN_TIER: &str = "large";
+
+fn print_usage() {
+    println!("用法：poc3-consistency [基准仓库根目录] [--include-large]");
+    println!();
+    println!("  基准仓库根目录   默认 ../../test-repos/repos");
+    println!("  --include-large  额外对比 large（100 万提交，耗时与磁盘压力显著）");
+    println!("  -h, --help       显示本帮助");
+}
+
+/// 解析命令行：返回（基准仓库根目录，是否包含 large）。
+fn parse_args() -> (PathBuf, bool) {
+    let mut base: Option<PathBuf> = None;
+    let mut include_large = false;
+
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--include-large" | "--all" => include_large = true,
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            other if other.starts_with('-') => {
+                eprintln!("未知参数：{other}");
+                print_usage();
+                std::process::exit(2);
+            }
+            other => base = Some(PathBuf::from(other)),
+        }
+    }
+
+    let base = base.unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-repos/repos")
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("../../test-repos/repos"))
+    });
+    (base, include_large)
+}
+
 fn main() {
-    let base = std::env::args().nth(1).map_or_else(
-        || {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../test-repos/repos")
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from("../../test-repos/repos"))
-        },
-        PathBuf::from,
-    );
+    let (base, include_large) = parse_args();
 
     println!("=== POC-3 gix 与 git CLI 一致性对比 ===");
-    println!("基准仓库根目录: {}\n", base.display());
+    println!("基准仓库根目录: {}", base.display());
+
+    let mut tiers: Vec<&str> = DEFAULT_TIERS.to_vec();
+    if include_large {
+        tiers.push(OPT_IN_TIER);
+    }
+    println!("对比档位: {}", tiers.join(" + "));
+    if !include_large && base.join(OPT_IN_TIER).join(".git").exists() {
+        println!("（已跳过 large：默认不跑大仓库，需要时加 --include-large）");
+    }
+    println!();
 
     let mut results = Vec::new();
 
-    for name in ["small", "medium", "large"] {
+    for name in tiers {
         let path = base.join(name);
         if !path.join(".git").exists() {
+            println!(
+                "跳过 {name}：{}/.git 不存在（见 test-repos/README.md 生成步骤）",
+                path.display()
+            );
             continue;
         }
         results.push(check_rev_list(&path));

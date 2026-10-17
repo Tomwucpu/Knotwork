@@ -65,6 +65,7 @@ pub fn recent_model(recent: &[gt_config::RecentRepo]) -> slint::ModelRc<generate
 pub use session::{Session, LOG_PAGE_SIZE};
 pub use view_model::{
     branch_text, build_change_rows, build_console_rows, build_diff_rows, build_graph_cells,
-    build_log_rows, build_recent_rows, build_ref_rows, head_text, lane_color, relative_time,
+    build_log_rows, build_recent_rows, build_ref_rows, diff_selection_hint, discard_confirmation,
+    discard_selection_confirmation, head_text, lane_color, ordered_refs, relative_time,
     state_banner, GraphKind,
 };

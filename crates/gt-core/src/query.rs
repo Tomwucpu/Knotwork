@@ -59,6 +59,38 @@ impl LogSort {
     }
 }
 
+/// 图呈现选项（FR-LOG-05）。
+///
+/// 与 [`LogFilter`] 分开是因为两者语义不同：筛选改变**返回哪些提交**，
+/// 图选项改变**这些提交怎么排列与省略**。但两者都会让日志 id 列表缓存失效，
+/// 因此 `LogIndex` 的缓存键同时包含二者。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct GraphOptions {
+    /// 排序方式。
+    pub sort: LogSort,
+    /// 只沿第一父项遍历（`git log --first-parent`）。
+    pub first_parent: bool,
+    /// 隐藏合并提交（`git log --no-merges`）。
+    pub hide_merges: bool,
+    /// 折叠线性历史：只保留分叉点 / 合并点 / 有引用或 HEAD 的提交。
+    ///
+    /// 交付口径说明（M2）：本项**压在 id 列表层**实现（等价"只看结构点"），
+    /// 与需求文档里"折叠后虚线显示、可点击单个分支折叠/展开"的视觉形态有差异；
+    /// 单分支点击折叠与虚线渲染顺延到 M4（见 M2 验收报告）。
+    pub collapse_linear: bool,
+}
+
+impl GraphOptions {
+    /// 是否有任何非默认选项（用于"是否走了过滤路径"的诊断）。
+    #[must_use]
+    pub const fn is_plain(&self) -> bool {
+        matches!(self.sort, LogSort::Date)
+            && !self.first_parent
+            && !self.hide_merges
+            && !self.collapse_linear
+    }
+}
+
 /// Log 视图的筛选条件。
 ///
 /// 条件的任何变更都构成一次**新的请求代次**，旧代次结果必须作废
@@ -97,7 +129,7 @@ impl LogFilter {
             filter: self.clone(),
             offset,
             limit: limit.clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE),
-            sort: LogSort::default(),
+            graph: GraphOptions::default(),
         }
     }
 }
@@ -111,8 +143,8 @@ pub struct LogPageRequest {
     pub offset: usize,
     /// 期望返回的提交数（会被裁剪到 `MIN..=MAX`）。
     pub limit: usize,
-    /// 排序方式。
-    pub sort: LogSort,
+    /// 图呈现选项（排序 / 第一父项 / 隐藏合并 / 折叠线性）。
+    pub graph: GraphOptions,
 }
 
 impl Default for LogPageRequest {
@@ -123,7 +155,7 @@ impl Default for LogPageRequest {
             filter: LogFilter::default(),
             offset: 0,
             limit: DEFAULT_PAGE_SIZE,
-            sort: LogSort::default(),
+            graph: GraphOptions::default(),
         }
     }
 }
@@ -172,8 +204,8 @@ impl LogNodePage {
 #[cfg(test)]
 mod tests {
     use super::{
-        BranchScope, LogFilter, LogNodePage, LogPageRequest, LogSort, DEFAULT_PAGE_SIZE,
-        MAX_PAGE_SIZE, MIN_PAGE_SIZE,
+        BranchScope, GraphOptions, LogFilter, LogNodePage, LogPageRequest, LogSort,
+        DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MIN_PAGE_SIZE,
     };
 
     #[test]
@@ -182,6 +214,46 @@ mod tests {
         assert_eq!(BranchScope::default(), BranchScope::LocalAndUpstream);
         assert_eq!(LogSort::default(), LogSort::Date);
         assert!(LogFilter::default().is_unfiltered());
+    }
+
+    #[test]
+    fn graph_options_default_to_plain_rendering() {
+        let options = GraphOptions::default();
+        assert!(options.is_plain());
+        assert_eq!(options.sort, LogSort::Date);
+        assert!(!options.first_parent);
+        assert!(!options.hide_merges);
+        assert!(!options.collapse_linear);
+
+        // 任一选项打开都不再是"plain"，缓存键必须随之变化。
+        for options in [
+            GraphOptions {
+                sort: LogSort::Topological,
+                ..GraphOptions::default()
+            },
+            GraphOptions {
+                first_parent: true,
+                ..GraphOptions::default()
+            },
+            GraphOptions {
+                hide_merges: true,
+                ..GraphOptions::default()
+            },
+            GraphOptions {
+                collapse_linear: true,
+                ..GraphOptions::default()
+            },
+        ] {
+            assert!(!options.is_plain(), "{options:?}");
+            assert_eq!(
+                LogPageRequest {
+                    graph: options,
+                    ..LogPageRequest::default()
+                }
+                .graph,
+                options
+            );
+        }
     }
 
     #[test]

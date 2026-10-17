@@ -15,6 +15,7 @@
 //! | [`status`] | 工作区状态条目与 porcelain XY 映射 |
 //! | [`state`] | 仓库进行中操作状态（merge/rebase 等，FR-STA-02） |
 //! | [`query`] | Log 筛选/排序条件与分页模型 |
+//! | [`commit_check`] | 提交前检查（空消息 / detached / 进行中，FR-CMT-03） |
 //!
 //! 设计约定：本 crate 中的类型**不持有仓库句柄、不做 I/O**；字符串一律为拥有型
 //! （`String`），以便跨线程传递。热路径上的字符串驻留与索引化（架构规划 5.8）
@@ -22,6 +23,7 @@
 
 pub mod change;
 pub mod commit;
+pub mod commit_check;
 pub mod oid;
 pub mod query;
 pub mod refs;
@@ -30,10 +32,11 @@ pub mod status;
 
 pub use change::{ChangeKind, FileChange};
 pub use commit::{CommitMeta, LogNode};
+pub use commit_check::{check_commit, CommitCheck, CommitCheckInput};
 pub use oid::{Oid, ParseOidError, OID_LEN};
 pub use query::{
-    BranchScope, LogFilter, LogNodePage, LogPageRequest, LogSort, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
-    MIN_PAGE_SIZE,
+    BranchScope, GraphOptions, LogFilter, LogNodePage, LogPageRequest, LogSort, DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE, MIN_PAGE_SIZE,
 };
 pub use refs::{HeadInfo, HeadKind, RefInfo, RefKind};
 pub use state::{MarkerPresence, RepoState, ResumableActions};

@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use gt_core::{
@@ -163,6 +164,12 @@ impl GitRepo {
     #[must_use]
     pub fn location(&self) -> &RepoLocation {
         &self.location
+    }
+
+    /// 命令审计观察者（写路径复用同一处，保证一次用户操作只留一条记录）。
+    #[must_use]
+    pub fn observer(&self) -> SharedObserver {
+        Arc::clone(&self.observer)
     }
 
     /// 转成可跨线程共享的句柄（共享 odb 缓存；各线程自行生成本地句柄）。
@@ -357,8 +364,8 @@ impl GitRepo {
             }
         }
 
-        if request.sort == LogSort::Topological {
-            tracing::debug!("M1 暂不实现拓扑排序选项，沿用提交日期序（FR-LOG-05 属 M2）");
+        if request.graph.sort == LogSort::Topological {
+            tracing::debug!("拓扑排序在 walk_ids_with 中完成，本函数只负责取元数据");
         }
 
         self.record(
@@ -472,6 +479,19 @@ impl GitRepo {
         Ok(accumulator.into_change_set())
     }
 
+    /// 当前仓库生效的 `user.email`（FR-LOG-06 的"我的提交"判定依据）。
+    ///
+    /// 读配置快照，不产生子进程；未配置时返回 [`None`]（此时不做高亮，
+    /// 而不是把所有提交都当成"我的"）。
+    #[must_use]
+    pub fn user_email(&self) -> Option<String> {
+        self.inner
+            .config_snapshot()
+            .string("user.email")
+            .map(|value| bs(&value))
+            .filter(|value| !value.is_empty())
+    }
+
     /// 当前仓库适用的 porcelain 路径渲染口径（读取 `core.quotepath`）。
     ///
     /// git 出厂配置为 `true`（非 ASCII 转义成 `\344\270\255`）；用户显式设为
@@ -546,6 +566,17 @@ impl GitRepo {
             .collect())
     }
 
+    /// 当前索引中某路径是否处于"未合并"状态（冲突）。
+    ///
+    /// 供 `gt-service` 在写操作前给出更准确的提示：冲突文件的 hunk 暂存会被
+    /// `git apply --cached` 拒绝，提前说明比让用户看到一句 fatal 更友好。
+    ///
+    /// # Errors
+    /// 索引损坏时返回 [`BackendError::Status`]。
+    pub fn path_is_conflicted(&self, path: &str) -> Result<bool> {
+        Ok(self.unmerged_kinds()?.contains_key(path))
+    }
+
     /// 计算两个修订之间的树差异（等价 `git diff --name-status <old> <new>`）。
     ///
     /// `old` 为 [`None`] 表示**空树**：即根提交与"无"的差异，对应
@@ -591,6 +622,150 @@ impl GitRepo {
             None,
         );
         Ok(out)
+    }
+
+    /// 按图选项枚举提交 id（FR-LOG-05）。
+    ///
+    /// 与 [`Self::walk_ids`] 的差别：
+    /// - `first_parent` 走 revwalk 的第一父项模式（`git log --first-parent`）；
+    /// - `hide_merges` 在遍历过程中就地过滤（父项数在 `Info` 里已有，不额外读对象）；
+    /// - `sort == Topological` 在本函数内做一次拓扑重排（见 [`topo_order`]）；
+    /// - `collapse_linear` 只保留"结构点"（见 [`collapse_linear`]）。
+    ///
+    /// 返回值附带一个可选的降级说明：拓扑排序需要把整段历史的父项关系留在内存里，
+    /// 超过 [`TOPO_MAX_NODES`] 时退回日期序并如实告知界面 —— 静默降级会让用户
+    /// 以为"排序没生效"是 bug。
+    ///
+    /// # Errors
+    /// 遍历失败时返回 [`BackendError::Object`]。
+    pub fn walk_ids_with(
+        &self,
+        request: &LogPageRequest,
+        limit: Option<usize>,
+    ) -> Result<(Vec<Oid>, Option<String>)> {
+        let began = Instant::now();
+        let graph = request.graph;
+        let tips = self.log_tips(request.filter.scope)?;
+        let mut note = None;
+
+        let mut nodes: Vec<GraphNode> = Vec::new();
+        if !tips.is_empty() {
+            let gix_tips: Vec<gix::ObjectId> = tips.iter().map(|oid| to_gix_oid(*oid)).collect();
+            // `first_parent_only` 是 Platform 上的构建期选项，必须在 `.all()` 之前设。
+            let mut platform = self.inner.rev_walk(gix_tips);
+            if graph.first_parent {
+                platform = platform.first_parent_only();
+            }
+            let walk = platform
+                .all()
+                .map_err(|err| BackendError::Object(err.to_string()))?;
+
+            for info in walk {
+                let info = info.map_err(|err| BackendError::Object(err.to_string()))?;
+                let parents: Vec<Oid> = info.parent_ids.iter().map(|id| to_core_oid(*id)).collect();
+                if graph.hide_merges && parents.len() > 1 {
+                    continue;
+                }
+                nodes.push(GraphNode {
+                    id: to_core_oid(info.id),
+                    parents,
+                });
+                // 必须先收完整段再排序/折叠，因此这里的 limit 只用于防失控。
+                if limit.is_some_and(|limit| nodes.len() >= limit) {
+                    break;
+                }
+            }
+        }
+
+        let mut ids: Vec<Oid> = if graph.sort == LogSort::Topological {
+            if nodes.len() > TOPO_MAX_NODES {
+                note = Some(format!(
+                    "提交数超过 {TOPO_MAX_NODES}，拓扑排序已退回提交日期序（结果仍为拓扑有效序）"
+                ));
+                nodes.iter().map(|node| node.id).collect()
+            } else {
+                topo_order(&nodes)
+            }
+        } else {
+            nodes.iter().map(|node| node.id).collect()
+        };
+
+        if graph.collapse_linear {
+            let mut anchors: BTreeSet<Oid> = tips.iter().copied().collect();
+            for reference in self.refs()? {
+                anchors.insert(reference.target);
+            }
+            ids = collapse_linear(&nodes, &ids, &anchors);
+        }
+
+        if let Some(limit) = limit {
+            ids.truncate(limit);
+        }
+
+        self.record(
+            format!(
+                "git rev-list{} {}（内置引擎）",
+                match request.filter.scope {
+                    BranchScope::All => " --all",
+                    BranchScope::LocalAndUpstream => " --branches HEAD",
+                },
+                graph_flags(graph)
+            ),
+            began,
+            None,
+        );
+        Ok((ids, note))
+    }
+
+    /// 读取索引中某路径的内容（"已暂存"一侧的差异输入）。
+    ///
+    /// `HEAD` 侧没有对应文件时（新增文件）返回 [`None`]；超过 `max_bytes`
+    /// 同样返回 [`None`] 交由上层显示占位。
+    ///
+    /// # Errors
+    /// 索引损坏时返回 [`BackendError::Status`]。
+    pub fn index_blob(&self, path: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+        let began = Instant::now();
+        if !self.inner.index_path().exists() {
+            return Ok(None);
+        }
+        let index = self
+            .inner
+            .open_index()
+            .map_err(|err| BackendError::Status(err.to_string()))?;
+
+        let bpath = gix::bstr::BStr::new(path.as_bytes());
+        let Some(entry) = index.entry_by_path(bpath) else {
+            self.record(
+                format!("git show :{path}（内置引擎，索引中不存在）"),
+                began,
+                None,
+            );
+            return Ok(None);
+        };
+
+        let id = entry.id;
+        let header = self
+            .inner
+            .find_header(id)
+            .map_err(|err| BackendError::Object(err.to_string()))?;
+        if header.size() > max_bytes as u64 {
+            self.record(
+                format!("git show :{path}（内置引擎，超阈值跳过）"),
+                began,
+                None,
+            );
+            return Ok(None);
+        }
+
+        let mut blob = self
+            .inner
+            .find_object(id)
+            .map_err(|err| BackendError::Object(err.to_string()))?
+            .into_blob();
+        let data = blob.take_data();
+        self.record(format!("git show :{path}（内置引擎）"), began, None);
+        Ok(Some(data))
     }
 
     /// 读取某个修订下某路径的内容。
@@ -1138,12 +1313,153 @@ fn placeholder_meta(id: Oid) -> CommitMeta {
     }
 }
 
+/// 提交图窗口中的一个节点（遍历时顺带留下父项，供排序与折叠使用）。
+#[derive(Debug, Clone)]
+pub struct GraphNode {
+    /// 提交 id。
+    pub id: Oid,
+    /// 父提交（第一父项在前）。
+    pub parents: Vec<Oid>,
+}
+
+/// 拓扑排序允许留在内存里的节点上限。
+///
+/// 200k 节点 ≈ 逐节点 20 字节 id + 父项表，实测约 15–25MB；作为"排序"这种
+/// 纯展示选项，不值得为它突破内存预算（NFR-MEM-03），因此超限即退回日期序
+/// 并把降级原因交给界面。
+pub const TOPO_MAX_NODES: usize = 200_000;
+
+/// 把"按提交日期"的节点序列重排成拓扑序（IntelliSort 的排序基础）。
+///
+/// 算法是带"就绪栈"的 Kahn：只有当一个提交的**全部子提交都已输出**时它才就绪；
+/// 就绪后优先沿第一父项继续下潜（这正是 `git rev-list --topo-order` 的
+/// "不把多条历史交错显示"的行为：8,6,5,3,7,4,2,1）。
+///
+/// 与"先做 DFS 再兜底"的写法相比，`pending_children` 计数保证了
+/// **任何提交都不会出现在它的某个子提交之前** —— 这是 `gt-graph` 泳道布局的
+/// 硬前提（`LaneLayout` 的拓扑校验会直接报违规）。
+#[must_use]
+pub fn topo_order(nodes: &[GraphNode]) -> Vec<Oid> {
+    use std::collections::{HashMap, VecDeque};
+
+    let position: HashMap<Oid, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id, index))
+        .collect();
+
+    // pending[index] = "还有多少个窗口内子提交没输出"。
+    let mut pending = vec![0u32; nodes.len()];
+    for node in nodes {
+        for parent in &node.parents {
+            if let Some(&index) = position.get(parent) {
+                pending[index] += 1;
+            }
+        }
+    }
+
+    // 初始就绪集合按日期序入队（保证同级节点之间的顺序与 `git log` 一致）。
+    let mut queue: VecDeque<usize> = pending
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count == 0)
+        .map(|(index, _)| index)
+        .collect();
+
+    let mut stack: Vec<usize> = Vec::new();
+    let mut emitted = vec![false; nodes.len()];
+    let mut out: Vec<Oid> = Vec::with_capacity(nodes.len());
+
+    loop {
+        let next = stack.pop().or_else(|| queue.pop_front());
+        let Some(index) = next else {
+            break;
+        };
+        if emitted[index] {
+            continue;
+        }
+        emitted[index] = true;
+        out.push(nodes[index].id);
+
+        // 逆序压栈 → 第一父项最后压入、最先弹出，形成"沿主干下潜"的次序。
+        for parent in nodes[index].parents.iter().rev() {
+            let Some(&parent_index) = position.get(parent) else {
+                continue;
+            };
+            pending[parent_index] -= 1;
+            if pending[parent_index] == 0 {
+                stack.push(parent_index);
+            }
+        }
+    }
+
+    // 理论上不会有剩余（窗口内无环）；真出现环时也要把剩下的按日期序补齐，
+    // 否则界面会少行 —— 少行比顺序不完美更难解释。
+    if out.len() < nodes.len() {
+        for (index, node) in nodes.iter().enumerate() {
+            if !emitted[index] {
+                out.push(node.id);
+            }
+        }
+    }
+    out
+}
+
+/// 只保留"结构点"：合并、根、分叉、分支尖端、以及有引用 / HEAD 的提交。
+///
+/// 这是"折叠线性分支"在 id 列表层的实现（见
+/// [`gt_core::GraphOptions::collapse_linear`] 的交付口径说明）。
+#[must_use]
+pub fn collapse_linear(nodes: &[GraphNode], order: &[Oid], anchors: &BTreeSet<Oid>) -> Vec<Oid> {
+    use std::collections::HashMap;
+
+    let mut children: HashMap<Oid, u32> = HashMap::new();
+    for node in nodes {
+        for parent in &node.parents {
+            *children.entry(*parent).or_insert(0) += 1;
+        }
+    }
+
+    let by_id: HashMap<Oid, &GraphNode> = nodes.iter().map(|node| (node.id, node)).collect();
+    order
+        .iter()
+        .filter(|id| {
+            let Some(node) = by_id.get(id) else {
+                // 不在窗口内的 id（理论上不会出现）保留，避免意外丢行。
+                return true;
+            };
+            let parents = node.parents.len();
+            let child_count = children.get(*id).copied().unwrap_or(0);
+            parents != 1 || child_count != 1 || anchors.contains(*id)
+        })
+        .copied()
+        .collect()
+}
+
+/// 图选项的审计标签。
+fn graph_flags(graph: gt_core::GraphOptions) -> String {
+    let mut flags = Vec::new();
+    if graph.first_parent {
+        flags.push("--first-parent");
+    }
+    if graph.hide_merges {
+        flags.push("--no-merges");
+    }
+    if graph.sort == LogSort::Topological {
+        flags.push("--topo-order");
+    }
+    if flags.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", flags.join(" "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{classify_ref, conflict_kind_from_stages, shorten_ref, RepoLocation};
     use gt_core::{ConflictKind, RefKind};
     use std::path::PathBuf;
-
     #[test]
     fn conflict_stages_map_to_porcelain_codes() {
         // 与 `git status --porcelain` 文档中的冲突码逐条对应。
@@ -1223,6 +1539,150 @@ mod tests {
         assert_eq!(
             bare.work_dir_or_git_dir(),
             PathBuf::from("/tmp/bare/other.git")
+        );
+    }
+
+    /// 构造图节点用的 oid。
+    fn oid(seed: u8) -> gt_core::Oid {
+        gt_core::Oid::from_bytes(&[seed; 20]).expect("Oid")
+    }
+
+    fn node(seed: u8, parents: &[u8]) -> super::GraphNode {
+        super::GraphNode {
+            id: oid(seed),
+            parents: parents.iter().copied().map(oid).collect(),
+        }
+    }
+
+    #[test]
+    fn topo_order_keeps_children_before_parents() {
+        // 0 → (1, 2)；1 → 3；2 → 3。日期序恰好是 0,1,2,3。
+        let nodes = vec![node(0, &[1, 2]), node(1, &[3]), node(2, &[3]), node(3, &[])];
+        let order = super::topo_order(&nodes);
+        assert_eq!(order.len(), 4);
+        // 不变量：任何提交都不出现在它的子提交之前。
+        let position: std::collections::HashMap<_, _> = order
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (*id, index))
+            .collect();
+        for item in &nodes {
+            for parent in &item.parents {
+                assert!(
+                    position[&item.id] < position[parent],
+                    "子提交必须排在父提交之前"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn topo_order_keeps_the_first_parent_chain_together() {
+        // 8 的两父：6（第一父）与 7（第二父，侧枝）。
+        // 期望：8 之后紧跟第一父链 6,5,3，再回到 7,4,2,1。
+        let nodes = vec![
+            node(8, &[6, 7]),
+            node(7, &[4]),
+            node(6, &[5]),
+            node(5, &[3]),
+            node(4, &[2]),
+            node(3, &[]),
+            node(2, &[1]),
+            node(1, &[]),
+        ];
+        let order = super::topo_order(&nodes);
+        assert_eq!(
+            order,
+            vec![
+                oid(8),
+                oid(6),
+                oid(5),
+                oid(3),
+                oid(7),
+                oid(4),
+                oid(2),
+                oid(1)
+            ],
+            "应按第一父项下潜，与 git rev-list --topo-order 的形状一致"
+        );
+    }
+
+    #[test]
+    fn topo_order_survives_a_disconnected_chain() {
+        // 两条互不相关的历史（多分支且无公共祖先）：不得丢行。
+        let nodes = vec![node(1, &[2]), node(2, &[]), node(3, &[4]), node(4, &[])];
+        let order = super::topo_order(&nodes);
+        assert_eq!(order.len(), 4, "任何节点都不能被丢掉：{order:?}");
+    }
+
+    #[test]
+    fn collapse_keeps_only_structural_points() {
+        // 纯线性链 1-2-3-4：只保留尖端与根。
+        let nodes = vec![node(1, &[2]), node(2, &[3]), node(3, &[4]), node(4, &[])];
+        let order: Vec<_> = nodes.iter().map(|item| item.id).collect();
+        let collapsed = super::collapse_linear(&nodes, &order, &std::collections::BTreeSet::new());
+        assert_eq!(collapsed, vec![oid(1), oid(4)], "线性中间提交应被折叠");
+
+        // 同样的链，但把 2 标成引用点（分支指向它）→ 必须保留。
+        let anchors = std::collections::BTreeSet::from([oid(2)]);
+        let collapsed = super::collapse_linear(&nodes, &order, &anchors);
+        assert_eq!(collapsed, vec![oid(1), oid(2), oid(4)], "引用点不得被折叠");
+    }
+
+    #[test]
+    fn collapse_keeps_merge_and_branch_points() {
+        // 10 是合并提交；12 有两个子（11 与 20），是分叉点；
+        // 11 与 20 都是"单子单父"的线性中间节点，应被折叠。
+        let nodes = vec![
+            node(10, &[11, 20]),
+            node(11, &[12]),
+            node(12, &[13]),
+            node(13, &[]),
+            node(20, &[12]),
+        ];
+        let order: Vec<_> = nodes.iter().map(|item| item.id).collect();
+        let collapsed = super::collapse_linear(&nodes, &order, &std::collections::BTreeSet::new());
+        assert_eq!(
+            collapsed,
+            vec![oid(10), oid(12), oid(13)],
+            "合并点 10、分叉点 12、根 13 保留；线性中间节点 11/20 折叠"
+        );
+    }
+
+    #[test]
+    fn collapse_keeps_branch_points() {
+        // 5 有两个子（4 与 6），是分叉点，必须保留。
+        let nodes = vec![node(4, &[5]), node(5, &[7]), node(6, &[5]), node(7, &[])];
+        let order: Vec<_> = nodes.iter().map(|node| node.id).collect();
+        let collapsed = super::collapse_linear(&nodes, &order, &std::collections::BTreeSet::new());
+        assert!(
+            collapsed.contains(&oid(5)),
+            "分叉点不得被折叠：{collapsed:?}"
+        );
+        assert!(
+            collapsed.contains(&oid(4)) && collapsed.contains(&oid(6)),
+            "尖端保留"
+        );
+    }
+
+    #[test]
+    fn graph_flags_render_expected_cli_arguments() {
+        use gt_core::GraphOptions;
+        assert_eq!(super::graph_flags(GraphOptions::default()), "");
+        assert_eq!(
+            super::graph_flags(GraphOptions {
+                first_parent: true,
+                ..GraphOptions::default()
+            }),
+            " --first-parent"
+        );
+        assert_eq!(
+            super::graph_flags(GraphOptions {
+                hide_merges: true,
+                sort: gt_core::LogSort::Topological,
+                ..GraphOptions::default()
+            }),
+            " --no-merges --topo-order"
         );
     }
 }

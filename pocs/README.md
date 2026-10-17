@@ -49,11 +49,16 @@ cargo build --release --workspace
 ### POC-3 一致性对比
 
 ```bash
-../target/release/poc3-consistency                 # 默认扫描 ../test-repos/repos
+../target/release/poc3-consistency                 # 默认扫描 ../test-repos/repos 的 small + medium
 ../target/release/poc3-consistency <仓库根目录>
+../target/release/poc3-consistency --include-large  # 额外纳入 large（100 万提交，按需）
 ```
 
 对 A（rev-list）/B（提交元数据）/C（status）/D（树差异）逐项比对并打印 PASS/FAIL。
+
+**默认只跑 `small` + `medium`。** `large` 与中小两档走完全相同的代码路径，
+规模不带来额外分支覆盖，只带来等待时间与磁盘压力，因此退化为按需的规模验证：
+只有需要确认"百万提交仓库下依然一致"时才加 `--include-large`。
 
 ### POC-4 泳道布局
 
@@ -66,7 +71,11 @@ cargo build --release --workspace
 ## 说明
 
 - POC-2 依赖 `test-repos/repos/large`（约 100 万提交），需先由
-  `scripts/gen-synthetic-repo.sh` 生成。
+  `scripts/gen-synthetic-repo.sh` 生成；这是唯一必须用 large 的探针（滚动帧时间的
+  意义就在规模），属手动执行的规模验证，不进入日常回归。
+- **日常与回归验证只需 `small` + `medium`。** `large` 不必生成、也不必保留 ——
+  删掉后 POC-3 会自动跳过，主 workspace 的 `cargo test` 完全不受影响（一致性套件
+  自建临时仓库）。
 - POC-3 会在系统临时目录创建 fixture 仓库用于工作区状态对比。
 - 这些工程仅用于 M0 验证；POC-3 的对比脚本与 POC-4 的算法将按 M1 任务
   （1-11 / 1-4）工程化进 `gt-backend` 与 `gt-graph`。

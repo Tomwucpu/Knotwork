@@ -49,7 +49,8 @@ pub use service::{
     ChangeImpact, GitService, RepoHandle, MAX_BLOB_BYTES,
 };
 pub use task::{
-    Delivery, LogPageResult, Outcome, RepoOverview, RequestError, RequestKind, RequestLane,
+    Delivery, DiffSide, LogPageResult, Outcome, RepoOverview, RequestError, RequestKind,
+    RequestLane, SearchRequest, SearchResult, SelectionMode, WriteRequest,
 };
 pub use watch::{
     merge_events, ChangeBatch, ChangeSink, Relevance, RepoPaths, RepoWatcher, WatchError,

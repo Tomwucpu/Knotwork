@@ -23,19 +23,41 @@
 //! | 进行中操作探测 | [`GitRepo::repo_state`] | FR-STA-02 |
 //! | git 可执行文件探测与执行 | [`GitCli`] | FR-STA-04、FR-RMT-05 |
 //! | 命令审计记录 | [`CommandRecord`]、[`CommandObserver`] | FR-CON-01 |
+//!
+//! # M2 新增
+//!
+//! | 能力 | 实现 | 需求 |
+//! |---|---|---|
+//! | 暂存 / 反暂存 / 丢弃 / 删除未跟踪 | [`RepoWriter`] | FR-LC-02 |
+//! | hunk 与行级暂存（`git apply --cached`） | [`RepoWriter::apply_patch_cached`] | FR-LC-03、FR-DIF-05 |
+//! | 提交与 amend（hooks 由 CLI 执行） | [`RepoWriter::commit`] | FR-CMT-01/02/03 |
+//! | 分支增删改 / 检出 / 上游 | [`RepoWriter::branch`] | FR-BR-01/02 |
+//! | 忽略规则写入 | [`RepoWriter::append_ignore`] | FR-LC-04 |
+//! | 提交消息搜索 | [`RepoWriter::search_commits`] | FR-LOG-03 |
+//! | 仓库写锁（只读降级） | [`WriteLock`]、[`LockAttempt`] | FR-MR-04 |
 
 pub mod cli;
 pub mod error;
+pub mod lock;
 pub mod record;
 pub mod repo;
+pub mod work;
 
-pub use cli::{CliOutput, GitCli, LOCAL_TIMEOUT, NETWORK_TIMEOUT};
+pub use cli::{CancelProbe, CliOutput, GitCli, LOCAL_TIMEOUT, NETWORK_TIMEOUT};
 pub use error::{BackendError, Result};
+pub use lock::{LockAttempt, WriteLock};
 pub use record::{
     noop_observer, CommandObserver, CommandRecord, CommandRoute, NoopObserver, SharedObserver,
     MAX_CAPTURE_BYTES,
 };
-pub use repo::{BlobPair, GitRepo, RepoLocation, SharedGitRepo};
+pub use repo::{
+    collapse_linear, topo_order, BlobPair, GitRepo, GraphNode, RepoLocation, SharedGitRepo,
+    TOPO_MAX_NODES,
+};
+pub use work::{
+    BranchOp, CommitRequest, IgnoreTarget, RepoWriter, UpstreamRow, WriteOutcome, LOCK_FILE_NAME,
+    SEARCH_TIMEOUT,
+};
 
 use gt_core::RepoId;
 

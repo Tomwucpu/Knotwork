@@ -4,7 +4,7 @@
 //!
 //! 三条原因：
 //!
-//! 1. **渲染需要的信息比领域模型多**（泳道颜色、行号槽、分段文本），
+//! 1. **渲染需要的信息比领域模型多**（泳道颜色、行号槽、分段文本、可选择标记），
 //!    而这些都要在 UI 线程上算；算在 Rust 侧才能被单测覆盖；
 //! 2. **Slint 的 `ModelRc` 要求 `'static` + `Clone`**，借用式领域模型无法直接传递；
 //! 3. **词级高亮不做文本测量**：把行拆成"分段文本 + 是否变更"的平行数组，
@@ -13,6 +13,7 @@
 //! 本模块**只做纯转换**（输入领域模型 → 输出行结构），不接触 I/O 与线程，
 //! 因此可以脱离 Slint 运行时直接单测。
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use gt_backend::CommandRecord;
@@ -139,6 +140,8 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 ///
 /// `nodes`、`layouts`、`refs_of` 三者下标必须一一对应；长度不一致时按最短的截断，
 /// 宁可少画几行，也不要错位（错位的泳道图比缺几行难排查得多）。
+///
+/// `my_email` 用于 FR-LOG-06 的"我的提交加粗"：与该邮箱一致的作者视为本人。
 #[must_use]
 pub fn build_log_rows(
     nodes: &[CommitMeta],
@@ -146,11 +149,15 @@ pub fn build_log_rows(
     refs_of: &[String],
     selected: Option<usize>,
     now: i64,
+    my_email: Option<&str>,
 ) -> Vec<LogRow> {
     let count = nodes.len().min(layouts.len());
     let mut rows = Vec::with_capacity(count);
     for index in 0..count {
         let node = &nodes[index];
+        let is_mine = my_email.is_some_and(|email| {
+            !email.is_empty() && node.author_email.eq_ignore_ascii_case(email)
+        });
         rows.push(LogRow {
             short_id: SharedString::from(node.short_id()),
             subject: SharedString::from(node.summary.as_str()),
@@ -158,6 +165,8 @@ pub fn build_log_rows(
             when: SharedString::from(relative_time(node.author_time, now)),
             refs_text: SharedString::from(refs_of.get(index).map_or("", String::as_str)),
             is_selected: selected == Some(index),
+            is_mine,
+            is_merge: node.is_merge(),
             graph: rc_model(build_graph_cells(&layouts[index])),
         });
     }
@@ -166,14 +175,19 @@ pub fn build_log_rows(
 
 /// 把差异载荷拆成界面行。
 ///
-/// 占位载荷（二进制 / 过大）会合成一行说明，而不是留空 —— 空白的 diff 面板
-/// 会让用户误以为"没有差异"。
+/// 每一行都带上"它来自哪个 hunk、hunk 内第几行"，界面据此把点击换算成补丁选择：
+/// - hunk 头行：`line-index == -1`，点击表示"整块"；
+/// - 增删行：`selectable == true`；
+/// - 上下文行与占位行：不可选。
+///
+/// `selected` 里是**界面行下标**，不是 diff 行下标 —— 两者在加入 hunk 头行后不再相同。
 #[must_use]
-pub fn build_diff_rows(diff: &FileDiff) -> Vec<DiffRow> {
+pub fn build_diff_rows(diff: &FileDiff, selected: &BTreeSet<usize>) -> Vec<DiffRow> {
+    let mut rows = Vec::new();
     match &diff.payload {
         DiffPayload::Text(hunks) => {
-            let mut rows = Vec::new();
-            for hunk in hunks {
+            for (hunk_index, hunk) in hunks.iter().enumerate() {
+                let hunk_index_i32 = i32::try_from(hunk_index).unwrap_or(-1);
                 rows.push(DiffRow {
                     kind: 3,
                     old_no: SharedString::new(),
@@ -181,22 +195,34 @@ pub fn build_diff_rows(diff: &FileDiff) -> Vec<DiffRow> {
                     segments: rc_model(vec![SharedString::from(hunk.header())]),
                     changed: rc_model(vec![false]),
                     is_hunk_header: true,
+                    hunk_index: hunk_index_i32,
+                    line_index: -1,
+                    selectable: true,
+                    selected: false,
                 });
-                for line in &hunk.lines {
-                    rows.push(diff_row(line));
+                for (line_index, line) in hunk.lines.iter().enumerate() {
+                    let mut row = diff_row(line);
+                    row.hunk_index = hunk_index_i32;
+                    row.line_index = i32::try_from(line_index).unwrap_or(-1);
+                    row.selectable = line.kind.is_change();
+                    rows.push(row);
                 }
             }
-            rows
         }
-        DiffPayload::Binary => vec![placeholder_row("（二进制文件，不显示内容差异）")],
+        DiffPayload::Binary => rows.push(placeholder_row("（二进制文件，不显示内容差异）")),
         DiffPayload::TooLarge {
             old_bytes,
             new_bytes,
-        } => vec![placeholder_row(&format!(
+        } => rows.push(placeholder_row(&format!(
             "（文件过大，已跳过差异计算：旧 {old_bytes} 字节 / 新 {new_bytes} 字节）"
-        ))],
-        DiffPayload::Empty => vec![placeholder_row("（两侧内容相同或为空）")],
+        ))),
+        DiffPayload::Empty => rows.push(placeholder_row("（两侧内容相同或为空）")),
     }
+
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.selected = selected.contains(&index);
+    }
+    rows
 }
 
 /// 占位说明行。
@@ -208,6 +234,10 @@ fn placeholder_row(text: &str) -> DiffRow {
         segments: rc_model(vec![SharedString::from(text)]),
         changed: rc_model(vec![false]),
         is_hunk_header: false,
+        hunk_index: -1,
+        line_index: -1,
+        selectable: false,
+        selected: false,
     }
 }
 
@@ -243,6 +273,10 @@ fn diff_row(line: &DiffLine) -> DiffRow {
         segments: rc_model(segments),
         changed: rc_model(changed),
         is_hunk_header: false,
+        hunk_index: -1,
+        line_index: -1,
+        selectable: false,
+        selected: false,
     }
 }
 
@@ -253,24 +287,30 @@ pub fn build_change_rows(changes: &ChangeSet, selected: Option<usize>) -> Vec<Ch
         .entries
         .iter()
         .enumerate()
-        .map(|(index, entry)| ChangeRow {
-            path: SharedString::from(entry.porcelain_path()),
-            code: SharedString::from(match entry.conflict {
-                Some(kind) => {
-                    let (x, y) = kind.code();
-                    format!("{x}{y}")
-                }
-                None => format!("{}{}", entry.index.letter(), entry.worktree.letter()),
-            }),
-            bucket: SharedString::from(entry.bucket().label()),
-            note: SharedString::from(match entry.conflict {
-                Some(kind) => kind.label().to_owned(),
-                None => entry
-                    .old_path
-                    .as_ref()
-                    .map_or_else(String::new, |old| format!("原路径 {old}")),
-            }),
-            is_selected: selected == Some(index),
+        .map(|(index, entry)| {
+            let is_untracked = entry.index == gt_core::StatusFlag::Untracked
+                || entry.worktree == gt_core::StatusFlag::Untracked;
+            ChangeRow {
+                path: SharedString::from(entry.porcelain_path()),
+                code: SharedString::from(match entry.conflict {
+                    Some(kind) => {
+                        let (x, y) = kind.code();
+                        format!("{x}{y}")
+                    }
+                    None => format!("{}{}", entry.index.letter(), entry.worktree.letter()),
+                }),
+                bucket: SharedString::from(entry.bucket().label()),
+                note: SharedString::from(match entry.conflict {
+                    Some(kind) => kind.label().to_owned(),
+                    None => entry
+                        .old_path
+                        .as_ref()
+                        .map_or_else(String::new, |old| format!("原路径 {old}")),
+                }),
+                is_selected: selected == Some(index),
+                is_conflict: entry.is_conflicted(),
+                is_untracked,
+            }
         })
         .collect()
 }
@@ -280,22 +320,47 @@ pub fn build_change_rows(changes: &ChangeSet, selected: Option<usize>) -> Vec<Ch
 /// 头部（当前分支）排最前，其余按 `gt-core` 的分组顺序与名称排列，
 /// 与侧栏"分支与标签"的阅读顺序一致。
 #[must_use]
-pub fn build_ref_rows(refs: &[RefInfo]) -> Vec<RefEntry> {
-    let mut rows: Vec<RefEntry> = refs
-        .iter()
-        .map(|info| RefEntry {
+pub fn build_ref_rows(refs: &[RefInfo], selected: Option<usize>) -> Vec<RefEntry> {
+    // 先按"是否头指针 / 类别 / 名称"排序，再统一发 selected 标记：
+    // 选择下标是**排序后**的下标，否则点一行会选中另一行。
+    let mut order: Vec<&RefInfo> = refs.iter().collect();
+    order.sort_by(|a, b| {
+        b.is_head
+            .cmp(&a.is_head)
+            .then_with(|| a.kind.group_order().cmp(&b.kind.group_order()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    order
+        .into_iter()
+        .enumerate()
+        .map(|(index, info)| RefEntry {
             name: SharedString::from(info.name.as_str()),
             kind: SharedString::from(info.kind.group_label()),
             is_head: info.is_head,
             sync: SharedString::from(info.sync_summary().unwrap_or_default()),
+            selected: selected == Some(index),
+            kind_id: match info.kind {
+                RefKind::LocalBranch => 0,
+                RefKind::RemoteBranch => 1,
+                RefKind::Tag => 2,
+                RefKind::Other => 3,
+            },
         })
-        .collect();
-    rows.sort_by(|a, b| {
+        .collect()
+}
+
+/// 按排序后的顺序取引用（与 [`build_ref_rows`] 的下标语义一致）。
+#[must_use]
+pub fn ordered_refs(refs: &[RefInfo]) -> Vec<RefInfo> {
+    let mut order: Vec<RefInfo> = refs.to_vec();
+    order.sort_by(|a, b| {
         b.is_head
             .cmp(&a.is_head)
-            .then_with(|| a.name.as_str().cmp(b.name.as_str()))
+            .then_with(|| a.kind.group_order().cmp(&b.kind.group_order()))
+            .then_with(|| a.name.cmp(&b.name))
     });
-    rows
+    order
 }
 
 /// 构造 Console 行。
@@ -378,12 +443,75 @@ pub const fn ref_kind_label(kind: RefKind) -> &'static str {
     kind.group_label()
 }
 
+/// 差异选择的操作提示（显示在 Diff 面板标题栏右侧）。
+#[must_use]
+pub fn diff_selection_hint(selected: usize, selectable: bool, staged_view: bool) -> String {
+    if !selectable {
+        return "该差异不支持逐块选择".to_owned();
+    }
+    if selected == 0 {
+        return if staged_view {
+            "点击 hunk 头或增删行以选择，然后反暂存".to_owned()
+        } else {
+            "点击 hunk 头或增删行以选择，然后暂存 / 丢弃".to_owned()
+        };
+    }
+    format!("已选 {selected} 行")
+}
+
+/// 危险操作确认的正文（FR-LC-02 / D4：默认强确认）。
+///
+/// 文案必须包含三件事：**将要失去什么**、**不可逆**、**替代做法**。
+/// 只写"确定吗？"的确认框等于没有确认。
+#[must_use]
+pub fn discard_confirmation(paths: &[String], untracked: bool) -> (String, String) {
+    let listed = paths.iter().take(8).cloned().collect::<Vec<_>>().join("\n");
+    let more = if paths.len() > 8 {
+        format!("\n…以及另外 {} 个路径", paths.len() - 8)
+    } else {
+        String::new()
+    };
+
+    if untracked {
+        (
+            format!("永久删除 {} 个未跟踪路径？", paths.len()),
+            format!(
+                "这些路径从未被 Git 跟踪，删除后无法通过 Git 恢复：\n\n{listed}{more}\n\n\
+                 替代做法：若只是不想看到它们，用「加入 .gitignore」。"
+            ),
+        )
+    } else {
+        (
+            format!("丢弃 {} 个文件的未提交修改？", paths.len()),
+            format!(
+                "工作区中的这些修改将被还原为索引中的内容，此操作不可撤销：\n\n{listed}{more}\n\n\
+                 替代做法：先「暂存」再提交，或先复制文件备份。"
+            ),
+        )
+    }
+}
+
+/// 丢弃所选 hunk / 行时的确认正文。
+#[must_use]
+pub fn discard_selection_confirmation(path: &str, lines: usize) -> (String, String) {
+    (
+        "丢弃所选变更？".to_owned(),
+        format!(
+            "将从工作区文件 {path} 中撤销所选 {lines} 行改动，此操作不可撤销。\n\n\
+             替代做法：先暂存所选内容再提交，这样改动会留在历史里。"
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         branch_text, build_change_rows, build_console_rows, build_diff_rows, build_graph_cells,
-        build_log_rows, build_ref_rows, relative_time, state_banner,
+        build_log_rows, build_ref_rows, diff_selection_hint, discard_confirmation,
+        discard_selection_confirmation, ordered_refs, relative_time, state_banner,
     };
+    use std::collections::BTreeSet;
+
     use slint::{Model as _, ModelRc};
 
     /// 把 Slint 模型取回成 `Vec`（`ModelRc` 不提供 `len`/下标）。
@@ -465,22 +593,57 @@ mod tests {
             .collect();
 
         let refs = vec!["HEAD -> main".to_owned(), String::new()];
-        let rows = build_log_rows(&nodes, &layouts, &refs, Some(1), 1_700_000_200);
+        let rows = build_log_rows(&nodes, &layouts, &refs, Some(1), 1_700_000_200, None);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].subject.as_str(), "第一个提交");
         assert!(rows[1].is_selected);
         assert!(!rows[0].is_selected);
         assert_eq!(rows[0].when.as_str(), "3 分钟前");
         assert_eq!(rows[0].refs_text.as_str(), "HEAD -> main");
+        assert!(!rows[0].is_mine, "未提供身份时不得标记为本人提交");
 
         // 长度不齐时按最短截断，绝不越界。
-        let short = build_log_rows(&nodes, &layouts[..1], &refs, None, 0);
+        let short = build_log_rows(&nodes, &layouts[..1], &refs, None, 0, None);
         assert_eq!(short.len(), 1);
         let empty_refs: Vec<String> = Vec::new();
         assert_eq!(
-            build_log_rows(&nodes, &layouts, &empty_refs, None, 0).len(),
+            build_log_rows(&nodes, &layouts, &empty_refs, None, 0, None).len(),
             2
         );
+    }
+
+    #[test]
+    fn log_rows_mark_mine_and_merge_commits() {
+        let mut merge = commit(3, "合并提交", 1_700_000_000);
+        merge.parents = vec![
+            Oid::from_bytes(&[1; 20]).expect("Oid"),
+            Oid::from_bytes(&[2; 20]).expect("Oid"),
+        ];
+        merge.author_email = "other@example.com".to_owned();
+        let nodes = vec![commit(1, "别人提交", 1_700_000_000), merge];
+        let mut layout = LaneLayout::new();
+        let layouts: Vec<gt_graph::RowLayout> = nodes
+            .iter()
+            .map(|meta| {
+                layout.push(&gt_core::LogNode {
+                    id: meta.id,
+                    parents: meta.parents.clone(),
+                })
+            })
+            .collect();
+
+        let rows = build_log_rows(
+            &nodes,
+            &layouts,
+            &[],
+            None,
+            1_700_000_100,
+            Some("Z@example.com"),
+        );
+        assert!(rows[0].is_mine, "邮箱应大小写不敏感地匹配");
+        assert!(!rows[0].is_merge);
+        assert!(rows[1].is_merge, "双父提交必须标记为合并");
+        assert!(!rows[1].is_mine);
     }
 
     #[test]
@@ -496,8 +659,8 @@ mod tests {
             new_start: 2,
             new_lines: 1,
             lines: vec![
-                line,
                 DiffLine::new(LineKind::Context, Some(1), Some(1), "context line"),
+                line,
             ],
         };
 
@@ -512,16 +675,49 @@ mod tests {
             },
         };
 
-        let rows = build_diff_rows(&diff);
+        let rows = build_diff_rows(&diff, &BTreeSet::new());
         // 一个 hunk 头 + 两行内容。
         assert_eq!(rows.len(), 3);
         assert!(rows[0].is_hunk_header);
-        assert_eq!(rows[1].kind, 1, "新增行");
-        assert_eq!(values(&rows[1].segments).len(), 2, "词级高亮应拆成两段");
-        assert!(values(&rows[1].changed)[1]);
-        assert_eq!(rows[2].kind, 0, "上下文行");
-        assert_eq!(values(&rows[2].segments).len(), 1);
-        assert_eq!(rows[2].old_no.as_str(), "1");
+        assert!(rows[0].selectable, "hunk 头可点击（整块选择）");
+        assert_eq!(rows[0].line_index, -1);
+        assert_eq!(rows[0].hunk_index, 0);
+
+        assert_eq!(rows[1].kind, 0, "上下文行");
+        assert!(!rows[1].selectable, "上下文行不参与选择");
+        assert_eq!(rows[1].old_no.as_str(), "1");
+
+        assert_eq!(rows[2].kind, 1, "新增行");
+        assert!(rows[2].selectable);
+        assert_eq!(rows[2].hunk_index, 0);
+        assert_eq!(rows[2].line_index, 1, "行下标指向 hunk.lines");
+        assert_eq!(values(&rows[2].segments).len(), 2, "词级高亮应拆成两段");
+        assert!(values(&rows[2].changed)[1]);
+    }
+
+    #[test]
+    fn diff_rows_apply_the_selection_marks() {
+        let hunk = DiffHunk {
+            old_start: 1,
+            old_lines: 2,
+            new_start: 1,
+            new_lines: 2,
+            lines: vec![
+                DiffLine::new(LineKind::Removed, Some(1), None, "old"),
+                DiffLine::new(LineKind::Added, None, Some(1), "new"),
+            ],
+        };
+        let diff = FileDiff {
+            old_path: "a".to_owned(),
+            new_path: "a".to_owned(),
+            payload: DiffPayload::Text(vec![hunk]),
+            stats: DiffStats::default(),
+        };
+        let selected = BTreeSet::from([1_usize]);
+        let rows = build_diff_rows(&diff, &selected);
+        assert!(rows[1].selected, "第 1 行（删除行）应被标记为选中");
+        assert!(!rows[0].selected);
+        assert!(!rows[2].selected);
     }
 
     #[test]
@@ -540,9 +736,10 @@ mod tests {
                 payload,
                 stats: DiffStats::default(),
             };
-            let rows = build_diff_rows(&diff);
+            let rows = build_diff_rows(&diff, &BTreeSet::new());
             assert_eq!(rows.len(), 1, "占位载荷必须给出一行说明而不是空白");
             assert_eq!(rows[0].kind, 3);
+            assert!(!rows[0].selectable);
             assert!(!values(&rows[0].segments)[0].is_empty());
         }
     }
@@ -559,8 +756,13 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].code.as_str(), "UU");
         assert_eq!(rows[0].bucket.as_str(), "冲突");
+        assert!(rows[0].is_conflict);
         assert!(rows[0].is_selected);
-        // 有争议的路径要能显示旧路径，否则重命名条目看起来像"新增"。
+        assert!(
+            rows[1].is_untracked,
+            "未跟踪条目要能触发「删除 / 忽略」按钮"
+        );
+        assert!(!rows[2].is_untracked);
         assert!(!rows[3].is_selected);
     }
 
@@ -595,10 +797,19 @@ mod tests {
                 behind: 1,
             },
         ];
-        let rows = build_ref_rows(&refs);
+        let rows = build_ref_rows(&refs, Some(1));
         assert_eq!(rows[0].name.as_str(), "main");
         assert!(rows[0].is_head);
         assert!(!rows[0].sync.is_empty(), "有上游时应给出同步摘要");
+        assert!(!rows[0].selected);
+        assert!(rows[1].selected, "选择下标按排序后的顺序解释");
+
+        // `ordered_refs` 必须与 `build_ref_rows` 的下标语义一致。
+        let ordered = ordered_refs(&refs);
+        assert_eq!(ordered[0].name, "main");
+        assert_eq!(ordered[1].name, "v1.0");
+        assert_eq!(rows[0].kind_id, 0);
+        assert_eq!(rows[1].kind_id, 2);
     }
 
     #[test]
@@ -664,5 +875,36 @@ mod tests {
             let color = super::lane_color(lane);
             assert_ne!(color, slint::Color::default(), "泳道配色不应为透明");
         }
+    }
+
+    #[test]
+    fn diff_hints_explain_the_next_action() {
+        assert!(diff_selection_hint(0, false, false).contains("不支持"));
+        let unstaged = diff_selection_hint(0, true, false);
+        assert!(unstaged.contains("暂存"), "{unstaged}");
+        let staged = diff_selection_hint(0, true, true);
+        assert!(staged.contains("反暂存"), "{staged}");
+        assert_eq!(diff_selection_hint(3, true, false), "已选 3 行");
+    }
+
+    #[test]
+    fn destructive_confirmations_state_what_is_lost() {
+        let (title, detail) =
+            discard_confirmation(&["a.txt".to_owned(), "b/c.txt".to_owned()], false);
+        assert!(title.contains('2'));
+        assert!(detail.contains("不可撤销"));
+        assert!(detail.contains("a.txt"));
+        assert!(
+            detail.contains("替代做法"),
+            "确认框必须给出代替方案：{detail}"
+        );
+
+        let (title, detail) = discard_confirmation(&["x.log".to_owned()], true);
+        assert!(title.contains("永久删除"));
+        assert!(detail.contains("未被 Git 跟踪"));
+
+        let (title, detail) = discard_selection_confirmation("a.txt", 4);
+        assert!(title.contains("丢弃"));
+        assert!(detail.contains("4 行"));
     }
 }

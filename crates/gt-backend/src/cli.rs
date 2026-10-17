@@ -26,6 +26,33 @@ const TAIL_CHARS: usize = 4000;
 /// 探测可执行文件所用的环境变量覆盖点。
 const PROGRAM_ENV: &str = "KNOTWORK_GIT";
 
+/// 取消探测：调用方（服务层）的取消令牌只需实现这一个方法。
+///
+/// 用 trait 而不是把 `gt-service` 的令牌类型搬进来，是为了保持依赖方向
+/// `gt-service → gt-backend` 单向：后端不认识调度层的类型。
+pub trait CancelProbe {
+    /// 是否已被取消。
+    fn is_cancelled(&self) -> bool;
+}
+
+impl<F> CancelProbe for F
+where
+    F: Fn() -> bool,
+{
+    fn is_cancelled(&self) -> bool {
+        self()
+    }
+}
+
+/// 永不取消的探针，用于无需取消的操作。
+struct NeverCancel;
+
+impl CancelProbe for NeverCancel {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
 /// 一次成功运行的输出。
 #[derive(Debug, Clone)]
 pub struct CliOutput {
@@ -134,16 +161,74 @@ impl GitCli {
         observer: &dyn CommandObserver,
         timeout: Duration,
     ) -> Result<CliOutput> {
+        self.run_full(cwd, args, None, observer, timeout, None)
+    }
+
+    /// 从标准输入喂入数据后执行（提交消息、补丁都用这条路径）。
+    ///
+    /// 用 stdin 而不是命令行参数传消息与补丁，原因有二：参数长度有平台上限，
+    /// 且多行文本经 shell 转义后极易出错（提交消息里的引号、CRLF）。
+    pub fn run_with_input(
+        &self,
+        cwd: Option<&Path>,
+        args: &[&str],
+        input: &[u8],
+        observer: &dyn CommandObserver,
+        timeout: Duration,
+    ) -> Result<CliOutput> {
+        self.run_full(cwd, args, Some(input), observer, timeout, None)
+    }
+
+    /// 可取消的执行（NFR-COR-02：被取消的操作不留子进程）。
+    ///
+    /// # Errors
+    /// 取消时返回 [`BackendError::Cancelled`]，超时见 [`BackendError::ProcessTimeout`]。
+    pub fn run_cancellable(
+        &self,
+        cwd: Option<&Path>,
+        args: &[&str],
+        input: Option<&[u8]>,
+        observer: &dyn CommandObserver,
+        timeout: Duration,
+        cancel: &dyn CancelProbe,
+    ) -> Result<CliOutput> {
+        self.run_full(cwd, args, input, observer, timeout, Some(cancel))
+    }
+
+    /// 执行的核心实现。
+    fn run_full(
+        &self,
+        cwd: Option<&Path>,
+        args: &[&str],
+        input: Option<&[u8]>,
+        observer: &dyn CommandObserver,
+        timeout: Duration,
+        cancel: Option<&dyn CancelProbe>,
+    ) -> Result<CliOutput> {
         let began = Instant::now();
-        let mut child = self.spawn(cwd, args, observer, began)?;
+        let mut child = self.spawn(cwd, args, input.is_some(), observer, began)?;
+
+        // 输入在线程里写：补丁可能远大于管道缓冲，同步写会与"读输出"互锁。
+        let stdin_writer = match (input, child.stdin.take()) {
+            (Some(bytes), Some(mut pipe)) => {
+                let owned = bytes.to_vec();
+                Some(std::thread::spawn(move || {
+                    use std::io::Write as _;
+                    let _ = pipe.write_all(&owned);
+                    // 关闭管道：git 靠 EOF 判定输入结束。
+                }))
+            }
+            _ => None,
+        };
 
         let stdout = child.stdout.take().expect("已配置 piped stdout");
         let stderr = child.stderr.take().expect("已配置 piped stderr");
         let stdout_reader = std::thread::spawn(move || read_capped(stdout));
         let stderr_reader = std::thread::spawn(move || read_capped(stderr));
 
-        let timed_out = match wait_with_timeout(&mut child, timeout) {
-            Ok(timed_out) => timed_out,
+        let probe = cancel.unwrap_or(&NeverCancel);
+        let waited = match wait_with_timeout(&mut child, timeout, probe) {
+            Ok(outcome) => outcome,
             Err(err) => {
                 // 先终止进程再收管道，否则读取线程可能永远等不到 EOF。
                 let _ = child.kill();
@@ -171,14 +256,26 @@ impl GitCli {
         // 必须先收完管道再 join（读取线程持有管道读端）。
         let (stdout_bytes, stdout_truncated) = join_reader(stdout_reader);
         let (stderr_bytes, stderr_truncated) = join_reader(stderr_reader);
+        if let Some(writer) = stdin_writer {
+            // 子进程已退出，写端可能已被打断；这里的错误无关紧要。
+            let _ = writer.join();
+        }
 
         let duration = began.elapsed();
         let exit_code = child.wait().ok().and_then(|status| status.code());
         let stdout_text = String::from_utf8_lossy(&stdout_bytes).into_owned();
         let stderr_text = String::from_utf8_lossy(&stderr_bytes).into_owned();
+        let truncated = stdout_truncated || stderr_truncated;
 
-        if timed_out {
-            let timeout_note = format!("超时 {}s", timeout.as_secs());
+        // 取消与超时都走"先记录再报错"的同一收尾路径：否则 Console 里会缺一条
+        // 用户实际触发过的操作记录，审计就断了。
+        let abort_reason = match waited {
+            WaitOutcome::Exited => None,
+            WaitOutcome::TimedOut => Some(format!("超时 {}s", timeout.as_secs())),
+            WaitOutcome::Cancelled => Some("已取消".to_owned()),
+        };
+
+        if let Some(reason) = &abort_reason {
             observer.observe(&cli_record(
                 self,
                 cwd,
@@ -188,14 +285,17 @@ impl GitCli {
                     exit_code,
                     stdout: Some(&stdout_text),
                     stderr: Some(&stderr_text),
-                    truncated: stdout_truncated || stderr_truncated,
-                    error: Some(&timeout_note),
+                    truncated,
+                    error: Some(reason),
                 },
             ));
-            return Err(BackendError::ProcessTimeout {
-                seconds: timeout.as_secs(),
-                program: self.program.display().to_string(),
-                args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            return Err(match waited {
+                WaitOutcome::Cancelled => BackendError::Cancelled,
+                _ => BackendError::ProcessTimeout {
+                    seconds: timeout.as_secs(),
+                    program: self.program.display().to_string(),
+                    args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+                },
             });
         }
 
@@ -208,7 +308,7 @@ impl GitCli {
                 exit_code,
                 stdout: Some(&stdout_text),
                 stderr: Some(&stderr_text),
-                truncated: stdout_truncated || stderr_truncated,
+                truncated,
                 error: None,
             },
         ));
@@ -217,7 +317,7 @@ impl GitCli {
             stdout: stdout_text,
             stderr: stderr_text,
             exit_code,
-            truncated: stdout_truncated || stderr_truncated,
+            truncated,
         })
     }
 
@@ -226,13 +326,18 @@ impl GitCli {
         &self,
         cwd: Option<&Path>,
         args: &[&str],
+        with_stdin: bool,
         observer: &dyn CommandObserver,
         began: Instant,
     ) -> Result<std::process::Child> {
         let mut command = Command::new(&self.program);
         command
             .args(args)
-            .stdin(Stdio::null())
+            .stdin(if with_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(dir) = cwd {
@@ -259,20 +364,40 @@ impl GitCli {
     }
 }
 
-/// 等待子进程结束；超时则强制终止。
+/// 等待结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    /// 正常结束。
+    Exited,
+    /// 超时后被强制终止。
+    TimedOut,
+    /// 被取消令牌终止。
+    Cancelled,
+}
+
+/// 等待子进程结束；超时或被取消则强制终止。
 ///
-/// 返回 `true` 表示发生了超时。**不**在此处收敛退出码：Windows 上 `try_wait`
-/// 已收割过状态，随后 `Child::wait()` 会直接取回缓存结果。
-fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> std::io::Result<bool> {
+/// **不**在此处收敛退出码：Windows 上 `try_wait` 已收割过状态，随后
+/// `Child::wait()` 会直接取回缓存结果。
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    cancel: &dyn CancelProbe,
+) -> std::io::Result<WaitOutcome> {
     let deadline = Instant::now() + timeout;
     loop {
         if child.try_wait()?.is_some() {
-            return Ok(false);
+            return Ok(WaitOutcome::Exited);
+        }
+        if cancel.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(WaitOutcome::Cancelled);
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Ok(true);
+            return Ok(WaitOutcome::TimedOut);
         }
         std::thread::sleep(Duration::from_millis(10));
     }

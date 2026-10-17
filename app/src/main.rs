@@ -5,6 +5,7 @@
 //! ```text
 //! knotwork                       # 打开启动页（最近仓库列表）
 //! knotwork <路径> [路径...]       # 每个路径一个窗口（FR-MR-03）
+//! knotwork --isolate <路径>       # 跳过单实例守卫，强制起独立进程（FR-MR-05）
 //! knotwork --probe 3             # 阶段 0 的多窗口内存探针（M0 基线采集入口）
 //! SLINT_BACKEND=winit-femtovg knotwork   # 切换 GPU 后端做内存 A/B 对比
 //! ```
@@ -12,25 +13,31 @@
 //! # 启动顺序
 //!
 //! 1. 选默认渲染后端（软件渲染，架构规划 2.3）→ 初始化日志；
-//! 2. 建命令审计缓冲与 `GitService`（其中包含 **git CLI 探测**，FR-STA-04）；
-//! 3. 读配置（含最近仓库列表）；
-//! 4. 为每个命令行路径开一个窗口；没有路径时开启动页；
-//! 5. 进事件循环；退出后保存配置并释放全部仓库。
+//! 2. 单实例守卫（FR-MR-05）：有主实例时把路径转发过去并立即退出；
+//! 3. 建命令审计缓冲与 `GitService`（其中包含 **git CLI 探测**，FR-STA-04）；
+//! 4. 读配置（含最近仓库列表）；
+//! 5. 为每个命令行路径开一个窗口；没有路径时开启动页；
+//! 6. 进事件循环；期间由定时器取出转发来的路径并开新窗口；
+//! 7. 退出后保存配置、释放写锁并注销全部仓库。
 //!
 //! UI 线程在整个过程中**不读仓库文件、不起子进程**：打开仓库这一步的
 //! `discover` 与配置解析是启动期一次性成本，之后所有数据都经由
 //! `gt-service` 的工作线程送达。
 
+mod ipc;
 mod logging;
 mod windows;
 
+use std::cell::RefCell;
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gt_config::UserConfig;
 use gt_service::{ConsoleBuffer, GitService};
 use slint::ComponentHandle;
 
+use ipc::Startup;
 use windows::{WindowManager, CONSOLE_CAPACITY};
 
 /// Slint 根据 `ui/*.slint` 生成的探针窗口绑定代码。
@@ -63,14 +70,17 @@ fn main() -> ExitCode {
     let command = match Command::parse(std::env::args().skip(1)) {
         Ok(command) => command,
         Err(message) => {
-            eprintln!("{message}\n\n用法：\n  knotwork [路径...]\n  knotwork --probe [窗口数]");
+            eprintln!(
+                "{message}\n\n用法：\n  knotwork [路径...]\n  \
+                 knotwork --isolate [路径...]\n  knotwork --probe [窗口数]"
+            );
             return ExitCode::FAILURE;
         }
     };
 
     match command {
         Command::Probe(count) => run_probe(count),
-        Command::Open(paths) => run_app(&paths),
+        Command::Open { paths, isolate } => run_app(&paths, isolate),
     }
 }
 
@@ -80,7 +90,12 @@ enum Command {
     /// 阶段 0 的多窗口内存探针。
     Probe(usize),
     /// 打开若干仓库路径（空表示启动页）。
-    Open(Vec<String>),
+    Open {
+        /// 仓库路径。
+        paths: Vec<String>,
+        /// 是否跳过单实例守卫（`--isolate`）。
+        isolate: bool,
+    },
 }
 
 impl Command {
@@ -90,6 +105,7 @@ impl Command {
     /// `--probe` 的取值无法解析时返回错误文本。
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut paths = Vec::new();
+        let mut isolate = false;
         let mut args = args.peekable();
 
         while let Some(arg) = args.next() {
@@ -106,6 +122,7 @@ impl Command {
                     };
                     return Ok(Self::Probe(count.clamp(1, MAX_PROBE_WINDOWS)));
                 }
+                "--isolate" => isolate = true,
                 "--help" | "-h" => {
                     return Err("Knotwork —— 轻量级 Git 管理工具".to_owned());
                 }
@@ -116,12 +133,26 @@ impl Command {
             }
         }
 
-        Ok(Self::Open(paths))
+        Ok(Self::Open { paths, isolate })
     }
 }
 
 /// 以真实仓库打开应用。
-fn run_app(paths: &[String]) -> ExitCode {
+fn run_app(paths: &[String], isolate: bool) -> ExitCode {
+    // 单实例守卫必须在建服务之前：若是转发，本进程不应占用任何仓库写锁，
+    // 也不该白建一个线程池（FR-MR-05 的"进程数不变"验收点）。
+    let server = match ipc::start(paths, isolate) {
+        Startup::Forwarded => {
+            tracing::info!("打开请求已交给运行中的实例，本进程退出");
+            return ExitCode::SUCCESS;
+        }
+        Startup::Primary(server) => Some(server),
+        Startup::Standalone(reason) => {
+            tracing::info!(%reason, "以独立实例启动");
+            None
+        }
+    };
+
     let console = ConsoleBuffer::shared(CONSOLE_CAPACITY);
     let service = match GitService::new(ConsoleBuffer::observer(&console)) {
         Ok(service) => Arc::new(service),
@@ -143,42 +174,55 @@ fn run_app(paths: &[String]) -> ExitCode {
 
     let (config, config_path) = load_config();
     let config_path = config_path.unwrap_or_else(|| std::path::PathBuf::from("config.toml"));
-    let mut manager = WindowManager::new(
+    // 管理器放进 `Rc<RefCell<..>>`：转发请求的定时器需要拿到它来开新窗口，
+    // 而 Slint 的定时器回调要求 `'static`。
+    let manager = Rc::new(RefCell::new(WindowManager::new(
         Arc::clone(&service),
         Arc::clone(&console),
         config,
         config_path,
-    );
+    )));
 
-    if paths.is_empty() {
-        if let Err(err) = manager.open_empty() {
-            tracing::error!(%err, "启动页创建失败");
-            return ExitCode::FAILURE;
-        }
-    } else {
-        for path in paths {
-            let candidate = std::path::Path::new(path);
-            match manager.open_repo(candidate) {
-                Ok(()) => tracing::info!(%path, "已打开仓库"),
-                Err(err) => {
-                    // 单个路径打不开不该让整次启动失败：报告并继续开下一个。
-                    tracing::error!(%path, %err, "打开仓库失败");
-                    eprintln!("无法打开 {path}：{err}");
+    {
+        let mut guard = manager.borrow_mut();
+        if paths.is_empty() {
+            if let Err(err) = guard.open_empty() {
+                tracing::error!(%err, "启动页创建失败");
+                return ExitCode::FAILURE;
+            }
+        } else {
+            for path in paths {
+                let candidate = std::path::Path::new(path);
+                match guard.open_repo(candidate) {
+                    Ok(()) => tracing::info!(%path, "已打开仓库"),
+                    Err(err) => {
+                        // 单个路径打不开不该让整次启动失败：报告并继续开下一个。
+                        tracing::error!(%path, %err, "打开仓库失败");
+                        eprintln!("无法打开 {path}：{err}");
+                    }
                 }
             }
+            if guard.window_count() == 0 {
+                tracing::error!("没有成功打开任何仓库");
+                return ExitCode::FAILURE;
+            }
         }
-        if manager.window_count() == 0 {
-            tracing::error!("没有成功打开任何仓库");
+
+        if let Err(err) = guard.show_all() {
+            tracing::error!(%err, "窗口显示失败");
             return ExitCode::FAILURE;
         }
     }
 
-    if let Err(err) = manager.show_all() {
-        tracing::error!(%err, "窗口显示失败");
-        return ExitCode::FAILURE;
-    }
+    // 转发请求的落地：每 300ms 取一次待打开路径。
+    // 定时器必须在事件循环期间存活，因此绑定到本地变量而不是临时值。
+    let ipc_timer = make_ipc_timer(&manager);
 
-    tracing::info!(windows = manager.window_count(), "进入事件循环");
+    tracing::info!(
+        windows = manager.borrow().window_count(),
+        forwarded = server.is_some(),
+        "进入事件循环"
+    );
     let outcome = match slint::run_event_loop() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -187,12 +231,52 @@ fn run_app(paths: &[String]) -> ExitCode {
         }
     };
 
-    // 关闭全部窗口后：保存配置、停止监听、注销仓库，然后按顺序释放。
-    manager.shutdown();
+    // 关闭全部窗口后：保存配置、停止监听、释放写锁、注销仓库，然后按顺序释放。
+    drop(ipc_timer);
+    manager.borrow_mut().shutdown();
+    if let Some(server) = &server {
+        server.shutdown();
+    }
+    drop(server);
     drop(manager);
     drop(console);
     drop(service);
     outcome
+}
+
+/// 构造"取出转发路径并开窗口"的定时器。
+///
+/// 为什么用定时器而不是 `invoke_from_event_loop`：新窗口必须在 UI 线程创建，
+/// 而这里的回调本来就在 UI 线程上；定时器只是"轮到我了"的触发点，
+/// 不引入额外的线程与消息泵。
+fn make_ipc_timer(manager: &Rc<RefCell<WindowManager>>) -> slint::Timer {
+    let timer = slint::Timer::default();
+    let manager = Rc::clone(manager);
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(300),
+        move || {
+            let pending = ipc::take_pending();
+            if pending.is_empty() {
+                return;
+            }
+            let mut guard = manager.borrow_mut();
+            let mut opened = 0usize;
+            for path in &pending {
+                match guard.open_repo(std::path::Path::new(path)) {
+                    Ok(()) => opened += 1,
+                    Err(err) => tracing::warn!(%path, %err, "转发的仓库打开失败"),
+                }
+            }
+            if opened > 0 {
+                if let Err(err) = guard.show_all() {
+                    tracing::warn!(%err, "显示新窗口失败");
+                }
+                tracing::info!(opened, "已按转发请求打开窗口");
+            }
+        },
+    );
+    timer
 }
 
 /// 读取配置；失败时退回默认配置并把原因写进日志。
@@ -285,14 +369,42 @@ mod tests {
 
     #[test]
     fn no_arguments_opens_the_start_page() {
-        assert_eq!(parse(&[]).expect("解析应成功"), Command::Open(Vec::new()));
+        assert_eq!(
+            parse(&[]).expect("解析应成功"),
+            Command::Open {
+                paths: Vec::new(),
+                isolate: false
+            }
+        );
     }
 
     #[test]
     fn paths_become_windows() {
         assert_eq!(
             parse(&["/tmp/a", "/tmp/b"]).expect("解析应成功"),
-            Command::Open(vec!["/tmp/a".to_owned(), "/tmp/b".to_owned()])
+            Command::Open {
+                paths: vec!["/tmp/a".to_owned(), "/tmp/b".to_owned()],
+                isolate: false
+            }
+        );
+    }
+
+    #[test]
+    fn isolate_flag_is_parsed_without_being_treated_as_a_path() {
+        assert_eq!(
+            parse(&["--isolate", "/tmp/a"]).expect("解析应成功"),
+            Command::Open {
+                paths: vec!["/tmp/a".to_owned()],
+                isolate: true
+            }
+        );
+        // 只有一个开关、没有路径时也要能解析（启动页 + 强制独立进程）。
+        assert_eq!(
+            parse(&["--isolate"]).expect("解析应成功"),
+            Command::Open {
+                paths: Vec::new(),
+                isolate: true
+            }
         );
     }
 

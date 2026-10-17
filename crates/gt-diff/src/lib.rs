@@ -8,7 +8,8 @@
 //! - 行级差异与 hunk 模型（FR-DIF-01）；
 //! - 行内**词级**差异高亮（FR-DIF-01）；
 //! - 大文件与二进制阈值判定（单侧 > 2MB 或二进制 → 占位，架构规划 5.5）；
-//! - `--numstat` 语义的增删行统计（M0 待办 #5 的一致性对比对象）。
+//! - `--numstat` 语义的增删行统计（M0 待办 #5 的一致性对比对象）；
+//! - **由差异生成落库补丁**（hunk / 行级选择，FR-LC-03、FR-DIF-05）。
 //!
 //! 目录级差异（FR-DIF-03）由 `gt-backend` 的树比较产出 [`gt_core::FileChange`]
 //! 列表，再逐文件调用本 crate 计算内容差异。
@@ -22,9 +23,11 @@
 
 mod engine;
 mod model;
+mod patch;
 
 pub use engine::{diff_bytes, diff_lines, diff_text, is_binary, word_spans};
 pub use model::{
     DiffHunk, DiffLine, DiffOptions, DiffPayload, DiffStats, FileDiff, LineKind, LineSpan,
     BINARY_SNIFF_LEN, DEFAULT_CONTEXT_LINES, DEFAULT_MAX_BYTES,
 };
+pub use patch::{build_patch, build_patch_all, is_hunk_selectable, HunkSelection, PatchPaths};

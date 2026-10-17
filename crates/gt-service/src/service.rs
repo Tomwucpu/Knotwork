@@ -28,15 +28,17 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Sender;
 use gt_backend::{
-    noop_observer, BackendError, GitCli, GitRepo, RepoLocation, SharedGitRepo, SharedObserver,
+    noop_observer, BackendError, GitCli, GitRepo, LockAttempt, RepoLocation, RepoWriter,
+    SharedGitRepo, SharedObserver, UpstreamRow, WriteLock,
 };
-use gt_core::{BranchScope, LogPageRequest, Oid, RepoId};
+use gt_core::{BranchScope, GraphOptions, LogPageRequest, Oid, RepoId};
 
 use crate::cancel::CancellationToken;
 use crate::generation::{Generation, RequestGate};
 use crate::pool::WorkerPool;
 use crate::task::{
-    Delivery, LogPageResult, Outcome, RepoOverview, RequestError, RequestKind, RequestLane,
+    Delivery, DiffSide, LogPageResult, Outcome, RepoOverview, RequestError, RequestKind,
+    RequestLane, SearchResult, SelectionMode, WriteRequest,
 };
 use crate::watch::{ChangeBatch, ChangeSink, RepoPaths, RepoWatcher, DEFAULT_DEBOUNCE};
 
@@ -84,15 +86,23 @@ pub struct RepoHandle {
     gates: Mutex<GateSet>,
     log_index: Mutex<LogIndex>,
     watcher: Mutex<Option<RepoWatcher>>,
+    /// 只读原因（FR-MR-04）；[`None`] 表示读写可用。
+    read_only: Option<String>,
+    /// 持有的写锁；窗口关闭时随句柄一起释放。
+    write_lock: Mutex<Option<WriteLock>>,
+    /// 启动时探测到的 git 句柄；缺失时写操作会给出明确降级说明。
+    cli: Option<GitCli>,
 }
 
-/// 四个视图通道的闸门。
+/// 视图通道的闸门集合。
 #[derive(Debug, Default)]
 struct GateSet {
     overview: RequestGate,
     status: RequestGate,
     log: RequestGate,
     diff: RequestGate,
+    /// 写通道的闸门：只用来发号与取取消令牌，**从不作废**。
+    write: RequestGate,
 }
 
 impl GateSet {
@@ -102,6 +112,7 @@ impl GateSet {
             RequestLane::Status => &self.status,
             RequestLane::Log => &self.log,
             RequestLane::Diff => &self.diff,
+            RequestLane::Write => &self.write,
         }
     }
 }
@@ -126,6 +137,28 @@ impl RepoHandle {
         self.id
     }
 
+    /// 是否只能读（FR-MR-04）。
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.is_some()
+    }
+
+    /// 只读原因；可写时为 [`None`]。
+    #[must_use]
+    pub fn read_only_reason(&self) -> Option<&str> {
+        self.read_only.as_deref()
+    }
+
+    /// 显式释放写锁（关闭窗口时调用；`Drop` 也会做，这里是为了确定性）。
+    pub fn release_write_lock(&self) {
+        let taken = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(taken);
+    }
+
     /// 仓库位置。
     #[must_use]
     pub fn location(&self) -> &RepoLocation {
@@ -148,10 +181,15 @@ impl RepoHandle {
     }
 
     /// 作废该仓库全部通道当前代次的在飞任务。
+    ///
+    /// 写通道被**刻意排除**：用户点"刷新"不该拦下一次正在执行的提交 ——
+    /// 那会让仓库处于"改了但不知道成功没有"的状态。
     pub fn cancel_in_flight(&self) {
         let gates = self.gates();
         for lane in RequestLane::ALL {
-            gates.get(lane).cancel_current();
+            if lane.is_gated() {
+                gates.get(lane).cancel_current();
+            }
         }
     }
 
@@ -231,34 +269,51 @@ impl RepoHandle {
 /// 因此完整枚举一次后按页切片，绝不为翻页重走历史）。
 #[derive(Debug, Default)]
 struct LogIndex {
-    /// 缓存所对应的分支范围。
-    scope: Option<BranchScope>,
+    /// 缓存所对应的查询口径：分支范围 + 图选项。
+    ///
+    /// 图选项必须进缓存键：同一 `scope` 下"隐藏合并"与"不隐藏"是两个不同的
+    /// id 列表，只按 scope 缓存会让切换选项后仍拿到旧列表（静默错误）。
+    key: Option<(BranchScope, GraphOptions)>,
     /// 完整的提交 id 列表（revwalk 顺序）。
     ids: Vec<Oid>,
+    /// 该列表的降级说明（例如拓扑排序因规模退回日期序）。
+    note: Option<String>,
 }
 
 impl LogIndex {
-    /// 确保缓存与 `scope` 匹配，返回 id 列表的引用。
+    /// 确保缓存与查询口径匹配，返回 id 列表的引用与降级说明。
     ///
     /// # Errors
     /// 仓库读取失败时返回错误。
-    /// # Panics
-    /// 不会 panic；内部借用范围与返回的引用一致。
     fn ensure(
         &mut self,
         repo: &GitRepo,
         scope: BranchScope,
+        graph: GraphOptions,
         token: &CancellationToken,
-    ) -> Result<(&[Oid], bool), BackendError> {
-        let from_cache = self.scope == Some(scope);
+    ) -> Result<(&[Oid], bool, Option<String>), BackendError> {
+        let key = (scope, graph);
+        let from_cache = self.key == Some(key);
         if !from_cache {
             token
                 .check()
                 .map_err(|_| BackendError::Status("操作已取消".to_owned()))?;
-            self.ids = repo.walk_ids(scope, None)?;
-            self.scope = Some(scope);
+            // 构建完整请求只为拿 scope/graph：offset/limit 在下游切片时用。
+            let request = LogPageRequest {
+                filter: gt_core::LogFilter {
+                    scope,
+                    ..gt_core::LogFilter::default()
+                },
+                offset: 0,
+                limit: gt_core::DEFAULT_PAGE_SIZE,
+                graph,
+            };
+            let (ids, note) = repo.walk_ids_with(&request, None)?;
+            self.ids = ids;
+            self.note = note;
+            self.key = Some(key);
         }
-        Ok((&self.ids, from_cache))
+        Ok((&self.ids, from_cache, self.note.clone()))
     }
 }
 
@@ -350,6 +405,16 @@ impl GitService {
         let repo = GitRepo::open(path, self.observer.clone())?;
         let location = repo.location().clone();
 
+        // 写锁（FR-MR-04）：拿不到就以只读模式打开，并把原因固化在句柄上 ——
+        // 界面据此禁用写操作、一次性说明原因（而不是让用户点了才报错）。
+        let (read_only, lock) = match WriteLock::acquire(&location.git_dir)? {
+            LockAttempt::Acquired(lock) => (None, Some(lock)),
+            held @ LockAttempt::Held { .. } => (held.read_only_reason(), None),
+        };
+        if let Some(reason) = &read_only {
+            tracing::warn!(path = %location.work_dir_or_git_dir().display(), %reason, "以只读模式打开仓库");
+        }
+
         let id = {
             let mut counter = self
                 .next_repo_id
@@ -366,6 +431,9 @@ impl GitService {
             gates: Mutex::new(GateSet::default()),
             log_index: Mutex::new(LogIndex::default()),
             watcher: Mutex::new(None),
+            read_only,
+            write_lock: Mutex::new(lock),
+            cli: self.cli.clone(),
         });
 
         tracing::info!(repo = ?id, path = %location.work_dir_or_git_dir().display(), "已注册仓库");
@@ -386,6 +454,9 @@ impl GitService {
             Some(handle) => {
                 handle.cancel_in_flight();
                 handle.stop_watching();
+                // 写锁必须在注销时立刻释放：用户关掉窗口后再开另一个实例，
+                // 不该被一个"已经不再写任何东西"的锁挡住。
+                handle.release_write_lock();
                 true
             }
             None => false,
@@ -448,6 +519,14 @@ impl GitService {
         sink: Sender<Delivery>,
     ) -> Result<Generation, RequestError> {
         let handle = self.repo(id).ok_or(RequestError::UnknownRepo(id))?;
+
+        // 只读仓库的写请求在**入队前**就被拒：让用户立刻知道原因，
+        // 而不是看着按钮转一会儿再报错。
+        if matches!(kind, RequestKind::Write(_)) {
+            if let Some(reason) = handle.read_only_reason() {
+                return Err(RequestError::ReadOnly(reason.to_owned()));
+            }
+        }
 
         // 推进该通道的代次：这条通道上此前在飞的任务会在下一个分片边界退出，
         // 且它们的过期结果不会再被投递。其它通道的请求不受影响。
@@ -521,13 +600,20 @@ fn run_request(
     let began = std::time::Instant::now();
     let repo = handle.repo.to_thread_local();
 
-    let outcome = match execute(&repo, kind, token, handle) {
-        Ok(outcome) => outcome,
-        Err(message) => Outcome::Failed(message),
+    let outcome = match kind {
+        RequestKind::Write(write) => match execute_write(handle, &repo, write, token) {
+            Ok(outcome) => outcome,
+            Err(message) => Outcome::Failed(message),
+        },
+        _ => match execute(&repo, kind, token, handle) {
+            Ok(outcome) => outcome,
+            Err(message) => Outcome::Failed(message),
+        },
     };
 
     // 代次校验：过期结果连消息都不发（架构规划 4.3 第 6 点）。
-    if !handle.is_current(kind.lane(), generation) {
+    // 写通道例外 —— 写结果必须落地，否则用户无从知道操作是否生效。
+    if kind.lane().is_gated() && !handle.is_current(kind.lane(), generation) {
         tracing::debug!(
             repo = ?handle.id,
             lane = kind.lane().label(),
@@ -565,14 +651,25 @@ fn execute(
         RequestKind::Overview => {
             let head = repo.head().map_err(user_message)?;
             token.check().map_err(user_message)?;
-            let refs = repo.refs().map_err(user_message)?;
+            let mut refs = repo.refs().map_err(user_message)?;
             token.check().map_err(user_message)?;
+            // ahead/behind（FR-BR-01）：一次 `for-each-ref` 全部取回。
+            // CLI 缺失时保持 0 —— 这属于"计数不可用"，不是读失败。
+            if let Some(cli) = handle.cli.as_ref() {
+                let writer = RepoWriter::new(repo.location(), cli.clone(), repo.observer());
+                match writer.upstream_tracking() {
+                    Ok(rows) => apply_tracking(&mut refs, &rows),
+                    Err(err) => tracing::debug!(%err, "读取上游跟踪信息失败，ahead/behind 置 0"),
+                }
+            }
             let state = repo.repo_state();
             Ok(Outcome::Overview(Box::new(RepoOverview {
                 head,
                 refs,
                 state,
                 location: repo.location().clone(),
+                read_only: handle.read_only_reason().map(str::to_owned),
+                user_email: repo.user_email(),
             })))
         }
         RequestKind::Status => {
@@ -581,10 +678,12 @@ fn execute(
         }
         RequestKind::LogPage(request) => {
             let scope = request.filter.scope;
-            let (ids, from_cache) = {
+            let (ids, from_cache, note) = {
                 let mut index = handle.lock_log_index();
-                let (ids, from_cache) = index.ensure(repo, scope, token).map_err(user_message)?;
-                (ids.to_vec(), from_cache)
+                let (ids, from_cache, note) = index
+                    .ensure(repo, scope, request.graph, token)
+                    .map_err(user_message)?;
+                (ids.to_vec(), from_cache, note)
             };
             token.check().map_err(user_message)?;
 
@@ -611,6 +710,7 @@ fn execute(
                 },
                 total,
                 from_cache,
+                note,
             })))
         }
         RequestKind::TreeChanges { old, new } => {
@@ -619,46 +719,201 @@ fn execute(
                 .map_err(user_message)?;
             Ok(Outcome::TreeChanges(changes))
         }
-        RequestKind::FileDiff {
-            old,
-            new,
-            path,
-            worktree,
-        } => {
-            let diff = compute_file_diff(repo, old.as_deref(), new, path, *worktree)?;
+        RequestKind::FileDiff { left, right, path } => {
+            let diff = compute_file_diff(repo, left, right, path)?;
             Ok(Outcome::FileDiff(Box::new(diff)))
         }
+        RequestKind::Search(request) => execute_search(repo, handle, request, token),
+        RequestKind::Write(_) => Err("写请求不应进入读取路径".to_owned()),
+    }
+}
+
+/// 执行一次提交消息搜索（FR-LOG-03）。
+///
+/// 抽成独立函数有两个理由：`execute` 已经接近行数上限；搜索的超时语义
+/// （"超时不是失败"）需要注释说清楚，混在一个大 match 里很容易被后来者改错。
+fn execute_search(
+    repo: &GitRepo,
+    handle: &RepoHandle,
+    request: &crate::task::SearchRequest,
+    token: &CancellationToken,
+) -> Result<Outcome, String> {
+    let Some(cli) = handle.cli.as_ref() else {
+        return Err("提交搜索依赖 git 可执行文件（当前未检测到 git）".to_owned());
+    };
+    let writer = RepoWriter::new(repo.location(), cli.clone(), repo.observer());
+    let (ids, timed_out) = match writer.search_commits(
+        &request.query,
+        request.regex,
+        request.case_sensitive,
+        request.all_refs,
+        request.limit,
+        Some(&TokenProbe(token)),
+    ) {
+        Ok(ids) => (ids, false),
+        // 超时是"建议构建索引"的信号，不是失败：返回空结果并标记。
+        Err(BackendError::ProcessTimeout { .. }) => (Vec::new(), true),
+        Err(err) => return Err(user_message(err)),
+    };
+    token.check().map_err(user_message)?;
+
+    let oids: Vec<Oid> = ids
+        .iter()
+        .filter_map(|text| Oid::from_prefix_hex(text))
+        .collect();
+    let request_model = LogPageRequest {
+        limit: oids.len().max(1),
+        ..LogPageRequest::default()
+    };
+    let nodes = repo
+        .commit_metas(&oids, &request_model)
+        .map_err(user_message)?;
+
+    Ok(Outcome::Search(Box::new(SearchResult {
+        nodes,
+        query: request.query.clone(),
+        timed_out,
+    })))
+}
+
+/// 执行一次写操作。
+///
+/// 写后**不做**任何读取重算：状态与日志由界面收到结果后主动重新请求。
+/// 理由是这样才能保持"一次用户操作 = 一条 Console 记录 + 一次明确的刷新"，
+/// 而不是在写路径里悄悄夹带一串读请求（那些读请求的值也无人在意）。
+fn execute_write(
+    handle: &RepoHandle,
+    repo: &GitRepo,
+    request: &WriteRequest,
+    token: &CancellationToken,
+) -> Result<Outcome, String> {
+    if let Some(reason) = handle.read_only_reason() {
+        return Err(reason.to_owned());
+    }
+    let Some(cli) = handle.cli.as_ref() else {
+        return Err(format!(
+            "「{}」需要 git 可执行文件支持（当前未检测到 git）",
+            request.label()
+        ));
+    };
+    let writer = RepoWriter::new(repo.location(), cli.clone(), repo.observer());
+
+    let outcome = match request {
+        WriteRequest::Stage(paths) => writer.stage_paths(paths),
+        WriteRequest::Unstage(paths) => writer.unstage_paths(paths),
+        WriteRequest::Discard(paths) => writer.discard_tracked(paths),
+        WriteRequest::DeleteUntracked(paths) => writer.delete_untracked(paths),
+        WriteRequest::Commit(commit) => writer.commit(commit),
+        WriteRequest::Branch(op) => writer.branch(op),
+        WriteRequest::Ignore { target, path } => writer.append_ignore(*target, path),
+        WriteRequest::Selection {
+            path,
+            left,
+            right,
+            selections,
+            expected_fingerprint,
+            mode,
+        } => apply_selection(
+            repo,
+            &writer,
+            path,
+            left,
+            right,
+            selections,
+            *expected_fingerprint,
+            *mode,
+        ),
+    };
+
+    token.check().map_err(user_message)?;
+
+    match outcome {
+        Ok(result) => {
+            // 写成功意味着引用 / 索引 / HEAD 至少有一处变了：缓存必须作废，
+            // 否则下一次翻页会拿到写之前的 id 列表。
+            handle.invalidate_log_index();
+            Ok(Outcome::Write(Box::new(result)))
+        }
+        Err(err) => Err(user_message(err)),
+    }
+}
+
+/// 把 hunk / 行级选择落库。
+///
+/// 指纹校验是这里最重要的一步：用户在界面上看到的是**某一份**差异，
+/// 若在他点"暂存"之前文件又被改动（外部编辑器、hook、另一个终端），
+/// 用旧下标去打补丁可能命中错误的位置。宁可拒绝并要求刷新。
+#[allow(clippy::too_many_arguments)]
+fn apply_selection(
+    repo: &GitRepo,
+    writer: &RepoWriter,
+    path: &str,
+    left: &DiffSide,
+    right: &DiffSide,
+    selections: &[gt_diff::HunkSelection],
+    expected_fingerprint: u64,
+    mode: SelectionMode,
+) -> Result<gt_backend::WriteOutcome, BackendError> {
+    let diff =
+        compute_file_diff(repo, left, right, path).map_err(|message| BackendError::Rejected {
+            summary: message,
+            detail: String::new(),
+        })?;
+
+    if diff.fingerprint() != expected_fingerprint {
+        return Err(BackendError::Rejected {
+            summary: "文件内容已变化，已取消本次操作，请刷新后重试".to_owned(),
+            detail: String::new(),
+        });
+    }
+
+    let Some(patch_text) = gt_diff::build_patch(&diff, gt_diff::PatchPaths::same(path), selections)
+    else {
+        return Ok(gt_backend::WriteOutcome::new("没有选中任何变更"));
+    };
+
+    match mode {
+        SelectionMode::Stage => writer.apply_patch_cached(&patch_text, false),
+        SelectionMode::Unstage => writer.apply_patch_cached(&patch_text, true),
+        SelectionMode::Discard => writer.apply_patch_worktree(&patch_text),
+    }
+}
+
+/// 把上游计数写回引用列表。
+fn apply_tracking(refs: &mut [gt_core::RefInfo], rows: &[UpstreamRow]) {
+    for reference in refs.iter_mut() {
+        if reference.kind != gt_core::RefKind::LocalBranch {
+            continue;
+        }
+        if let Some((_, upstream, ahead, behind)) =
+            rows.iter().find(|(name, _, _, _)| name == &reference.name)
+        {
+            reference.upstream = upstream.clone();
+            reference.ahead = *ahead;
+            reference.behind = *behind;
+        }
+    }
+}
+
+/// 把取消令牌适配成后端的取消探针（保持依赖方向 gt-service → gt-backend）。
+struct TokenProbe<'a>(&'a CancellationToken);
+
+impl gt_backend::CancelProbe for TokenProbe<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
     }
 }
 
 /// 计算单文件差异（组合 `gt-diff` 的引擎）。
 fn compute_file_diff(
     repo: &GitRepo,
-    old: Option<&str>,
-    new: &str,
+    left: &DiffSide,
+    right: &DiffSide,
     path: &str,
-    worktree: bool,
 ) -> Result<gt_diff::FileDiff, String> {
     let options = gt_diff::DiffOptions::default();
-
-    let (old_bytes, new_bytes) = if worktree {
-        // 本地更改：一侧取自索引/HEAD，另一侧取自工作区。
-        let old_bytes = match old {
-            Some(spec) => repo
-                .blob_at(spec, path, MAX_BLOB_BYTES)
-                .map_err(user_message)?,
-            None => None,
-        };
-        let new_bytes = repo
-            .worktree_blob(path, MAX_BLOB_BYTES)
-            .map_err(user_message)?;
-        (old_bytes, new_bytes)
-    } else {
-        let pair = repo
-            .blob_pair(old, Some(new), path, MAX_BLOB_BYTES)
-            .map_err(user_message)?;
-        (pair.old, pair.new)
-    };
+    let old_bytes = read_side(repo, left, path)?;
+    let new_bytes = read_side(repo, right, path)?;
 
     Ok(gt_diff::diff_bytes(
         path,
@@ -667,6 +922,20 @@ fn compute_file_diff(
         new_bytes.as_deref(),
         &options,
     ))
+}
+
+/// 读取差异某一侧的内容。
+fn read_side(repo: &GitRepo, side: &DiffSide, path: &str) -> Result<Option<Vec<u8>>, String> {
+    match side {
+        DiffSide::Empty => Ok(None),
+        DiffSide::Rev(spec) => repo
+            .blob_at(spec, path, MAX_BLOB_BYTES)
+            .map_err(user_message),
+        DiffSide::Index => repo.index_blob(path, MAX_BLOB_BYTES).map_err(user_message),
+        DiffSide::Worktree => repo
+            .worktree_blob(path, MAX_BLOB_BYTES)
+            .map_err(user_message),
+    }
 }
 
 /// 把后端错误转成面向用户的说明。
@@ -713,7 +982,7 @@ mod tests {
         default_branch_scope, display_path, Capabilities, GitService, RequestKind, MAX_BLOB_BYTES,
     };
     use crate::console::ConsoleBuffer;
-    use crate::task::Outcome;
+    use crate::task::{DiffSide, Outcome, SelectionMode, WriteRequest};
     use crossbeam_channel::unbounded;
     use gt_core::BranchScope;
     use std::path::{Path, PathBuf};
@@ -983,10 +1252,9 @@ mod tests {
             .request(
                 handle.id(),
                 RequestKind::FileDiff {
-                    old: Some("HEAD~1".to_owned()),
-                    new: "HEAD".to_owned(),
+                    left: DiffSide::Rev("HEAD~1".to_owned()),
+                    right: DiffSide::Rev("HEAD".to_owned()),
                     path: "a.txt".to_owned(),
-                    worktree: false,
                 },
                 sender,
             )
@@ -1023,10 +1291,9 @@ mod tests {
             .request(
                 handle.id(),
                 RequestKind::FileDiff {
-                    old: Some("HEAD".to_owned()),
-                    new: "HEAD".to_owned(),
+                    left: DiffSide::Rev("HEAD".to_owned()),
+                    right: DiffSide::Worktree,
                     path: "a.txt".to_owned(),
-                    worktree: true,
                 },
                 sender,
             )
@@ -1107,5 +1374,346 @@ mod tests {
             "noop",
             std::time::Duration::ZERO,
         ));
+    }
+
+    // ------------------------------------------------------------ M2 写路径
+
+    /// 造一个 20 行的文件并提交，返回仓库根。
+    fn tmp_repo_with_lines(label: &str) -> Option<PathBuf> {
+        let root = tmp_repo(label)?;
+        let baseline = (1..=20).fold(String::new(), |mut acc, n| {
+            use std::fmt::Write as _;
+            let _ = writeln!(acc, "line{n}");
+            acc
+        });
+        std::fs::write(root.join("a.txt"), baseline).expect("写文件");
+        let cli = gt_backend::GitCli::detect()?;
+        let output = cli
+            .run(
+                Some(&root),
+                &["commit", "-q", "-am", "多行基线"],
+                &gt_backend::NoopObserver,
+                gt_backend::LOCAL_TIMEOUT,
+            )
+            .expect("提交");
+        assert!(output.is_success(), "{}", output.stderr);
+        Some(root)
+    }
+
+    /// 等待一条指定类别的结果（跳过其它通道的更新）。
+    fn wait_for_outcome(
+        receiver: &crossbeam_channel::Receiver<crate::task::Delivery>,
+        predicate: impl Fn(&Outcome) -> bool,
+    ) -> Outcome {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if let Ok(delivery) = receiver.recv_timeout(Duration::from_millis(200)) {
+                if predicate(&delivery.outcome) {
+                    return delivery.outcome;
+                }
+            }
+        }
+        panic!("在超时前未收到期望的结果");
+    }
+
+    #[test]
+    fn staging_through_the_service_updates_the_index() {
+        let Some(root) = tmp_repo("write-stage") else {
+            return;
+        };
+        std::fs::write(root.join("a.txt"), "hello\nstaged\n").expect("改文件");
+
+        let (mut service, console) = service();
+        let handle = service.open_repo(&root).expect("打开仓库");
+        assert!(!handle.is_read_only(), "单实例应拿到写锁");
+        let (sender, receiver) = unbounded();
+
+        service
+            .request(
+                handle.id(),
+                RequestKind::Write(Box::new(WriteRequest::Stage(vec!["a.txt".to_owned()]))),
+                sender,
+            )
+            .expect("投递暂存");
+
+        let outcome = wait_for_outcome(&receiver, Outcome::is_write);
+        let Outcome::Write(result) = outcome else {
+            panic!("写结果类型不符");
+        };
+        assert!(result.summary.contains("已暂存"), "{result:?}");
+
+        // 与 CLI 等价的验收：索引里应有这条修改。
+        let cli = gt_backend::GitCli::detect().expect("git");
+        let output = cli
+            .run(
+                Some(&root),
+                &["diff", "--cached", "--name-only"],
+                &gt_backend::NoopObserver,
+                gt_backend::LOCAL_TIMEOUT,
+            )
+            .expect("执行 git");
+        assert!(output.stdout.contains("a.txt"), "{}", output.stdout);
+
+        // Console 里应能看到这次写操作的真实命令行（FR-CON-01）。
+        assert!(console
+            .snapshot()
+            .iter()
+            .any(|record| record.command_line.contains("git add")));
+
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hunk_selection_applies_only_the_selected_lines() {
+        let Some(root) = tmp_repo_with_lines("write-hunk") else {
+            return;
+        };
+        // 两处相隔足够远（第 2 行与第 18 行）→ 必然是两个 hunk。
+        let mut content: String = (1..=20)
+            .map(|n| match n {
+                2 => "CHANGED2\n".to_owned(),
+                18 => "CHANGED18\n".to_owned(),
+                other => format!("line{other}\n"),
+            })
+            .collect();
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        std::fs::write(root.join("a.txt"), content).expect("改文件");
+
+        let (mut service, _console) = service();
+        let handle = service.open_repo(&root).expect("打开仓库");
+        let (sender, receiver) = unbounded();
+
+        // 先取差异，拿到指纹与 hunk 结构（与界面看到的完全一致）。
+        service
+            .request(
+                handle.id(),
+                RequestKind::FileDiff {
+                    left: DiffSide::Index,
+                    right: DiffSide::Worktree,
+                    path: "a.txt".to_owned(),
+                },
+                sender.clone(),
+            )
+            .expect("投递差异");
+        let Outcome::FileDiff(diff) =
+            wait_for_outcome(&receiver, |outcome| matches!(outcome, Outcome::FileDiff(_)))
+        else {
+            panic!("差异结果类型不符");
+        };
+        let hunks = diff.payload.hunks().expect("应有文本差异");
+        assert!(hunks.len() >= 2, "应有两个独立 hunk：{}", hunks.len());
+
+        service
+            .request(
+                handle.id(),
+                RequestKind::Write(Box::new(WriteRequest::Selection {
+                    path: "a.txt".to_owned(),
+                    left: DiffSide::Index,
+                    right: DiffSide::Worktree,
+                    selections: vec![gt_diff::HunkSelection::whole(0)],
+                    expected_fingerprint: diff.fingerprint(),
+                    mode: SelectionMode::Stage,
+                })),
+                sender,
+            )
+            .expect("投递 hunk 暂存");
+        let outcome = wait_for_outcome(&receiver, Outcome::is_write);
+        assert!(outcome.is_ok(), "{:?}", outcome.error());
+
+        // 索引里应只有第一个 hunk 的变化：CHANGED2 进入暂存，CHANGED7 没有。
+        let cli = gt_backend::GitCli::detect().expect("git");
+        let cached = cli
+            .run(
+                Some(&root),
+                &["diff", "--cached", "-U0"],
+                &gt_backend::NoopObserver,
+                gt_backend::LOCAL_TIMEOUT,
+            )
+            .expect("执行 git");
+        assert!(cached.stdout.contains("+CHANGED2"), "{}", cached.stdout);
+        assert!(
+            !cached.stdout.contains("+CHANGED18"),
+            "未选中的 hunk 不得被暂存：{}",
+            cached.stdout
+        );
+
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stale_fingerprint_blocks_the_patch() {
+        let Some(root) = tmp_repo_with_lines("write-stale") else {
+            return;
+        };
+        std::fs::write(root.join("a.txt"), "line1\nfirst\nline3\n").expect("改文件");
+
+        let (mut service, _console) = service();
+        let handle = service.open_repo(&root).expect("打开仓库");
+        let (sender, receiver) = unbounded();
+
+        service
+            .request(
+                handle.id(),
+                RequestKind::Write(Box::new(WriteRequest::Selection {
+                    path: "a.txt".to_owned(),
+                    left: DiffSide::Index,
+                    right: DiffSide::Worktree,
+                    selections: vec![gt_diff::HunkSelection::whole(0)],
+                    // 故意给一个不可能的指纹：模拟"界面上的差异已过期"。
+                    expected_fingerprint: 0,
+                    mode: SelectionMode::Stage,
+                })),
+                sender,
+            )
+            .expect("投递");
+
+        let outcome = wait_for_outcome(&receiver, |outcome| {
+            outcome.is_write() || matches!(outcome, Outcome::Failed(_))
+        });
+        let message = outcome.error().unwrap_or_default();
+        assert!(message.contains("已变化"), "必须拒绝过期选择：{message}");
+
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_second_handle_in_the_same_process_is_read_only() {
+        let Some(root) = tmp_repo("write-lock") else {
+            return;
+        };
+        let (mut service, _console) = service();
+        let first = service.open_repo(&root).expect("第一次打开");
+        let second = service.open_repo(&root).expect("第二次打开");
+
+        assert!(!first.is_read_only());
+        assert!(second.is_read_only(), "第二个句柄必须是只读");
+        assert!(second
+            .read_only_reason()
+            .is_some_and(|reason| reason.contains("只读")));
+
+        let (sender, _receiver) = unbounded();
+        let err = service
+            .request(
+                second.id(),
+                RequestKind::Write(Box::new(WriteRequest::Stage(vec!["a.txt".to_owned()]))),
+                sender,
+            )
+            .expect_err("只读仓库的写请求必须在入队前被拒");
+        assert!(matches!(err, crate::task::RequestError::ReadOnly(_)));
+
+        // 释放第一个句柄的写锁后，新的打开应该恢复可写。
+        service.close_repo(first.id());
+        let third = service.open_repo(&root).expect("第三次打开");
+        assert!(
+            !third.is_read_only(),
+            "前者退出后应恢复读写（FR-MR-04 验收）"
+        );
+
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn commit_through_the_service_lands_in_the_log() {
+        let Some(root) = tmp_repo("write-commit") else {
+            return;
+        };
+        std::fs::write(root.join("a.txt"), "hello\ncommitted\n").expect("改文件");
+
+        let (mut service, _console) = service();
+        let handle = service.open_repo(&root).expect("打开仓库");
+        let (sender, receiver) = unbounded();
+
+        service
+            .request(
+                handle.id(),
+                RequestKind::Write(Box::new(WriteRequest::Stage(vec!["a.txt".to_owned()]))),
+                sender.clone(),
+            )
+            .expect("暂存");
+        let _ = wait_for_outcome(&receiver, Outcome::is_write);
+
+        service
+            .request(
+                handle.id(),
+                RequestKind::Write(Box::new(WriteRequest::Commit(gt_backend::CommitRequest {
+                    message: "feat: 通过服务层提交".to_owned(),
+                    ..gt_backend::CommitRequest::default()
+                }))),
+                sender.clone(),
+            )
+            .expect("提交");
+        let outcome = wait_for_outcome(&receiver, Outcome::is_write);
+        assert!(outcome.is_ok(), "{:?}", outcome.error());
+
+        // 日志页应能看到这条新提交（写后缓存已作废）。
+        service
+            .request(
+                handle.id(),
+                RequestKind::LogPage(super::first_log_page()),
+                sender,
+            )
+            .expect("日志");
+        let outcome = wait_for_outcome(&receiver, |outcome| matches!(outcome, Outcome::LogPage(_)));
+        let Outcome::LogPage(page) = outcome else {
+            panic!("日志结果类型不符");
+        };
+        assert_eq!(
+            page.page.nodes[0].summary, "feat: 通过服务层提交",
+            "最新提交应排在首位"
+        );
+
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_returns_matching_commits() {
+        let Some(root) = tmp_repo("search") else {
+            return;
+        };
+        let cli = gt_backend::GitCli::detect().expect("git");
+        let _ = cli.run(
+            Some(&root),
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "feat: 可搜索的关键字",
+            ],
+            &gt_backend::NoopObserver,
+            gt_backend::LOCAL_TIMEOUT,
+        );
+
+        let (mut service, _console) = service();
+        let handle = service.open_repo(&root).expect("打开仓库");
+        let (sender, receiver) = unbounded();
+
+        service
+            .request(
+                handle.id(),
+                RequestKind::Search(crate::task::SearchRequest {
+                    query: "关键字".to_owned(),
+                    ..crate::task::SearchRequest::default()
+                }),
+                sender,
+            )
+            .expect("搜索");
+        let outcome = wait_for_outcome(&receiver, |outcome| matches!(outcome, Outcome::Search(_)));
+        let Outcome::Search(result) = outcome else {
+            panic!("搜索结果类型不符");
+        };
+        assert_eq!(result.nodes.len(), 1, "{:?}", result.nodes);
+        assert_eq!(result.query, "关键字");
+        assert!(!result.timed_out);
+
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
