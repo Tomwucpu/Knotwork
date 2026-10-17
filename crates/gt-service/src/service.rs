@@ -24,12 +24,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Sender;
 use gt_backend::{
-    noop_observer, BackendError, GitCli, GitRepo, LockAttempt, RepoLocation, RepoWriter,
-    SharedGitRepo, SharedObserver, UpstreamRow, WriteLock,
+    noop_observer, AdvancedOps, BackendError, BranchProtection, CredentialKind, GitCli, GitRepo,
+    KeyringStore, LockAttempt, NetworkCredential, NetworkResult, ProgressSink, RemoteListing,
+    RemoteOps, RepoLocation, RepoWriter, SharedGitRepo, SharedObserver, TokenStore, UpstreamRow,
+    WriteLock, WriteOutcome,
 };
 use gt_core::{BranchScope, GraphOptions, LogPageRequest, Oid, RepoId};
 
@@ -37,8 +40,9 @@ use crate::cancel::CancellationToken;
 use crate::generation::{Generation, RequestGate};
 use crate::pool::WorkerPool;
 use crate::task::{
-    Delivery, DiffSide, LogPageResult, Outcome, RepoOverview, RequestError, RequestKind,
-    RequestLane, SearchResult, SelectionMode, WriteRequest,
+    AdvancedResult, ConflictedEntry, CredentialOutcome, Delivery, DiffSide, LogPageResult,
+    NetworkFailure, NetworkOutcome, NetworkRequest, Outcome, RepoOverview, RequestError,
+    RequestKind, RequestLane, SearchResult, SelectionMode, WriteRequest,
 };
 use crate::watch::{ChangeBatch, ChangeSink, RepoPaths, RepoWatcher, DEFAULT_DEBOUNCE};
 
@@ -78,6 +82,118 @@ impl Capabilities {
     }
 }
 
+/// 网络操作的实时状态（进度与串行化）。
+///
+/// UI 线程每 100ms 读一次（[`RepoHandle::network_snapshot`]），工作线程在读取
+/// stderr 时写入 —— 两边都只拿一个短锁，不做任何 I/O。
+#[derive(Debug, Default)]
+pub struct NetworkState {
+    busy: AtomicBool,
+    label: Mutex<String>,
+    line: Mutex<String>,
+    token: Mutex<Option<CancellationToken>>,
+}
+
+/// 网络状态快照（供界面渲染进度条）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkSnapshot {
+    /// 是否有网络操作在进行。
+    pub busy: bool,
+    /// 操作名称（"获取更新" / "推送"…）。
+    pub label: String,
+    /// 最新一行进度（git 的进度流，已去掉 `\r`）。
+    pub line: String,
+}
+
+impl NetworkState {
+    /// 尝试占用独占槽位；已被占用时返回 `false`。
+    ///
+    /// **必须在推进网络通道代次之前调用**：若先推进代次再发现槽位被占，
+    /// 代次推进已经取消了正在运行的那个网络操作的令牌 —— 用户点"推送"
+    /// 会导致正在跑的 fetch 被静默取消，而推送本身还被拒绝。
+    fn reserve(&self, label: &str) -> bool {
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        label.clone_into(&mut self.lock_label());
+        self.lock_line().clear();
+        true
+    }
+
+    /// 把取消令牌挂到已占用的槽位上。
+    fn attach(&self, token: CancellationToken) {
+        *self
+            .token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+    }
+
+    /// 测试用：是否已被独占。
+    #[cfg(test)]
+    fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
+    }
+
+    /// 释放槽位（无论成败都必须调用，否则此后所有网络操作都会被拒）。
+    fn finish(&self) {
+        self.busy.store(false, Ordering::Release);
+        self.lock_line().clear();
+        self.lock_label().clear();
+        let _ = self
+            .token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
+    /// 记录一行进度。
+    fn set_line(&self, text: &str) {
+        text.clone_into(&mut self.lock_line());
+    }
+
+    /// 取消当前网络操作。
+    ///
+    /// 取消的是**子进程等待**：`GitCli` 在等待循环里看到取消就杀进程树，
+    /// 因此返回后不会留下孤儿进程（NFR-COR-02 的验收口径）。
+    fn cancel(&self) -> bool {
+        let guard = self
+            .token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match guard.as_ref() {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn snapshot(&self) -> NetworkSnapshot {
+        NetworkSnapshot {
+            busy: self.busy.load(Ordering::Acquire),
+            label: self.lock_label().clone(),
+            line: self.lock_line().clone(),
+        }
+    }
+
+    fn lock_label(&self) -> std::sync::MutexGuard<'_, String> {
+        self.label
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_line(&self) -> std::sync::MutexGuard<'_, String> {
+        self.line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// 已打开仓库的句柄。
 pub struct RepoHandle {
     id: RepoId,
@@ -92,6 +208,36 @@ pub struct RepoHandle {
     write_lock: Mutex<Option<WriteLock>>,
     /// 启动时探测到的 git 句柄；缺失时写操作会给出明确降级说明。
     cli: Option<GitCli>,
+    /// 网络操作的进度与取消状态。
+    network: Arc<NetworkState>,
+    /// 凭据存储（默认系统密钥链；测试注入内存实现）。
+    tokens: Arc<dyn TokenStore>,
+    /// 高级操作槽位：同一仓库同时只允许一个会长时间改写 index / HEAD 的操作。
+    advanced: Arc<Mutex<Option<String>>>,
+}
+
+/// 高级操作槽位的占用凭证；离开作用域即释放。
+///
+/// 用 RAII 而不是"用完手动清空"：变基 / 合并的失败路径多（冲突、取消、git 报错），
+/// 任何一条漏掉清理，该仓库此后就再也发不出高级操作 —— 这类"一次失败之后永久失效"
+/// 的缺陷在 M3 的网络槽位上已经踩过一次。
+pub struct AdvancedSlot {
+    slot: Arc<Mutex<Option<String>>>,
+}
+
+impl std::fmt::Debug for AdvancedSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdvancedSlot").finish_non_exhaustive()
+    }
+}
+
+impl Drop for AdvancedSlot {
+    fn drop(&mut self) {
+        *self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 /// 视图通道的闸门集合。
@@ -103,6 +249,10 @@ struct GateSet {
     diff: RequestGate,
     /// 写通道的闸门：只用来发号与取取消令牌，**从不作废**。
     write: RequestGate,
+    /// 网络通道的闸门：同上，只发号与取令牌。
+    network: RequestGate,
+    /// 高级操作读取通道（冲突清单 / 冲突文件 / 变基计划 / 贮藏列表）。
+    advanced: RequestGate,
 }
 
 impl GateSet {
@@ -113,6 +263,8 @@ impl GateSet {
             RequestLane::Log => &self.log,
             RequestLane::Diff => &self.diff,
             RequestLane::Write => &self.write,
+            RequestLane::Network => &self.network,
+            RequestLane::Advanced => &self.advanced,
         }
     }
 }
@@ -190,6 +342,75 @@ impl RepoHandle {
             if lane.is_gated() {
                 gates.get(lane).cancel_current();
             }
+        }
+    }
+
+    /// 网络操作状态快照（界面每帧读取，用于进度条与"取消"按钮）。
+    #[must_use]
+    pub fn network_snapshot(&self) -> NetworkSnapshot {
+        self.network.snapshot()
+    }
+
+    /// 取消正在进行的网络操作。
+    ///
+    /// 返回是否确实取消了某个在飞操作：没有在飞操作时返回 `false`，
+    /// 界面据此不显示"已取消"这种会误导用户的提示。
+    pub fn cancel_network(&self) -> bool {
+        self.network.cancel()
+    }
+
+    /// 占用网络独占槽位（不挂令牌）。
+    fn reserve_network(&self, label: &str) -> bool {
+        self.network.reserve(label)
+    }
+
+    /// 把本次请求的取消令牌挂到已占用的槽位上。
+    fn attach_network_token(&self, token: CancellationToken) {
+        self.network.attach(token);
+    }
+
+    /// 释放网络独占槽位。
+    fn finish_network(&self) {
+        self.network.finish();
+    }
+
+    /// 占用高级操作槽位。
+    ///
+    /// # Errors
+    /// 该仓库已有高级操作在进行时返回面向用户的说明。
+    fn begin_advanced(&self, label: &str) -> Result<AdvancedSlot, String> {
+        let mut slot = self
+            .advanced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(busy) = slot.as_ref() {
+            return Err(format!(
+                "该仓库已有高级操作在进行（{busy}）：请等它完成，或先在横幅上中止"
+            ));
+        }
+        *slot = Some(label.to_owned());
+        drop(slot);
+        Ok(AdvancedSlot {
+            slot: Arc::clone(&self.advanced),
+        })
+    }
+
+    /// 当前是否有高级操作在进行（供界面显示）。
+    #[must_use]
+    pub fn advanced_label(&self) -> Option<String> {
+        self.advanced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// 作废某条通道当前代次的在飞任务（不影响其它通道）。
+    ///
+    /// 用于"用户已经关掉了那个面板"的场景：冲突编辑器关闭后，
+    /// 迟到的冲突清单不该把遮罩又弹回来。
+    pub fn cancel_lane(&self, lane: RequestLane) {
+        if lane.is_gated() {
+            self.gates().get(lane).cancel_current();
         }
     }
 
@@ -323,6 +544,8 @@ pub struct GitService {
     cli: Option<GitCli>,
     caps: Capabilities,
     observer: SharedObserver,
+    /// 凭据存储（默认系统密钥链）。
+    tokens: Arc<dyn TokenStore>,
     repos: Mutex<HashMap<RepoId, Arc<RepoHandle>>>,
     next_repo_id: Mutex<u32>,
 }
@@ -346,6 +569,20 @@ impl GitService {
     /// # Errors
     /// 工作线程创建失败时返回错误。
     pub fn new(observer: SharedObserver) -> std::io::Result<Self> {
+        Self::with_token_store(observer, Arc::new(KeyringStore::new()))
+    }
+
+    /// 建服务并指定凭据存储。
+    ///
+    /// 单测注入 [`gt_backend::MemoryTokenStore`]：真实密钥链是**机器级**共享状态，
+    /// 测试写进去会污染开发机，也无法并行。
+    ///
+    /// # Errors
+    /// 工作线程创建失败时返回错误。
+    pub fn with_token_store(
+        observer: SharedObserver,
+        tokens: Arc<dyn TokenStore>,
+    ) -> std::io::Result<Self> {
         let pool = WorkerPool::new()?;
         let cli = GitCli::detect();
         let caps = Capabilities {
@@ -356,6 +593,7 @@ impl GitService {
             cli,
             caps,
             observer,
+            tokens,
             repos: Mutex::new(HashMap::new()),
             next_repo_id: Mutex::new(1),
         })
@@ -434,6 +672,9 @@ impl GitService {
             read_only,
             write_lock: Mutex::new(lock),
             cli: self.cli.clone(),
+            network: Arc::new(NetworkState::default()),
+            tokens: Arc::clone(&self.tokens),
+            advanced: Arc::new(Mutex::new(None)),
         });
 
         tracing::info!(repo = ?id, path = %location.work_dir_or_git_dir().display(), "已注册仓库");
@@ -527,18 +768,57 @@ impl GitService {
                 return Err(RequestError::ReadOnly(reason.to_owned()));
             }
         }
+        // 网络操作里只有"会写引用"的那些需要拦；`Remotes` / `Preview` /
+        // 凭据存取在只读模式下仍然应当可用（用户得能看懂远端配置）。
+        if let RequestKind::Network(network) = &kind {
+            if network.mutates_repo() {
+                if let Some(reason) = handle.read_only_reason() {
+                    return Err(RequestError::ReadOnly(reason.to_owned()));
+                }
+            }
+        }
+
+        // 网络独占：同一仓库同时只允许一个会触碰远端的操作。
+        // 两个并行的 fetch 不仅没有意义，还会在同一个 index/pack 上互相踩。
+        //
+        // 这一步必须在**推进代次之前**完成：推进代次会取消该通道上正在运行的
+        // 令牌，若随后才发现槽位被占并拒绝请求，用户就会看到"推送被拒，同时
+        // 正在跑的 fetch 莫名停了"。
+        let exclusive = match &kind {
+            RequestKind::Network(network) if network.needs_exclusive_slot() => {
+                if !handle.reserve_network(network.label()) {
+                    let busy = handle.network_snapshot().label;
+                    return Err(RequestError::NetworkBusy(busy));
+                }
+                true
+            }
+            _ => false,
+        };
 
         // 推进该通道的代次：这条通道上此前在飞的任务会在下一个分片边界退出，
         // 且它们的过期结果不会再被投递。其它通道的请求不受影响。
         let lane = kind.lane();
         let (generation, token) = handle.begin(lane);
+        if exclusive {
+            handle.attach_network_token(token.clone());
+        }
 
         let job_handle = Arc::clone(&handle);
         let boxed: crate::pool::Job = Box::new(move || {
             run_request(&job_handle, &kind, generation, &token, &sink);
+            // 独占槽位必须在**任何**退出路径上释放，否则该仓库之后再也发不出
+            // 网络请求（"一次取消之后 fetch 按钮永久失效"就是这么来的）。
+            if exclusive {
+                job_handle.finish_network();
+            }
         });
 
-        self.pool.submit(boxed).map_err(RequestError::from)?;
+        if let Err(err) = self.pool.submit(boxed) {
+            if exclusive {
+                handle.finish_network();
+            }
+            return Err(RequestError::from(err));
+        }
         Ok(generation)
     }
     /// 关闭服务：停止全部监听、注销仓库、等待工作线程收尾。
@@ -605,6 +885,7 @@ fn run_request(
             Ok(outcome) => outcome,
             Err(message) => Outcome::Failed(message),
         },
+        RequestKind::Network(network) => execute_network(handle, &repo, network, token),
         _ => match execute(&repo, kind, token, handle) {
             Ok(outcome) => outcome,
             Err(message) => Outcome::Failed(message),
@@ -670,6 +951,9 @@ fn execute(
                 location: repo.location().clone(),
                 read_only: handle.read_only_reason().map(str::to_owned),
                 user_email: repo.user_email(),
+                // 变基进度是"第 3/7 个"的来源；直接读 `.git/rebase-merge`，
+                // 不需要 git CLI（FR-MRG-02）。
+                rebase: gt_backend::read_rebase_progress(&repo.location().git_dir),
             })))
         }
         RequestKind::Status => {
@@ -724,8 +1008,81 @@ fn execute(
             Ok(Outcome::FileDiff(Box::new(diff)))
         }
         RequestKind::Search(request) => execute_search(repo, handle, request, token),
+        RequestKind::Conflicts => execute_conflicts(repo),
+        RequestKind::ConflictFile { path } => {
+            let Some(bytes) = repo
+                .worktree_blob(path, MAX_BLOB_BYTES)
+                .map_err(user_message)?
+            else {
+                return Err(format!(
+                    "无法读取 {path}：文件不存在，或超过 {}MB 的读取上限",
+                    MAX_BLOB_BYTES / (1024 * 1024)
+                ));
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            Ok(Outcome::ConflictFile(Box::new(
+                gt_diff::ConflictFile::parse(path.clone(), &text),
+            )))
+        }
+        RequestKind::RebasePlan { onto, base } => {
+            let ops = advanced_ops(repo, handle)?;
+            let plan = ops.plan_from_base(onto, base).map_err(user_message)?;
+            Ok(Outcome::RebasePlan(Box::new(plan)))
+        }
+        RequestKind::StashList => {
+            let ops = advanced_ops(repo, handle)?;
+            Ok(Outcome::StashList(ops.stash_list().map_err(user_message)?))
+        }
         RequestKind::Write(_) => Err("写请求不应进入读取路径".to_owned()),
+        RequestKind::Network(_) => Err("网络请求不应进入读取路径".to_owned()),
     }
+}
+
+/// 构造高级操作执行器；git 缺失时给出与其它写操作一致的降级说明。
+fn advanced_ops(repo: &GitRepo, handle: &RepoHandle) -> Result<AdvancedOps, String> {
+    let Some(cli) = handle.cli.as_ref() else {
+        return Err(
+            "该操作依赖 git 可执行文件（当前未检测到 git）；             只读的仓库浏览仍可用。可通过环境变量 KNOTWORK_GIT 指定 git 路径。"
+                .to_owned(),
+        );
+    };
+    Ok(AdvancedOps::new(
+        repo.location(),
+        cli.clone(),
+        repo.observer(),
+    ))
+}
+
+/// 列出待解决的冲突文件（FR-CFL-02）。
+///
+/// 冲突块数量通过读工作区文件统计：它决定"这个文件还需要处理几处"，
+/// 是用户在冲突侧栏里最想看到的数字；文件数通常在个位数，代价可忽略。
+fn execute_conflicts(repo: &GitRepo) -> Result<Outcome, String> {
+    let changes = repo.status().map_err(user_message)?;
+    let partitioned = changes.partition();
+    let entries: Vec<ConflictedEntry> = partitioned
+        .conflicted
+        .iter()
+        .map(|entry| {
+            let hunks = repo
+                .worktree_blob(&entry.path, MAX_BLOB_BYTES)
+                .ok()
+                .flatten()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .map_or(0, |text| gt_diff::count_conflict_markers(&text) / 2);
+            let kind = entry
+                .conflict
+                .unwrap_or(gt_core::ConflictKind::BothModified);
+            let (ours, theirs) = kind.code();
+            ConflictedEntry {
+                path: entry.path.clone(),
+                code: format!("{ours}{theirs}"),
+                kind,
+                hunks,
+            }
+        })
+        .collect();
+    Ok(Outcome::Conflicts(entries))
 }
 
 /// 执行一次提交消息搜索（FR-LOG-03）。
@@ -776,6 +1133,217 @@ fn execute_search(
     })))
 }
 
+/// 执行一次网络操作（FR-RMT）。
+///
+/// 函数体偏长是有意的：它是一张"请求 → 执行器"的对照表，拆开会让
+/// "哪个请求落到哪个执行器"变得难以一眼看清。
+///
+/// 返回 [`Outcome`] 而不是 `Result`：网络失败的形态比本地写丰富得多
+/// （凭据/网络/远端策略），用 [`NetworkFailure`] 承载才能让界面据此给出
+/// "保存 token"这类针对性入口，而不是只弹一句红字。
+#[allow(clippy::too_many_lines)]
+fn execute_network(
+    handle: &RepoHandle,
+    repo: &GitRepo,
+    request: &NetworkRequest,
+    token: &CancellationToken,
+) -> Outcome {
+    // 凭据存取不碰远端，因此排在 git 探测之前：git 缺失时用户仍然能管理 token。
+    match request {
+        NetworkRequest::SaveToken {
+            host,
+            username,
+            secret,
+        } => {
+            return match handle.tokens.set(host, username, secret) {
+                Ok(()) => Outcome::Network(Box::new(NetworkOutcome::Token(Box::new(
+                    CredentialOutcome {
+                        host: host.clone(),
+                        saved: true,
+                        message: format!("已把 {host} 的 token 存入系统密钥链（明文不落盘）"),
+                    },
+                )))),
+                Err(err) => network_failed(NetworkFailure {
+                    summary: format!("写入系统密钥链失败：{err}"),
+                    kind: CredentialKind::Unknown,
+                    hints: vec!["可改用 git 自己的 credential helper 保管密码：\
+                         git config --global credential.helper manager"
+                        .to_owned()],
+                    detail: String::new(),
+                }),
+            };
+        }
+        NetworkRequest::ForgetToken { host } => {
+            return match handle.tokens.delete(host) {
+                Ok(()) => Outcome::Network(Box::new(NetworkOutcome::Token(Box::new(
+                    CredentialOutcome {
+                        host: host.clone(),
+                        saved: false,
+                        message: format!("已删除 {host} 保存的 token"),
+                    },
+                )))),
+                Err(err) => network_failed(NetworkFailure {
+                    summary: format!("删除密钥链条目失败：{err}"),
+                    kind: CredentialKind::Unknown,
+                    hints: Vec::new(),
+                    detail: String::new(),
+                }),
+            };
+        }
+        _ => {}
+    }
+
+    let Some(cli) = handle.cli.as_ref() else {
+        return network_failed(NetworkFailure {
+            summary: format!(
+                "「{}」需要 git 可执行文件支持（当前未检测到 git）",
+                request.label()
+            ),
+            kind: CredentialKind::Unknown,
+            hints: vec![
+                "安装 git 后重启本工具；也可用环境变量 KNOTWORK_GIT 指定 git 路径。".to_owned(),
+            ],
+            detail: String::new(),
+        });
+    };
+
+    let ops = RemoteOps::new(repo.location(), cli.clone(), repo.observer());
+    let result = match request {
+        NetworkRequest::Remotes => ops.list_remotes().map(|remotes| {
+            NetworkOutcome::Remotes(Box::new(RemoteListing {
+                remotes,
+                helpers: ops.credential_helpers(),
+                ssh_agent: ops.ssh_agent_available(),
+                keyring_available: handle.tokens.is_available(),
+            }))
+        }),
+        NetworkRequest::EditRemote(edit) => ops.edit_remote(edit).map(as_done),
+        NetworkRequest::Fetch(fetch) => attach_credential(ops, handle, fetch.remote.as_deref())
+            .fetch(fetch, &TokenProbe(token), Some(progress_sink(handle)))
+            .map(as_done),
+        NetworkRequest::Pull(pull) => attach_credential(ops, handle, Some(&pull.remote))
+            .pull(pull, &TokenProbe(token), Some(progress_sink(handle)))
+            .map(as_done),
+        NetworkRequest::Push {
+            request: push,
+            protected_patterns,
+        } => {
+            let protection = BranchProtection::new(protected_patterns);
+            attach_credential(ops, handle, Some(&push.remote))
+                .push(
+                    push,
+                    &protection,
+                    &TokenProbe(token),
+                    Some(progress_sink(handle)),
+                )
+                .map(as_done)
+        }
+        NetworkRequest::Preview(preview) => {
+            let protection = BranchProtection::new(&preview.protected_patterns);
+            ops.push_preview(&preview.remote, preview.branch.as_deref(), &protection)
+                .map(|preview| NetworkOutcome::Preview(Box::new(preview)))
+        }
+        // 上面已经处理过，这里只是让 match 保持穷尽。
+        NetworkRequest::SaveToken { .. } | NetworkRequest::ForgetToken { .. } => {
+            unreachable!("凭据存取已在函数开头返回")
+        }
+    };
+
+    match result {
+        Ok(outcome) => {
+            // 引用 / 索引变了：日志 id 列表必须作废，否则新提交不会出现在 Log 里。
+            if request.mutates_repo() {
+                handle.invalidate_log_index();
+            }
+            Outcome::Network(Box::new(outcome))
+        }
+        Err(err) => network_error_outcome(err),
+    }
+}
+
+/// 把后端结果包装成"执行完成"。
+fn as_done(result: NetworkResult) -> NetworkOutcome {
+    NetworkOutcome::Done(Box::new(result))
+}
+
+/// 进度回调：把 git 的进度流写进仓库的共享状态，由界面按帧读取。
+///
+/// 不直接更新界面（UI 线程只做搬运），也不缓冲历史（只需要最新一行）。
+fn progress_sink(handle: &RepoHandle) -> Arc<dyn ProgressSink> {
+    let state = Arc::clone(&handle.network);
+    Arc::new(move |line: &str| state.set_line(line))
+}
+
+/// 为一次网络操作附加密钥链里的凭据（若存在）。
+fn attach_credential(ops: RemoteOps, handle: &RepoHandle, remote: Option<&str>) -> RemoteOps {
+    let Some(remote) = remote else {
+        // `fetch --all` 之类没有单一主机：只能走用户自己的 credential helper。
+        return ops;
+    };
+    let Some(host) = ops.credential_host(remote) else {
+        // SSH 远端或本地路径：不注入 HTTPS 凭据（注入也没用，还会误导排查）。
+        return ops;
+    };
+    let Some(secret) = handle.tokens.get(&host) else {
+        return ops;
+    };
+    let username = ops.credential_username(remote);
+    let username = if username.is_empty() {
+        // 多数托管服务的 token 认证只校验 token 本身；这里给一个非空占位符，
+        // 避免 git 因"用户名为空"直接失败。
+        "knotwork".to_owned()
+    } else {
+        username
+    };
+    tracing::debug!(host, %username, "使用密钥链中的凭据");
+    ops.with_credential(Some(NetworkCredential { username, secret }))
+}
+
+/// 构造一次网络失败结果。
+fn network_failed(failure: NetworkFailure) -> Outcome {
+    Outcome::Network(Box::new(NetworkOutcome::Failed(Box::new(failure))))
+}
+
+/// 把后端错误翻译成结构化的网络失败。
+fn network_error_outcome(error: BackendError) -> Outcome {
+    let failure = match error {
+        BackendError::Network {
+            summary,
+            detail,
+            kind,
+        } => NetworkFailure {
+            summary,
+            kind,
+            // 后端已经把这轮的具体建议写进 summary 了，这里不再重复。
+            hints: Vec::new(),
+            detail,
+        },
+        BackendError::Cancelled => NetworkFailure {
+            summary: "操作已取消：已终止 git 子进程及其子进程".to_owned(),
+            kind: CredentialKind::Unknown,
+            hints: vec!["取消不会回滚已经完成的远端改动；如需确认，请重新 Fetch 一次。".to_owned()],
+            detail: String::new(),
+        },
+        BackendError::ProcessTimeout { seconds, .. } => NetworkFailure {
+            summary: format!("网络操作超时（{seconds}s），已终止进程树"),
+            kind: CredentialKind::Network,
+            hints: vec![
+                "确认网络连通性；企业内网通常需要 VPN 或代理。".to_owned(),
+                "超大仓库首次 fetch 可在终端里预热一次，让 pack 落到本地缓存。".to_owned(),
+                "也可在终端里执行「复现」一行的命令，以区分是本工具还是网络的问题。".to_owned(),
+            ],
+            detail: String::new(),
+        },
+        other => NetworkFailure {
+            summary: other.to_string(),
+            kind: CredentialKind::Unknown,
+            hints: vec!["详见 Console 中该条记录的完整输出。".to_owned()],
+            detail: String::new(),
+        },
+    };
+    network_failed(failure)
+}
+
 /// 执行一次写操作。
 ///
 /// 写后**不做**任何读取重算：状态与日志由界面收到结果后主动重新请求。
@@ -787,6 +1355,11 @@ fn execute_write(
     request: &WriteRequest,
     token: &CancellationToken,
 ) -> Result<Outcome, String> {
+    // 高级操作（M4）走独立实现：它们的失败形态（冲突、中断）与"暂存失败"
+    // 完全不同，混在同一个 match 里会让两条路径的语义互相污染。
+    if request.is_advanced() {
+        return execute_advanced(handle, repo, request, token);
+    }
     if let Some(reason) = handle.read_only_reason() {
         return Err(reason.to_owned());
     }
@@ -823,6 +1396,12 @@ fn execute_write(
             *expected_fingerprint,
             *mode,
         ),
+        // M4 的高级操作已在函数开头分流到 `execute_advanced`；
+        // 走到这里说明 `is_advanced()` 与新变体不同步，属于内部一致性错误。
+        other => Err(BackendError::Process(format!(
+            "「{}」应走高级操作路径",
+            other.label()
+        ))),
     };
 
     token.check().map_err(user_message)?;
@@ -835,6 +1414,92 @@ fn execute_write(
             Ok(Outcome::Write(Box::new(result)))
         }
         Err(err) => Err(user_message(err)),
+    }
+}
+
+/// 执行一次高级操作（FR-MRG / FR-STH / FR-PTC / FR-CFL）。
+///
+/// 与 [`execute_write`] 的差别有两点：
+///
+/// 1. **冲突不是失败**：`Ok(AdvancedResult)` 里带着冲突文件清单，界面据此进入
+///    三路编辑器；只有"没有冲突却执行失败"才走 `Err`。
+/// 2. **独占槽位**：合并 / 变基 / 拣选等操作会长时间持有 index 与 HEAD，
+///    两个并行执行会互相踩 `index.lock`。槽位是 RAII 的，任何退出路径都会释放。
+fn execute_advanced(
+    handle: &RepoHandle,
+    repo: &GitRepo,
+    request: &WriteRequest,
+    token: &CancellationToken,
+) -> Result<Outcome, String> {
+    if let Some(reason) = handle.read_only_reason() {
+        return Err(reason.to_owned());
+    }
+    let ops = advanced_ops(repo, handle)?;
+
+    let _slot = if request.needs_advanced_slot() {
+        Some(handle.begin_advanced(request.label())?)
+    } else {
+        None
+    };
+
+    let result: Result<AdvancedResult, BackendError> = match request {
+        WriteRequest::Merge(req) => ops.merge(req).map(AdvancedResult::from),
+        WriteRequest::Rebase(req) => ops.rebase(req).map(AdvancedResult::from),
+        WriteRequest::RebaseControl(control) => {
+            ops.rebase_control(*control).map(AdvancedResult::from)
+        }
+        WriteRequest::InteractiveRebase(plan) => ops
+            .interactive_rebase(plan, Some(&TokenProbe(token)))
+            .map(AdvancedResult::from),
+        WriteRequest::CherryPick(req) => ops.cherry_pick(req).map(AdvancedResult::from),
+        WriteRequest::Revert(req) => ops.revert(req).map(AdvancedResult::from),
+        WriteRequest::Reset(req) => ops.reset(req).map(AdvancedResult::from),
+        WriteRequest::UndoCommit { id } => ops.undo_commit(id).map(AdvancedResult::from),
+        WriteRequest::Stash(op) => ops.stash(op).map(AdvancedResult::from),
+        WriteRequest::ApplyPatch(req) => ops.apply_patch(req).map(AdvancedResult::from),
+        WriteRequest::AbortMerge => ops.abort_merge().map(AdvancedResult::from),
+        WriteRequest::ContinueState { state, abort } => ops
+            .continue_or_abort(*state, *abort)
+            .map(AdvancedResult::from),
+        WriteRequest::Tag(op) => ops.tag(op).map(AdvancedResult::from),
+        WriteRequest::ResolveConflict { path, content } => ops
+            .resolve_conflict(path, content)
+            .map(|outcome| from_write_outcome(&ops, repo, outcome)),
+        WriteRequest::TakeSide { path, stage } => ops
+            .take_side(path, *stage)
+            .map(|outcome| from_write_outcome(&ops, repo, outcome)),
+        WriteRequest::CreatePatch { source, output } => {
+            ops.create_patch(source, output).map(|path| AdvancedResult {
+                summary: format!("已生成补丁：{}", path.display()),
+                detail: String::new(),
+                conflicts: Vec::new(),
+                state: repo.repo_state(),
+            })
+        }
+        _ => return Err("该请求不是高级操作".to_owned()),
+    };
+
+    match result {
+        Ok(result) => {
+            // 合并 / 变基 / 重置都会移动引用：日志 id 列表缓存必须作废，
+            // 否则下一次翻页拿到的是写之前的提交列表。
+            handle.invalidate_log_index();
+            Ok(Outcome::Advanced(Box::new(result)))
+        }
+        Err(err) => Err(user_message(err)),
+    }
+}
+
+/// 把 `WriteOutcome` 形态的结果补全成 [`AdvancedResult`]。
+///
+/// 冲突落盘与"取某一侧"由 [`gt_backend::RepoOutcome`]（`WriteOutcome`）返回，
+/// 但它们同属高级操作：界面需要同一份结构（含剩余冲突与仓库状态）来决定下一步。
+fn from_write_outcome(ops: &AdvancedOps, repo: &GitRepo, outcome: WriteOutcome) -> AdvancedResult {
+    AdvancedResult {
+        summary: outcome.summary,
+        detail: outcome.detail,
+        conflicts: ops.conflicted_paths().unwrap_or_default(),
+        state: repo.repo_state(),
     }
 }
 
@@ -1715,5 +2380,434 @@ mod tests {
 
         service.shutdown();
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    //! 网络通道的服务层行为：结果不作废、独占、只读拦截、凭据存取。
+
+    use super::{GitService, NetworkState, RequestKind};
+    use crate::cancel::CancellationToken;
+    use crate::task::{
+        Delivery, NetworkOutcome, NetworkRequest, Outcome, PushPreviewRequest, RequestError,
+    };
+    use crossbeam_channel::{unbounded, Receiver};
+    use gt_backend::{
+        FetchRequest, MemoryTokenStore, PullStrategy, PushRequest, PushTarget, RemoteEdit,
+        TokenStore,
+    };
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("执行 git");
+        assert!(
+            output.status.success(),
+            "git {args:?} 失败：{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_stdout(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("执行 git");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// 工作仓库 + 裸远端。
+    fn repo_with_remote(label: &str) -> Option<(PathBuf, PathBuf)> {
+        gt_backend::GitCli::detect()?;
+        let root =
+            std::env::temp_dir().join(format!("knotwork-net-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let work = root.join("work");
+        let bare = root.join("remote.git");
+        std::fs::create_dir_all(&work).expect("建目录");
+
+        git(
+            &root,
+            &[
+                "init",
+                "--bare",
+                "-q",
+                "--initial-branch=main",
+                "remote.git",
+            ],
+        );
+        git(&work, &["init", "-q", "--initial-branch=main"]);
+        git(&work, &["config", "user.email", "net@knotwork.invalid"]);
+        git(&work, &["config", "user.name", "Knotwork Net"]);
+        std::fs::write(work.join("a.txt"), "one\n").expect("写文件");
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-q", "-m", "first"]);
+        git(
+            &work,
+            &["remote", "add", "origin", bare.to_str().expect("路径")],
+        );
+        Some((work, bare))
+    }
+
+    fn service_with_memory_tokens() -> (GitService, Arc<MemoryTokenStore>) {
+        let store = Arc::new(MemoryTokenStore::new());
+        let service = GitService::with_token_store(
+            gt_backend::noop_observer(),
+            Arc::clone(&store) as Arc<dyn TokenStore>,
+        )
+        .expect("建服务");
+        (service, store)
+    }
+
+    fn wait(receiver: &Receiver<Delivery>, timeout: Duration) -> Delivery {
+        receiver.recv_timeout(timeout).expect("应在超时前收到结果")
+    }
+
+    fn network(outcome: Outcome) -> NetworkOutcome {
+        match outcome {
+            Outcome::Network(result) => *result,
+            other => panic!("期望网络结果，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remotes_carry_credential_capabilities() {
+        let Some((work, _bare)) = repo_with_remote("remotes") else {
+            return;
+        };
+        let (mut service, _store) = service_with_memory_tokens();
+        let handle = service.open_repo(&work).expect("打开仓库");
+        let (sender, receiver) = unbounded();
+
+        service
+            .request(
+                handle.id(),
+                RequestKind::Network(Box::new(NetworkRequest::Remotes)),
+                sender,
+            )
+            .expect("投递远端列表");
+        let listing = match network(wait(&receiver, Duration::from_secs(20)).outcome) {
+            NetworkOutcome::Remotes(listing) => listing,
+            other => panic!("期望远端列表，实际 {other:?}"),
+        };
+        assert_eq!(listing.remotes.len(), 1);
+        assert_eq!(listing.remotes[0].name, "origin");
+        assert!(!listing.remotes[0].has_embedded_credentials);
+        assert!(
+            listing.keyring_available,
+            "内存实现应报告可用；真实密钥链在 CI 上可能不可用"
+        );
+
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(work.parent().expect("父目录"));
+    }
+
+    #[test]
+    fn preview_and_push_reach_the_remote() {
+        let Some((work, bare)) = repo_with_remote("push") else {
+            return;
+        };
+        let (mut service, _store) = service_with_memory_tokens();
+        let handle = service.open_repo(&work).expect("打开仓库");
+        let (sender, receiver) = unbounded();
+
+        service
+            .request(
+                handle.id(),
+                RequestKind::Network(Box::new(NetworkRequest::Preview(PushPreviewRequest {
+                    remote: "origin".to_owned(),
+                    branch: Some("main".to_owned()),
+                    protected_patterns: Vec::new(),
+                }))),
+                sender.clone(),
+            )
+            .expect("投递预览");
+        let preview = match network(wait(&receiver, Duration::from_secs(20)).outcome) {
+            NetworkOutcome::Preview(preview) => preview,
+            other => panic!("期望预览，实际 {other:?}"),
+        };
+        assert!(preview.creates_branch, "远端尚无 main");
+        assert_eq!(preview.commits.len(), 1);
+
+        service
+            .request(
+                handle.id(),
+                RequestKind::Network(Box::new(NetworkRequest::Push {
+                    request: PushRequest {
+                        remote: "origin".to_owned(),
+                        targets: vec![PushTarget::same("main")],
+                        force_with_lease: false,
+                        set_upstream: true,
+                        tags: false,
+                    },
+                    protected_patterns: Vec::new(),
+                })),
+                sender,
+            )
+            .expect("投递推送");
+        let outcome = wait(&receiver, Duration::from_secs(60)).outcome;
+        assert!(outcome.is_ok(), "推送应成功：{outcome:?}");
+
+        // 远端真的收到了提交（以 git 自己的引用为准，不看我们的自述）。
+        let remote_head = git_stdout(&bare, &["rev-parse", "refs/heads/main"]);
+        let local_head = git_stdout(&work, &["rev-parse", "HEAD"]);
+        assert_eq!(remote_head, local_head);
+
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(work.parent().expect("父目录"));
+    }
+
+    #[test]
+    fn protected_branch_blocks_force_push_through_the_service() {
+        let Some((work, _bare)) = repo_with_remote("protect") else {
+            return;
+        };
+        let (mut service, _store) = service_with_memory_tokens();
+        let handle = service.open_repo(&work).expect("打开仓库");
+        let (sender, receiver) = unbounded();
+
+        service
+            .request(
+                handle.id(),
+                RequestKind::Network(Box::new(NetworkRequest::Push {
+                    request: PushRequest {
+                        remote: "origin".to_owned(),
+                        targets: vec![PushTarget::same("main")],
+                        force_with_lease: true,
+                        set_upstream: false,
+                        tags: false,
+                    },
+                    protected_patterns: vec!["^main$".to_owned()],
+                })),
+                sender,
+            )
+            .expect("投递推送");
+        let failure = match network(wait(&receiver, Duration::from_secs(30)).outcome) {
+            NetworkOutcome::Failed(failure) => failure,
+            other => panic!("强制推送受保护分支必须失败，实际 {other:?}"),
+        };
+        assert!(
+            failure.summary.contains("受保护分支"),
+            "{}",
+            failure.summary
+        );
+        assert!(failure.summary.contains("替代做法"), "{}", failure.summary);
+
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(work.parent().expect("父目录"));
+    }
+
+    #[test]
+    fn fetch_and_pull_report_and_update_refs() {
+        let Some((work, bare)) = repo_with_remote("fetch") else {
+            return;
+        };
+        // 先推一次，让远端有 main。
+        git(&work, &["push", "-q", "-u", "origin", "main"]);
+
+        let (mut service, _store) = service_with_memory_tokens();
+        let handle = service.open_repo(&work).expect("打开仓库");
+        let (sender, receiver) = unbounded();
+
+        service
+            .request(
+                handle.id(),
+                RequestKind::Network(Box::new(NetworkRequest::Fetch(FetchRequest {
+                    remote: Some("origin".to_owned()),
+                    prune: true,
+                    tags: false,
+                }))),
+                sender.clone(),
+            )
+            .expect("投递 fetch");
+        let fetched = wait(&receiver, Duration::from_secs(60)).outcome;
+        assert!(fetched.is_ok(), "fetch 应成功：{fetched:?}");
+
+        // 远端被另一个克隆推进，本地 pull 之后应包含那个提交。
+        let other = work.parent().expect("父目录").join("other");
+        git(
+            work.parent().expect("父目录"),
+            &[
+                "clone",
+                "-q",
+                bare.to_str().expect("路径"),
+                other.to_str().expect("路径"),
+            ],
+        );
+        git(&other, &["config", "user.email", "other@knotwork.invalid"]);
+        git(&other, &["config", "user.name", "Other"]);
+        std::fs::write(other.join("b.txt"), "x\n").expect("写文件");
+        git(&other, &["add", "-A"]);
+        git(&other, &["commit", "-q", "-m", "from other"]);
+        git(&other, &["push", "-q", "origin", "main"]);
+
+        service
+            .request(
+                handle.id(),
+                RequestKind::Network(Box::new(NetworkRequest::Pull(gt_backend::PullRequest {
+                    remote: "origin".to_owned(),
+                    branch: Some("main".to_owned()),
+                    strategy: PullStrategy::Merge,
+                }))),
+                sender,
+            )
+            .expect("投递 pull");
+        let pulled = wait(&receiver, Duration::from_secs(60)).outcome;
+        assert!(pulled.is_ok(), "pull 应成功：{pulled:?}");
+        assert!(work.join("b.txt").exists(), "pull 后应包含远端新增文件");
+
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(work.parent().expect("父目录"));
+    }
+
+    #[test]
+    fn read_only_repo_allows_listing_but_refuses_network_writes() {
+        let Some((work, _bare)) = repo_with_remote("readonly") else {
+            return;
+        };
+        // 另一个"实例"持有写锁。
+        let held = gt_backend::WriteLock::acquire(&work.join(".git")).expect("占锁");
+        assert!(matches!(held, gt_backend::LockAttempt::Acquired(_)));
+
+        let (mut service, _store) = service_with_memory_tokens();
+        let handle = service.open_repo(&work).expect("打开仓库");
+        assert!(handle.is_read_only(), "写锁被占时应以只读打开");
+
+        let (sender, _receiver) = unbounded();
+        let error = service
+            .request(
+                handle.id(),
+                RequestKind::Network(Box::new(NetworkRequest::Fetch(FetchRequest {
+                    remote: Some("origin".to_owned()),
+                    prune: false,
+                    tags: false,
+                }))),
+                sender.clone(),
+            )
+            .expect_err("只读仓库不应接受写引用操作");
+        assert!(matches!(error, RequestError::ReadOnly(_)), "{error:?}");
+
+        // 读取远端列表不改变仓库，只读模式下也必须可用。
+        service
+            .request(
+                handle.id(),
+                RequestKind::Network(Box::new(NetworkRequest::Remotes)),
+                sender,
+            )
+            .expect("只读仓库仍可列出远端");
+
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(work.parent().expect("父目录"));
+    }
+
+    #[test]
+    fn network_slot_is_exclusive_and_released() {
+        let state = NetworkState::default();
+        assert!(!state.snapshot().busy);
+
+        let token = CancellationToken::new();
+        assert!(state.reserve("获取更新"));
+        state.attach(token.clone());
+        assert!(state.snapshot().busy);
+        assert_eq!(state.snapshot().label, "获取更新");
+
+        // 第二个网络操作必须被拒（同一仓库不允许并行 fetch/push）。
+        assert!(!state.reserve("推送"));
+        assert!(state.is_busy(), "被拒绝的抢占不能影响已占用的槽位");
+
+        // 进度可被界面读到。
+        state.set_line("Receiving objects: 42%");
+        assert_eq!(state.snapshot().line, "Receiving objects: 42%");
+
+        // 取消作用于当前令牌。
+        assert!(state.cancel());
+        assert!(token.is_cancelled());
+
+        state.finish();
+        assert!(!state.snapshot().busy);
+        assert!(
+            state.reserve("推送"),
+            "释放后必须能再次占用（否则一次取消会让按钮永久失效）"
+        );
+        state.finish();
+    }
+
+    #[test]
+    fn tokens_are_saved_and_forgotten_through_the_service() {
+        let Some((work, _bare)) = repo_with_remote("token") else {
+            return;
+        };
+        let (mut service, store) = service_with_memory_tokens();
+        let handle = service.open_repo(&work).expect("打开仓库");
+        let (sender, receiver) = unbounded();
+
+        service
+            .request(
+                handle.id(),
+                RequestKind::Network(Box::new(NetworkRequest::SaveToken {
+                    host: "example.com".to_owned(),
+                    username: "bob".to_owned(),
+                    secret: "tok-secret".to_owned(),
+                })),
+                sender.clone(),
+            )
+            .expect("投递保存凭据");
+        let outcome = network(wait(&receiver, Duration::from_secs(10)).outcome);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(store.get("example.com").as_deref(), Some("tok-secret"));
+
+        service
+            .request(
+                handle.id(),
+                RequestKind::Network(Box::new(NetworkRequest::ForgetToken {
+                    host: "example.com".to_owned(),
+                })),
+                sender,
+            )
+            .expect("投递删除凭据");
+        let outcome = network(wait(&receiver, Duration::from_secs(10)).outcome);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(store.get("example.com").is_none());
+
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(work.parent().expect("父目录"));
+    }
+
+    #[test]
+    fn remote_edits_are_applied_to_the_repository() {
+        let Some((work, bare)) = repo_with_remote("edit") else {
+            return;
+        };
+        let (mut service, _store) = service_with_memory_tokens();
+        let handle = service.open_repo(&work).expect("打开仓库");
+        let (sender, receiver) = unbounded();
+
+        service
+            .request(
+                handle.id(),
+                RequestKind::Network(Box::new(NetworkRequest::EditRemote(RemoteEdit::Rename {
+                    from: "origin".to_owned(),
+                    to: "upstream".to_owned(),
+                }))),
+                sender.clone(),
+            )
+            .expect("投递改名");
+        let outcome = network(wait(&receiver, Duration::from_secs(20)).outcome);
+        assert!(outcome.is_ok(), "{outcome:?}");
+
+        let remotes = git_stdout(&work, &["remote"]);
+        assert_eq!(remotes, "upstream", "改名必须落到仓库配置");
+        let url = git_stdout(&work, &["remote", "get-url", "upstream"]);
+        assert_eq!(url, bare.to_str().expect("路径"));
+
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(work.parent().expect("父目录"));
     }
 }

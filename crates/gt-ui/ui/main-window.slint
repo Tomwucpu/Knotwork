@@ -121,10 +121,72 @@ export struct ConsoleRow {
     ok: bool,
 }
 
+// 推送预览的一行（将被推送的提交）。
+export struct PushRow {
+    short-id: string,
+    subject: string,
+    author: string,
+    when: string,
+}
+
+// 远端列表的一行。
+export struct RemoteRow {
+    name: string,
+    url: string,
+    detail: string,
+    selected: bool,
+}
+
 // 最近仓库的一项。
 export struct RecentRow {
     name: string,
     path: string,
+}
+
+// 贮藏列表的一行（FR-STH）。
+export struct StashRow {
+    index: int,
+    selector: string,
+    summary: string,
+    branch: string,
+}
+
+// 三路编辑器左侧的冲突文件行（FR-CFL-02）。
+export struct ConflictFileRow {
+    row-index: int,
+    path: string,
+    code: string,
+    hunks: int,
+    selected: bool,
+}
+
+// 三路编辑器的一行：kind=0 是上下文（只有 result），kind=1 是三栏冲突块。
+export struct ConflictRow {
+    kind: int,
+    block: int,
+    label: string,
+    ours: string,
+    theirs: string,
+    result: string,
+    decided: bool,
+}
+
+// 交互式变基步骤的一行（FR-MRG-03）。
+export struct RebaseStepRow {
+    row-index: int,
+    short-id: string,
+    subject: string,
+    action: int,
+    selected: bool,
+    has-message: bool,
+}
+
+// 两提交比较 / 快照浏览的文件行（FR-LOG-08）。
+export struct CompareRow {
+    path: string,
+    code: string,
+    status: string,
+    selected: bool,
 }
 
 // ---------------------------------------------------------------- 子组件
@@ -244,6 +306,32 @@ component OptionToggle inherits Rectangle {
 }
 
 // 日志行：左侧泳道图 + 提交信息。
+// 上下文菜单的一行：左对齐文字 + 悬停高亮。
+component CtxMenuItem inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 26px;
+    background: touch.has-hover && root.enabled ? Palette.hover : transparent;
+    border-radius: 3px;
+
+    Text {
+        x: 8px;
+        width: parent.width - 16px;
+        text: root.text;
+        color: !root.enabled ? Palette.text-faint : Palette.text;
+        font-size: 12px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
 component LogRowView inherits Rectangle {
     in property <string> short-id;
     in property <string> subject;
@@ -255,6 +343,8 @@ component LogRowView inherits Rectangle {
     in property <bool> is-mine;
     in property <bool> is-merge;
     callback clicked();
+    // 右键：提交上下文菜单（FR-LOG-07/08）。带上光标坐标，菜单出现在鼠标处。
+    callback context-clicked(length, length);
 
     background: root.is-selected
         ? (Palette.dark ? #35507a : #cfe0ff)
@@ -345,6 +435,15 @@ component LogRowView inherits Rectangle {
 
     touch := TouchArea {
         clicked => { root.clicked(); }
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.right) {
+                // 菜单贴在该行的左边缘展开：`PointerEvent` 不提供光标坐标，
+                // 而"点击哪一行就在哪一行旁边弹出"本来就是上下文菜单的语义。
+                root.context-clicked(
+                    touch.absolute-position.x + 48px,
+                    touch.absolute-position.y);
+            }
+        }
     }
 }
 
@@ -595,6 +694,41 @@ export component MainWindow inherits Window {
     in-out property <[ConsoleRow]> console-rows: [];
     in-out property <string> console-summary: "";
 
+    // ---- 远端（FR-RMT）----
+    // 网络操作进行中：显示进度条与取消按钮。
+    in-out property <bool> network-busy: false;
+    in-out property <string> network-label: "";
+    in-out property <string> network-progress: "";
+    // 最近一次远端失败（结论 + 建议，多行）。
+    in-out property <bool> network-error-visible: false;
+    in-out property <string> network-error: "";
+    // 当前仓库的远端名（工具栏显示与推送目标）。
+    in-out property <[string]> remote-names: [];
+    in-out property <string> remote-current: "";
+    // 更新策略：0 = 合并，1 = 变基，2 = 仅快进
+    in-out property <int> pull-strategy: 0;
+
+    // ---- 远端管理遮罩 ----
+    in-out property <bool> remotes-visible: false;
+    in-out property <[RemoteRow]> remote-rows: [];
+    in-out property <int> remote-selected: -1;
+    in-out property <string> remote-name-input: "";
+    in-out property <string> remote-url-input: "";
+    in-out property <string> remote-help: "";
+    in-out property <string> token-host: "";
+    in-out property <string> token-input: "";
+    in-out property <bool> keyring-available: true;
+
+    // ---- 推送预览遮罩（FR-RMT-03）----
+    in-out property <bool> push-visible: false;
+    in-out property <[PushRow]> push-rows: [];
+    in-out property <string> push-summary: "";
+    in-out property <string> push-hint: "";
+    in-out property <bool> push-force: false;
+    in-out property <bool> push-set-upstream: false;
+    in-out property <bool> push-creates-branch: false;
+    in-out property <bool> push-protected: false;
+
     // ---- 底部面板标签：0 = 本地更改，1 = Console ----
     in-out property <int> bottom-tab: 0;
 
@@ -622,6 +756,65 @@ export component MainWindow inherits Window {
     in-out property <string> set-merge-tool: "";
     in-out property <int> set-log-level: 2;
     in-out property <string> set-status: "";
+
+    // ---- M4：提交上下文菜单（FR-LOG-07/08）----
+    in-out property <bool> ctx-visible: false;
+    in-out property <length> ctx-x: 0px;
+    in-out property <length> ctx-y: 0px;
+    in-out property <string> ctx-subject: "";
+    in-out property <bool> ctx-is-head: false;
+
+    // ---- M4：通用操作对话框（合并/变基/重置/补丁/标签）----
+    // 用一个对话框承载五种"填一个参数再确认"的操作：它们的交互形态完全一致，
+    // 分成五个遮罩只会让 Slint 与接线各多五份一模一样的代码。
+    in-out property <bool> op-visible: false;
+    in-out property <int> op-kind: 0;
+    in-out property <string> op-title: "";
+    in-out property <string> op-hint: "";
+    in-out property <string> op-input: "";
+    in-out property <string> op-placeholder: "";
+    in-out property <string> op-input2: "";
+    in-out property <string> op-placeholder2: "";
+    in-out property <bool> op-show-input2: false;
+    in-out property <[string]> op-modes: [];
+    in-out property <int> op-mode: 0;
+    in-out property <bool> op-danger: false;
+
+    // ---- M4：交互式变基编辑器（FR-MRG-03）----
+    in-out property <bool> iplan-visible: false;
+    in-out property <[RebaseStepRow]> iplan-rows: [];
+    in-out property <string> iplan-title: "";
+    in-out property <string> iplan-summary: "";
+    in-out property <int> iplan-selected: -1;
+    in-out property <string> iplan-message: "";
+    in-out property <bool> iplan-message-visible: false;
+
+    // ---- M4：三路冲突编辑器（FR-CFL）----
+    in-out property <bool> cfl-visible: false;
+    in-out property <[ConflictFileRow]> cfl-files: [];
+    in-out property <[ConflictRow]> cfl-rows: [];
+    in-out property <string> cfl-title: "";
+    in-out property <string> cfl-summary: "";
+    in-out property <string> cfl-manual: "";
+    in-out property <bool> cfl-manual-visible: false;
+    in-out property <int> cfl-block: -1;
+
+    // ---- M4：贮藏面板（FR-STH）----
+    in-out property <[StashRow]> stash-rows: [];
+    in-out property <string> stash-message: "";
+    in-out property <bool> stash-untracked: false;
+    in-out property <string> stash-summary: "";
+
+    // ---- M4：比较 / 快照浏览（FR-LOG-08）----
+    in-out property <bool> compare-visible: false;
+    in-out property <[CompareRow]> compare-rows: [];
+    in-out property <string> compare-title: "";
+    in-out property <bool> compare-browse: false;
+
+    // ---- M4：忙碌与中断恢复 ----
+    in-out property <string> advanced-label: "";
+    in-out property <bool> resume-visible: false;
+    in-out property <bool> resume-can-skip: false;
 
     callback poll();
     callback refresh();
@@ -654,6 +847,7 @@ export component MainWindow inherits Window {
     callback branch-delete(bool);
     callback branch-upstream();
     callback checkout-selected-commit();
+    callback delete-tag();
 
     // 搜索与图选项
     callback set-search(string);
@@ -662,6 +856,30 @@ export component MainWindow inherits Window {
     callback clear-search();
     callback toggle-option(int);
 
+    // 远端（FR-RMT）
+    callback fetch-selected();
+    callback fetch-all();
+    callback update-project();
+    callback push-request();
+    callback push-confirm();
+    callback push-cancel();
+    callback toggle-push-force(bool);
+    callback toggle-push-upstream(bool);
+    callback set-pull-strategy(int);
+    callback select-remote(int);
+    callback cancel-network();
+    callback dismiss-network-error();
+    callback open-remotes();
+    callback close-remotes();
+    callback set-remote-name(string);
+    callback set-remote-url(string);
+    callback remote-add();
+    callback remote-remove();
+    callback remote-set-url();
+    callback set-token-input(string);
+    callback save-token();
+    callback forget-token();
+
     // 遮罩
     callback confirm-yes();
     callback confirm-no();
@@ -669,6 +887,56 @@ export component MainWindow inherits Window {
     callback close-settings();
     callback apply-settings();
     callback toggle-theme(bool);
+
+    // ---- M4：提交上下文菜单 ----
+    callback open-commit-menu(int, length, length);
+    callback close-commit-menu();
+    // 菜单项统一走一个回调：动作标识由 Rust 侧解释，避免十三个几乎相同的回调。
+    callback commit-action(string);
+
+    // ---- M4：通用操作对话框 ----
+    callback set-op-input(string);
+    callback set-op-input2(string);
+    callback set-op-mode(int);
+    callback op-confirm();
+    callback op-cancel();
+
+    // ---- M4：交互式变基 ----
+    callback iplan-select(int);
+    callback iplan-action(int, int);
+    callback iplan-set-message(string);
+    callback iplan-confirm();
+    callback iplan-cancel();
+
+    // ---- M4：三路冲突解决 ----
+    callback cfl-select(int);
+    callback cfl-pick-block(int);
+    callback cfl-take-side(int);
+    callback cfl-resolve(int, int);
+    callback cfl-resolve-all(int);
+    callback cfl-set-manual(string);
+    callback cfl-apply-manual();
+    callback cfl-mark-resolved();
+    callback cfl-close();
+
+    // ---- M4：贮藏 ----
+    callback request-stash-list();
+    callback set-stash-message(string);
+    callback toggle-stash-untracked(bool);
+    callback stash-create();
+    callback stash-apply(int);
+    callback stash-pop(int);
+    callback stash-drop(int);
+    callback stash-branch(int);
+
+    // ---- M4：比较 / 快照浏览 ----
+    callback compare-select(int);
+    callback compare-close();
+
+    // ---- M4：中断恢复（merge / rebase / cherry-pick / revert）----
+    callback resume-continue();
+    callback resume-skip();
+    callback resume-abort();
 
     title: repo-title + (read-only ? "（只读）" : "");
     width: 1280px;
@@ -734,6 +1002,46 @@ export component MainWindow inherits Window {
                     vertical-alignment: center;
                 }
 
+                // ---- 远端操作（FR-RMT-01/02/03）----
+                Text {
+                    text: root.remote-current;
+                    color: Palette.text-faint;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+
+                FlatButton {
+                    text: "Fetch";
+                    enabled: root.has-repo && !root.cli-missing && !root.network-busy;
+                    clicked => { root.fetch-selected(); }
+                }
+
+                FlatButton {
+                    text: "全部";
+                    enabled: root.has-repo && !root.cli-missing && !root.network-busy;
+                    clicked => { root.fetch-all(); }
+                }
+
+                FlatButton {
+                    text: "Update";
+                    enabled: root.has-repo && !root.cli-missing && !root.network-busy
+                        && !root.read-only;
+                    clicked => { root.update-project(); }
+                }
+
+                FlatButton {
+                    text: "Push";
+                    enabled: root.has-repo && !root.cli-missing && !root.network-busy
+                        && !root.read-only;
+                    clicked => { root.push-request(); }
+                }
+
+                FlatButton {
+                    text: "远端";
+                    enabled: root.has-repo && !root.cli-missing;
+                    clicked => { root.open-remotes(); }
+                }
+
                 FlatButton {
                     text: "设置";
                     clicked => { root.open-settings(); }
@@ -764,6 +1072,26 @@ export component MainWindow inherits Window {
                     font-size: 12px;
                     vertical-alignment: center;
                     overflow: elide;
+                }
+
+                FlatButton {
+                    text: "继续";
+                    visible: root.resume-visible;
+                    clicked => { root.resume-continue(); }
+                }
+
+                FlatButton {
+                    text: "跳过";
+                    visible: root.resume-visible && root.resume-can-skip;
+                    danger: true;
+                    clicked => { root.resume-skip(); }
+                }
+
+                FlatButton {
+                    text: "中止";
+                    visible: root.resume-visible;
+                    danger: true;
+                    clicked => { root.resume-abort(); }
                 }
 
                 FlatButton {
@@ -803,6 +1131,69 @@ export component MainWindow inherits Window {
                 font-size: 12px;
                 vertical-alignment: center;
                 wrap: word-wrap;
+            }
+        }
+
+        // ---------------------------------------------------- 网络操作进度（FR-RMT-05）
+        Rectangle {
+            height: root.network-busy ? 26px : 0px;
+            visible: root.network-busy;
+            background: Palette.panel;
+
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 10px;
+                spacing: 10px;
+
+                Text {
+                    text: root.network-label + "…";
+                    color: Palette.text;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.network-progress;
+                    color: Palette.text-faint;
+                    font-size: 11px;
+                    font-family: Palette.mono-font;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                FlatButton {
+                    text: "取消";
+                    danger: true;
+                    clicked => { root.cancel-network(); }
+                }
+            }
+        }
+
+        // ---------------------------------------------------- 远端失败提示（结论 + 建议）
+        Rectangle {
+            height: root.network-error-visible ? 62px : 0px;
+            visible: root.network-error-visible;
+            background: Palette.danger-bg;
+
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 10px;
+                spacing: 10px;
+
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.network-error;
+                    color: Palette.danger-text;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                    overflow: elide;
+                }
+
+                FlatButton {
+                    text: "关闭";
+                    clicked => { root.dismiss-network-error(); }
+                }
             }
         }
 
@@ -914,10 +1305,21 @@ export component MainWindow inherits Window {
                         }
                     }
 
-                    FlatButton {
-                        text: "检出所选提交（分离）";
-                        enabled: !root.read-only;
-                        clicked => { root.checkout-selected-commit(); }
+                    HorizontalLayout {
+                        spacing: 4px;
+
+                        FlatButton {
+                            text: "检出所选提交（分离）";
+                            enabled: !root.read-only;
+                            clicked => { root.checkout-selected-commit(); }
+                        }
+
+                        FlatButton {
+                            text: "删标签";
+                            danger: true;
+                            enabled: !root.read-only;
+                            clicked => { root.delete-tag(); }
+                        }
                     }
                 }
             }
@@ -1049,6 +1451,10 @@ export component MainWindow inherits Window {
                             is-mine: row.is-mine;
                             is-merge: row.is-merge;
                             clicked => { root.select-log(index); }
+                            context-clicked(x, y) => {
+                                root.select-log(index);
+                                root.open-commit-menu(index, x, y);
+                            }
                         }
                     }
                 }
@@ -1276,6 +1682,15 @@ export component MainWindow inherits Window {
                             clicked => { root.bottom-tab = 1; }
                         }
 
+                        TabButton {
+                            text: "Stash " + root.stash-summary;
+                            active: root.bottom-tab == 2;
+                            clicked => {
+                                root.bottom-tab = 2;
+                                root.request-stash-list();
+                            }
+                        }
+
                         Rectangle { horizontal-stretch: 1; }
 
                         FlatButton {
@@ -1442,6 +1857,110 @@ export component MainWindow inherits Window {
                         ok: row.ok;
                     }
                 }
+
+                // ---- 贮藏（FR-STH）
+                HorizontalLayout {
+                    vertical-stretch: 1;
+                    visible: root.bottom-tab == 2;
+                    spacing: 0px;
+
+                    VerticalLayout {
+                        width: 310px;
+                        padding: 8px;
+                        spacing: 6px;
+
+                        Text {
+                            text: "新建贮藏";
+                            color: Palette.text-dim;
+                            font-size: 11px;
+                        }
+
+                        Field {
+                            text <=> root.stash-message;
+                            placeholder: "消息（可留空）";
+                            edited(v) => { root.set-stash-message(v); }
+                        }
+
+                        CheckBox {
+                            text: "包含未跟踪文件（-u）";
+                            checked: root.stash-untracked;
+                            toggled => { root.toggle-stash-untracked(!root.stash-untracked); }
+                        }
+
+                        FlatButton {
+                            text: "创建贮藏";
+                            enabled: !root.read-only;
+                            clicked => { root.stash-create(); }
+                        }
+
+                        Text {
+                            text: "贮藏会清空工作区；应用后仍需自行提交。\n从贮藏创建分支可把改动固定到一个新分支上。";
+                            color: Palette.text-faint;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
+
+                        Rectangle { vertical-stretch: 1; }
+                    }
+
+                    Rectangle { width: 1px; background: Palette.line; }
+
+                    ListView {
+                        horizontal-stretch: 1;
+                        for row in root.stash-rows: Rectangle {
+                            height: 30px;
+                            background: transparent;
+
+                            Text {
+                                x: 8px;
+                                width: 86px;
+                                text: row.selector;
+                                color: Palette.text-faint;
+                                font-size: 11px;
+                                font-family: Palette.mono-font;
+                                vertical-alignment: center;
+                            }
+
+                            Text {
+                                x: 98px;
+                                width: parent.width - 380px;
+                                text: row.branch == "" ? row.summary : row.summary + "   ·   " + row.branch;
+                                color: Palette.text;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+
+                            HorizontalLayout {
+                                x: parent.width - 276px;
+                                width: 270px;
+                                spacing: 4px;
+
+                                FlatButton {
+                                    text: "应用";
+                                    enabled: !root.read-only;
+                                    clicked => { root.stash-apply(row.index); }
+                                }
+                                FlatButton {
+                                    text: "弹出";
+                                    enabled: !root.read-only;
+                                    clicked => { root.stash-pop(row.index); }
+                                }
+                                FlatButton {
+                                    text: "删除";
+                                    danger: true;
+                                    enabled: !root.read-only;
+                                    clicked => { root.stash-drop(row.index); }
+                                }
+                                FlatButton {
+                                    text: "建分支";
+                                    enabled: !root.read-only && root.branch-input != "";
+                                    clicked => { root.stash-branch(row.index); }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1479,6 +1998,13 @@ export component MainWindow inherits Window {
                 }
 
                 Rectangle { horizontal-stretch: 1; }
+
+                Text {
+                    text: root.advanced-label == "" ? "" : "⏳ " + root.advanced-label + " 进行中";
+                    color: Palette.amber;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
 
                 Text {
                     text: root.has-repo ? root.branch-text : "";
@@ -1631,6 +2157,11 @@ export component MainWindow inherits Window {
                         checked: root.set-update-strategy == 1;
                         toggled => { root.set-update-strategy = 1; }
                     }
+                    OptionToggle {
+                        text: "仅快进";
+                        checked: root.set-update-strategy == 2;
+                        toggled => { root.set-update-strategy = 2; }
+                    }
                 }
 
                 // 受保护分支 / 缓存
@@ -1726,4 +2257,1034 @@ export component MainWindow inherits Window {
             }
         }
     }
+
+    // ---------------------------------------------------- 推送预览遮罩（FR-RMT-03）
+    Rectangle {
+        visible: root.push-visible;
+        background: #00000099;
+
+        TouchArea {}
+
+        Rectangle {
+            width: min(parent.width - 80px, 720px);
+            height: min(parent.height - 60px, 520px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Palette.panel;
+            border-color: Palette.border;
+            border-width: 1px;
+            border-radius: 6px;
+
+            VerticalLayout {
+                padding: 18px;
+                spacing: 10px;
+
+                Text {
+                    text: "推送预览";
+                    color: Palette.text;
+                    font-size: 15px;
+                    font-weight: 600;
+                }
+
+                Text {
+                    text: root.push-summary;
+                    color: Palette.text-dim;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { height: 1px; background: Palette.line; }
+
+                ListView {
+                    vertical-stretch: 1;
+                    for row in root.push-rows: Rectangle {
+                        height: 22px;
+
+                        HorizontalLayout {
+                            padding-left: 4px;
+                            spacing: 8px;
+
+                            Text {
+                                width: 70px;
+                                text: row.short-id;
+                                color: Palette.text-faint;
+                                font-size: 11px;
+                                font-family: Palette.mono-font;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: row.subject;
+                                color: Palette.text;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                width: 90px;
+                                text: row.author;
+                                color: Palette.text-faint;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                width: 80px;
+                                text: row.when;
+                                color: Palette.text-faint;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                horizontal-alignment: right;
+                            }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 14px;
+
+                    CheckBox {
+                        text: "强制（force-with-lease）";
+                        checked: root.push-force;
+                        toggled => { root.toggle-push-force(!root.push-force); }
+                    }
+                    CheckBox {
+                        text: "设置上游（-u）";
+                        checked: root.push-set-upstream;
+                        toggled => { root.toggle-push-upstream(!root.push-set-upstream); }
+                    }
+                }
+
+                Text {
+                    text: root.push-hint;
+                    color: root.push-protected ? Palette.amber : Palette.text-faint;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+
+                    FlatButton {
+                        text: "取消";
+                        clicked => { root.push-cancel(); }
+                    }
+                    FlatButton {
+                        text: "推送";
+                        enabled: root.push-rows.length > 0 || root.push-creates-branch;
+                        clicked => { root.push-confirm(); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------- 远端管理遮罩（FR-RMT-01/04）
+    Rectangle {
+        visible: root.remotes-visible;
+        background: #00000099;
+
+        TouchArea {}
+
+        Rectangle {
+            width: min(parent.width - 80px, 700px);
+            height: min(parent.height - 60px, 540px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Palette.panel;
+            border-color: Palette.border;
+            border-width: 1px;
+            border-radius: 6px;
+
+            VerticalLayout {
+                padding: 18px;
+                spacing: 10px;
+
+                Text {
+                    text: "远端管理";
+                    color: Palette.text;
+                    font-size: 15px;
+                    font-weight: 600;
+                }
+
+                Rectangle { height: 1px; background: Palette.line; }
+
+                ListView {
+                    vertical-stretch: 1;
+                    for entry[index] in root.remote-rows: Rectangle {
+                        height: 26px;
+                        background: entry.selected ? Palette.hover : transparent;
+
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            spacing: 8px;
+
+                            Text {
+                                width: 110px;
+                                text: entry.name;
+                                color: Palette.text;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: entry.url;
+                                color: Palette.text-dim;
+                                font-size: 11px;
+                                font-family: Palette.mono-font;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                width: 150px;
+                                text: entry.detail;
+                                color: Palette.text-faint;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+
+                        TouchArea {
+                            clicked => { root.select-remote(index); }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 6px;
+
+                    Field {
+                        width: 140px;
+                        text <=> root.remote-name-input;
+                        placeholder: "名称（origin）";
+                        edited(v) => { root.set-remote-name(v); }
+                    }
+                    Field {
+                        horizontal-stretch: 1;
+                        text <=> root.remote-url-input;
+                        placeholder: "地址（https://… 或 git@host:owner/repo）";
+                        monospace: true;
+                        edited(v) => { root.set-remote-url(v); }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 6px;
+
+                    FlatButton {
+                        text: "添加";
+                        enabled: !root.read-only;
+                        clicked => { root.remote-add(); }
+                    }
+                    FlatButton {
+                        text: "改地址";
+                        enabled: !root.read-only && root.remote-selected >= 0;
+                        clicked => { root.remote-set-url(); }
+                    }
+                    FlatButton {
+                        text: "删除";
+                        danger: true;
+                        enabled: !root.read-only && root.remote-selected >= 0;
+                        clicked => { root.remote-remove(); }
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+
+                    FlatButton {
+                        text: "关闭";
+                        clicked => { root.close-remotes(); }
+                    }
+                }
+
+                Rectangle { height: 1px; background: Palette.line; }
+
+                Text {
+                    text: "更新策略（记忆用户选择，FR-RMT-02）";
+                    color: Palette.text-dim;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+
+                HorizontalLayout {
+                    spacing: 6px;
+
+                    OptionToggle {
+                        text: "合并";
+                        checked: root.pull-strategy == 0;
+                        toggled => { root.set-pull-strategy(0); }
+                    }
+                    OptionToggle {
+                        text: "变基";
+                        checked: root.pull-strategy == 1;
+                        toggled => { root.set-pull-strategy(1); }
+                    }
+                    OptionToggle {
+                        text: "仅快进";
+                        checked: root.pull-strategy == 2;
+                        toggled => { root.set-pull-strategy(2); }
+                    }
+                }
+
+                Text {
+                    text: root.remote-help;
+                    color: Palette.text-faint;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: "HTTPS token（存入系统密钥链；明文不落盘）· 目标主机："
+                        + (root.token-host == "" ? "（非 HTTPS 远端）" : root.token-host);
+                    color: Palette.text-dim;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: 6px;
+
+                    Field {
+                        horizontal-stretch: 1;
+                        text <=> root.token-input;
+                        placeholder: "访问 token";
+                        monospace: true;
+                        edited(v) => { root.set-token-input(v); }
+                    }
+                    FlatButton {
+                        text: "保存 token";
+                        enabled: root.keyring-available && root.token-host != ""
+                            && root.token-input != "";
+                        clicked => { root.save-token(); }
+                    }
+                    FlatButton {
+                        text: "删除 token";
+                        enabled: root.keyring-available && root.token-host != "";
+                        clicked => { root.forget-token(); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------ 提交上下文菜单（FR-LOG-07/08）
+    Rectangle {
+        visible: root.ctx-visible;
+        background: transparent;
+
+        // 点空白处关闭；这层必须在菜单面板**之前**声明，否则会盖住菜单。
+        TouchArea {
+            clicked => { root.close-commit-menu(); }
+        }
+
+        Rectangle {
+            width: 236px;
+            height: menu.preferred-height + 8px;
+            x: min(root.ctx-x, root.width - 248px);
+            y: min(root.ctx-y, root.height - self.height - 16px);
+            background: Palette.panel;
+            border-color: Palette.border;
+            border-width: 1px;
+            border-radius: 4px;
+
+            menu := VerticalLayout {
+                x: 4px;
+                y: 4px;
+                width: parent.width - 8px;
+                spacing: 1px;
+
+                CtxMenuItem {
+                    text: "合并到当前分支…";
+                    enabled: !root.read-only;
+                    clicked => { root.commit-action("merge"); }
+                }
+                CtxMenuItem {
+                    text: "变基到此处";
+                    enabled: !root.read-only;
+                    clicked => { root.commit-action("rebase"); }
+                }
+                CtxMenuItem {
+                    text: "从此处交互式变基…";
+                    enabled: !root.read-only;
+                    clicked => { root.commit-action("iplan"); }
+                }
+                CtxMenuItem {
+                    text: "拣选此提交";
+                    enabled: !root.read-only;
+                    clicked => { root.commit-action("cherry-pick"); }
+                }
+                CtxMenuItem {
+                    text: "回滚此提交";
+                    enabled: !root.read-only;
+                    clicked => { root.commit-action("revert"); }
+                }
+                CtxMenuItem {
+                    text: "重置当前分支到此…";
+                    enabled: !root.read-only;
+                    clicked => { root.commit-action("reset"); }
+                }
+                CtxMenuItem {
+                    text: "撤销此提交（软重置）";
+                    enabled: !root.read-only && root.ctx-is-head;
+                    clicked => { root.commit-action("undo"); }
+                }
+
+                Rectangle { height: 1px; background: Palette.line; }
+
+                CtxMenuItem {
+                    text: "生成补丁…";
+                    clicked => { root.commit-action("patch"); }
+                }
+                CtxMenuItem {
+                    text: "新建标签…";
+                    enabled: !root.read-only;
+                    clicked => { root.commit-action("tag"); }
+                }
+                CtxMenuItem {
+                    text: "应用补丁…";
+                    enabled: !root.read-only;
+                    clicked => { root.commit-action("apply-patch"); }
+                }
+                CtxMenuItem {
+                    text: "与当前工作区比较";
+                    clicked => { root.commit-action("compare"); }
+                }
+                CtxMenuItem {
+                    text: "浏览此版本（只读）";
+                    clicked => { root.commit-action("browse"); }
+                }
+
+                Rectangle { height: 1px; background: Palette.line; }
+
+                CtxMenuItem {
+                    text: "复制哈希";
+                    clicked => { root.commit-action("copy"); }
+                }
+                CtxMenuItem {
+                    text: "检出（分离头指针）";
+                    enabled: !root.read-only;
+                    clicked => { root.commit-action("checkout"); }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------ 通用操作对话框
+    Rectangle {
+        visible: root.op-visible;
+        background: #00000099;
+
+        TouchArea {}
+
+        Rectangle {
+            width: min(parent.width - 80px, 520px);
+            height: min(parent.height - 80px, 320px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Palette.panel;
+            border-color: root.op-danger ? Palette.red : Palette.border;
+            border-width: 1px;
+            border-radius: 6px;
+
+            VerticalLayout {
+                padding: 18px;
+                spacing: 10px;
+
+                Text {
+                    text: root.op-title;
+                    color: Palette.text;
+                    font-size: 15px;
+                    font-weight: 600;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: root.op-hint;
+                    color: Palette.text-faint;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { height: 1px; background: Palette.line; }
+
+                HorizontalLayout {
+                    spacing: 6px;
+                    visible: root.op-modes.length > 0;
+
+                    for mode-label[index] in root.op-modes: TabButton {
+                        // 显式给宽：TabButton 默认最小 120px，四个模式会撑破对话框。
+                        width: 108px;
+                        text: mode-label;
+                        active: root.op-mode == index;
+                        clicked => { root.set-op-mode(index); }
+                    }
+                }
+
+                Field {
+                    text <=> root.op-input;
+                    placeholder: root.op-placeholder;
+                    monospace: true;
+                    edited(v) => { root.set-op-input(v); }
+                }
+
+                Field {
+                    visible: root.op-show-input2;
+                    text <=> root.op-input2;
+                    placeholder: root.op-placeholder2;
+                    edited(v) => { root.set-op-input2(v); }
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+
+                    FlatButton {
+                        text: "取消";
+                        clicked => { root.op-cancel(); }
+                    }
+                    FlatButton {
+                        text: "执行";
+                        danger: root.op-danger;
+                        clicked => { root.op-confirm(); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------ 交互式变基编辑器（FR-MRG-03）
+    Rectangle {
+        visible: root.iplan-visible;
+        background: #00000099;
+
+        TouchArea {}
+
+        Rectangle {
+            width: min(parent.width - 60px, 980px);
+            height: min(parent.height - 60px, 620px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Palette.panel;
+            border-color: Palette.border;
+            border-width: 1px;
+            border-radius: 6px;
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 8px;
+
+                Text {
+                    text: root.iplan-title;
+                    color: Palette.text;
+                    font-size: 15px;
+                    font-weight: 600;
+                }
+
+                Text {
+                    text: root.iplan-summary;
+                    color: Palette.text-faint;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { height: 1px; background: Palette.line; }
+
+                ListView {
+                    vertical-stretch: 1;
+                    for row in root.iplan-rows: Rectangle {
+                        height: 30px;
+                        background: row.selected ? Palette.hover : transparent;
+
+                        TouchArea {
+                            clicked => { root.iplan-select(row.row-index); }
+                        }
+
+                        Text {
+                            x: 6px;
+                            width: 64px;
+                            text: row.short-id;
+                            color: Palette.text-faint;
+                            font-size: 11px;
+                            font-family: Palette.mono-font;
+                            vertical-alignment: center;
+                        }
+
+                        Text {
+                            x: 74px;
+                            width: parent.width - 420px;
+                            text: row.subject + (row.action == 1 && !row.has-message ? "   （需填写新消息）" : "");
+                            color: Palette.text;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+
+                        HorizontalLayout {
+                            x: parent.width - 340px;
+                            width: 336px;
+                            spacing: 3px;
+
+                            for action-label[action-index] in ["保留", "改写", "压缩", "吞并", "丢弃"]: TabButton {
+                                width: 62px;
+                                text: action-label;
+                                active: row.action == action-index;
+                                clicked => { root.iplan-action(row.row-index, action-index); }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle { height: 1px; background: Palette.line; }
+
+                Text {
+                    text: root.iplan-message-visible
+                        ? "所选提交的新消息（「改写」需要填写）"
+                        : "选中一行后可「改写」其消息；「压缩/吞并」会并入上一行提交";
+                    color: Palette.text-dim;
+                    font-size: 11px;
+                }
+
+                Rectangle {
+                    height: root.iplan-message-visible ? 54px : 0px;
+                    visible: root.iplan-message-visible;
+                    background: Palette.bg;
+                    border-color: Palette.border;
+                    border-width: 1px;
+                    border-radius: 3px;
+
+                    TextInput {
+                        x: 6px;
+                        y: 4px;
+                        width: parent.width - 12px;
+                        height: parent.height - 8px;
+                        text <=> root.iplan-message;
+                        single-line: false;
+                        wrap: word-wrap;
+                        color: Palette.text;
+                        font-size: 12px;
+                        font-family: Palette.mono-font;
+                        edited => { root.iplan-set-message(root.iplan-message); }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+
+                    FlatButton {
+                        text: "取消";
+                        clicked => { root.iplan-cancel(); }
+                    }
+                    FlatButton {
+                        text: "开始变基";
+                        danger: true;
+                        clicked => { root.iplan-confirm(); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------ 三路冲突编辑器（FR-CFL）
+    Rectangle {
+        visible: root.cfl-visible;
+        background: #00000099;
+
+        TouchArea {}
+
+        Rectangle {
+            width: min(parent.width - 40px, 1180px);
+            height: min(parent.height - 40px, 720px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Palette.panel;
+            border-color: Palette.border;
+            border-width: 1px;
+            border-radius: 6px;
+
+            VerticalLayout {
+                padding: 14px;
+                spacing: 8px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.cfl-title;
+                        color: Palette.text;
+                        font-size: 14px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        text: root.cfl-summary;
+                        color: Palette.text-faint;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 6px;
+
+                    FlatButton {
+                        text: "全部取当前分支";
+                        enabled: !root.read-only;
+                        clicked => { root.cfl-resolve-all(0); }
+                    }
+                    FlatButton {
+                        text: "全部取合入分支";
+                        enabled: !root.read-only;
+                        clicked => { root.cfl-resolve-all(1); }
+                    }
+                    FlatButton {
+                        text: "全部取双方";
+                        enabled: !root.read-only;
+                        clicked => { root.cfl-resolve-all(2); }
+                    }
+                    FlatButton {
+                        text: "整文件取当前分支";
+                        enabled: !root.read-only;
+                        clicked => { root.cfl-take-side(2); }
+                    }
+                    FlatButton {
+                        text: "整文件取合入分支";
+                        enabled: !root.read-only;
+                        clicked => { root.cfl-take-side(3); }
+                    }
+                    FlatButton {
+                        text: "标记为已解决";
+                        enabled: !root.read-only;
+                        clicked => { root.cfl-mark-resolved(); }
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+
+                    FlatButton {
+                        text: "关闭";
+                        clicked => { root.cfl-close(); }
+                    }
+                }
+
+                Rectangle { height: 1px; background: Palette.line; }
+
+                HorizontalLayout {
+                    vertical-stretch: 1;
+                    spacing: 0px;
+
+                    ListView {
+                        width: 250px;
+                        for file-row in root.cfl-files: Rectangle {
+                            height: 26px;
+                            background: file-row.selected ? Palette.hover : transparent;
+
+                            TouchArea {
+                                clicked => { root.cfl-select(file-row.row-index); }
+                            }
+
+                            Text {
+                                x: 6px;
+                                width: 26px;
+                                text: file-row.code;
+                                color: Palette.amber;
+                                font-size: 11px;
+                                font-family: Palette.mono-font;
+                                vertical-alignment: center;
+                            }
+
+                            Text {
+                                x: 34px;
+                                width: parent.width - 74px;
+                                text: file-row.path;
+                                color: Palette.text;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                x: parent.width - 38px;
+                                width: 32px;
+                                text: file-row.hunks > 0 ? "×" + file-row.hunks : "✓";
+                                color: file-row.hunks > 0 ? Palette.amber : Palette.green;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                horizontal-alignment: right;
+                            }
+                        }
+                    }
+
+                    Rectangle { width: 1px; background: Palette.line; }
+
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 0px;
+
+                        Flickable {
+                            vertical-stretch: 1;
+                            content-height: conflict-content.preferred-height;
+                            content-width: self.width;
+
+                            conflict-content := VerticalLayout {
+                                width: parent.width;
+                                spacing: 2px;
+
+                                for row in root.cfl-rows: Rectangle {
+                                    // 上下文行紧凑，冲突卡片按内容撑开。
+                                    height: row.kind == 0
+                                        ? max(18px, context-text.preferred-height)
+                                        : card.preferred-height + 8px;
+                                    background: row.kind == 0 ? transparent : Palette.bg;
+                                    border-color: row.kind == 0 ? transparent : (row.decided ? Palette.line : Palette.amber);
+                                    border-width: 1px;
+                                    border-radius: 4px;
+
+                                    context-text := Text {
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        visible: row.kind == 0;
+                                        text: row.result;
+                                        color: Palette.text-dim;
+                                        font-size: 11px;
+                                        font-family: Palette.mono-font;
+                                        wrap: word-wrap;
+                                    }
+
+                                    card := VerticalLayout {
+                                        x: 6px;
+                                        y: 4px;
+                                        width: parent.width - 12px;
+                                        visible: row.kind == 1;
+                                        spacing: 4px;
+
+                                        HorizontalLayout {
+                                            spacing: 6px;
+
+                                            Text {
+                                                horizontal-stretch: 1;
+                                                text: row.label;
+                                                color: row.decided ? Palette.green : Palette.amber;
+                                                font-size: 11px;
+                                                vertical-alignment: center;
+                                            }
+
+                                            FlatButton {
+                                                text: "取当前分支";
+                                                enabled: !root.read-only;
+                                                clicked => { root.cfl-resolve(row.block, 0); }
+                                            }
+                                            FlatButton {
+                                                text: "取合入分支";
+                                                enabled: !root.read-only;
+                                                clicked => { root.cfl-resolve(row.block, 1); }
+                                            }
+                                            FlatButton {
+                                                text: "取双方";
+                                                enabled: !root.read-only;
+                                                clicked => { root.cfl-resolve(row.block, 2); }
+                                            }
+                                            FlatButton {
+                                                text: "取共同祖先";
+                                                enabled: !root.read-only;
+                                                clicked => { root.cfl-resolve(row.block, 3); }
+                                            }
+                                            FlatButton {
+                                                text: "手动编辑";
+                                                enabled: !root.read-only;
+                                                clicked => { root.cfl-pick-block(row.block); }
+                                            }
+                                        }
+
+                                        HorizontalLayout {
+                                            spacing: 6px;
+
+                                            VerticalLayout {
+                                                horizontal-stretch: 1;
+                                                spacing: 1px;
+                                                Text {
+                                                    text: "当前分支";
+                                                    color: Palette.text-faint;
+                                                    font-size: 10px;
+                                                }
+                                                Text {
+                                                    text: row.ours == "" ? "（空）" : row.ours;
+                                                    color: Palette.text;
+                                                    font-size: 11px;
+                                                    font-family: Palette.mono-font;
+                                                    wrap: word-wrap;
+                                                }
+                                            }
+
+                                            VerticalLayout {
+                                                horizontal-stretch: 1;
+                                                spacing: 1px;
+                                                Text {
+                                                    text: "结果";
+                                                    color: Palette.green;
+                                                    font-size: 10px;
+                                                }
+                                                Text {
+                                                    text: row.result;
+                                                    color: Palette.text;
+                                                    font-size: 11px;
+                                                    font-family: Palette.mono-font;
+                                                    wrap: word-wrap;
+                                                }
+                                            }
+
+                                            VerticalLayout {
+                                                horizontal-stretch: 1;
+                                                spacing: 1px;
+                                                Text {
+                                                    text: "合入分支";
+                                                    color: Palette.text-faint;
+                                                    font-size: 10px;
+                                                }
+                                                Text {
+                                                    text: row.theirs == "" ? "（空）" : row.theirs;
+                                                    color: Palette.text;
+                                                    font-size: 11px;
+                                                    font-family: Palette.mono-font;
+                                                    wrap: word-wrap;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            height: root.cfl-manual-visible ? 96px : 0px;
+                            visible: root.cfl-manual-visible;
+                            background: Palette.bg;
+                            border-color: Palette.border;
+                            border-width: 1px;
+
+                            TextInput {
+                                x: 6px;
+                                y: 4px;
+                                width: parent.width - 120px;
+                                height: parent.height - 8px;
+                                text <=> root.cfl-manual;
+                                single-line: false;
+                                wrap: word-wrap;
+                                color: Palette.text;
+                                font-size: 11px;
+                                font-family: Palette.mono-font;
+                                edited => { root.cfl-set-manual(root.cfl-manual); }
+                            }
+
+                            FlatButton {
+                                x: parent.width - 106px;
+                                y: 6px;
+                                text: "应用到该块";
+                                enabled: !root.read-only && root.cfl-block >= 0;
+                                clicked => { root.cfl-apply-manual(); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------ 比较 / 快照浏览（FR-LOG-08）
+    Rectangle {
+        visible: root.compare-visible;
+        background: #00000099;
+
+        TouchArea {}
+
+        Rectangle {
+            width: min(parent.width - 120px, 760px);
+            height: min(parent.height - 120px, 520px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Palette.panel;
+            border-color: Palette.border;
+            border-width: 1px;
+            border-radius: 6px;
+
+            VerticalLayout {
+                padding: 14px;
+                spacing: 8px;
+
+                Text {
+                    text: root.compare-title;
+                    color: Palette.text;
+                    font-size: 14px;
+                    font-weight: 600;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: root.compare-browse
+                        ? "只读浏览：此视图不修改工作区，双击文件可在下方查看差异"
+                        : "两提交比较：双击文件可在下方查看差异";
+                    color: root.compare-browse ? Palette.amber : Palette.text-faint;
+                    font-size: 11px;
+                }
+
+                Rectangle { height: 1px; background: Palette.line; }
+
+                ListView {
+                    vertical-stretch: 1;
+                    for row[index] in root.compare-rows: Rectangle {
+                        height: 24px;
+                        background: row.selected ? Palette.hover : transparent;
+
+                        TouchArea {
+                            clicked => { root.compare-select(index); }
+                        }
+
+                        Text {
+                            x: 6px;
+                            width: 24px;
+                            text: row.code;
+                            color: Palette.amber;
+                            font-size: 11px;
+                            font-family: Palette.mono-font;
+                            vertical-alignment: center;
+                        }
+
+                        Text {
+                            x: 34px;
+                            width: parent.width - 120px;
+                            text: row.path;
+                            color: Palette.text;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            x: parent.width - 80px;
+                            width: 74px;
+                            text: row.status;
+                            color: Palette.text-faint;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                            horizontal-alignment: right;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    FlatButton {
+                        text: "关闭";
+                        clicked => { root.compare-close(); }
+                    }
+                }
+            }
+        }
+    }
+
 }

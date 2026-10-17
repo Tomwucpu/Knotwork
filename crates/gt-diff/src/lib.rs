@@ -21,10 +21,15 @@
 //! 情形的起始行号处理以本模块文档所述规则为准（一致性测试断言 numstat 与
 //! 增删行集合，不断言 hunk 头文本）。
 
+pub mod conflict;
 mod engine;
 mod model;
 mod patch;
 
+pub use conflict::{
+    count_conflict_markers, ConflictFile, ConflictHunk, ConflictPeer, ConflictSide, Resolution,
+    SolveError,
+};
 pub use engine::{diff_bytes, diff_lines, diff_text, is_binary, word_spans};
 pub use model::{
     DiffHunk, DiffLine, DiffOptions, DiffPayload, DiffStats, FileDiff, LineKind, LineSpan,

@@ -16,13 +16,17 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use gt_backend::CommandRecord;
+use gt_backend::{CommandRecord, PushPreview, RemoteInfo, RemoteListing};
 use gt_core::{ChangeSet, CommitMeta, HeadKind, RefInfo, RefKind, RepoState};
 use gt_diff::{DiffLine, DiffPayload, FileDiff, LineKind};
 use gt_graph::RowLayout;
+use gt_service::NetworkFailure;
 use slint::{Color, ModelRc, SharedString, VecModel};
 
-use crate::generated::{ChangeRow, ConsoleRow, DiffRow, GraphCell, LogRow, RecentRow, RefEntry};
+use crate::generated::{
+    ChangeRow, CompareRow, ConflictFileRow, ConflictRow, ConsoleRow, DiffRow, GraphCell, LogRow,
+    PushRow, RebaseStepRow, RecentRow, RefEntry, RemoteRow, StashRow,
+};
 
 /// 泳道配色（8 色循环）。取自可访问性对比度足够的暗色系。
 const LANE_PALETTE: [u32; 8] = [
@@ -369,7 +373,9 @@ pub fn build_console_rows(records: &[CommandRecord]) -> Vec<ConsoleRow> {
     records
         .iter()
         .map(|record| ConsoleRow {
-            route: SharedString::from(record.route.label()),
+            // 用 `route_label()` 而不是 `route.label()`：网络操作要带上"网络"
+            // 后缀，否则 Console 里一次 fetch 与一次本地命令看起来毫无区别。
+            route: SharedString::from(record.route_label()),
             summary: SharedString::from(record.summary_line()),
             detail: SharedString::from(
                 record
@@ -503,12 +509,125 @@ pub fn discard_selection_confirmation(path: &str, lines: usize) -> (String, Stri
     )
 }
 
+// ---------------------------------------------------------------- 远端视图模型
+
+/// 构造推送预览的行模型。
+///
+/// 时间用相对口径（"3 分钟前"）：推送前的复核关心"这是刚提交的还是上周的"。
+#[must_use]
+pub fn build_push_rows(preview: &PushPreview, now: i64) -> Vec<PushRow> {
+    preview
+        .commits
+        .iter()
+        .map(|commit| PushRow {
+            short_id: SharedString::from(commit.short_id.as_str()),
+            subject: SharedString::from(commit.subject.as_str()),
+            author: SharedString::from(commit.author.as_str()),
+            when: SharedString::from(relative_time(commit.timestamp, now)),
+        })
+        .collect()
+}
+
+/// 构造远端列表的行模型。
+#[must_use]
+pub fn build_remote_rows(remotes: &[RemoteInfo], selected: Option<usize>) -> Vec<RemoteRow> {
+    remotes
+        .iter()
+        .enumerate()
+        .map(|(index, remote)| RemoteRow {
+            name: SharedString::from(remote.name.as_str()),
+            url: SharedString::from(remote.display_url()),
+            detail: SharedString::from(if remote.has_embedded_credentials {
+                "URL 内嵌凭据（建议改用 helper）"
+            } else if remote.push_url.is_some() {
+                "push URL 与 fetch 不同"
+            } else {
+                ""
+            }),
+            selected: selected == Some(index),
+        })
+        .collect()
+}
+
+/// 推送预览的摘要文案（标题下方那行）。
+#[must_use]
+pub fn push_preview_text(preview: &PushPreview) -> String {
+    let mut text = preview.summary();
+    if preview.truncated {
+        let _ = write!(text, "（仅列出前 {} 条）", preview.commits.len());
+    }
+    text
+}
+
+/// 推送遮罩里的提示行：把"会发生什么 / 风险 / 替代做法"写在同一处。
+#[must_use]
+pub fn push_hints(preview: &PushPreview, force: bool) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(pattern) = preview.protection.as_deref() {
+        lines.push(format!(
+            "该分支命中受保护规则「{pattern}」：禁止强制推送（普通推送不受影响）。"
+        ));
+    }
+    if preview.needs_update_first() {
+        lines.push(format!(
+            "远端另有 {} 个提交：普通推送会被拒绝，请先 Update。",
+            preview.behind
+        ));
+    }
+    if force {
+        lines.push(
+            "已勾选强制推送（force-with-lease）：远端若在你上次 fetch 之后被他人推进，\
+             本次推送会失败而不是覆盖。"
+                .to_owned(),
+        );
+    }
+    if preview.creates_branch {
+        lines.push("远端尚无该分支，推送会在远端新建它。".to_owned());
+    }
+    lines.join(" ")
+}
+
+/// 网络失败的展示文本（结论 + 建议）。
+#[must_use]
+pub fn network_error_text(failure: &NetworkFailure) -> String {
+    failure.message()
+}
+
+/// 远端管理遮罩里的凭据说明。
+///
+/// 说清"凭据是从哪来的"，用户才知道失败时该改哪一处：
+/// 有 credential helper 就走 helper，没有才需要在本工具里存 token。
+#[must_use]
+pub fn credential_help(listing: &RemoteListing, stored_hosts: &[String]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if listing.helpers.is_empty() {
+        parts.push("未检测到 credential helper".to_owned());
+    } else {
+        parts.push(format!("credential helper：{}", listing.helpers.join("、")));
+    }
+    parts.push(if listing.ssh_agent {
+        "SSH agent 可用".to_owned()
+    } else {
+        "SSH agent 未运行（SSH 远端可能需要 ssh-add）".to_owned()
+    });
+    if !listing.keyring_available {
+        parts.push("系统密钥链不可用，无法在本工具内保存 token".to_owned());
+    } else if stored_hosts.is_empty() {
+        parts.push("尚未保存任何 token".to_owned());
+    } else {
+        parts.push(format!("已保存 token 的主机：{}", stored_hosts.join("、")));
+    }
+    parts.join(" · ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         branch_text, build_change_rows, build_console_rows, build_diff_rows, build_graph_cells,
-        build_log_rows, build_ref_rows, diff_selection_hint, discard_confirmation,
-        discard_selection_confirmation, ordered_refs, relative_time, state_banner,
+        build_log_rows, build_push_rows, build_ref_rows, build_remote_rows, credential_help,
+        diff_selection_hint, discard_confirmation, discard_selection_confirmation,
+        network_error_text, ordered_refs, push_hints, push_preview_text, relative_time,
+        state_banner,
     };
     use std::collections::BTreeSet;
 
@@ -813,6 +932,23 @@ mod tests {
     }
 
     #[test]
+    fn console_rows_tag_network_operations() {
+        let mut record = gt_backend::CommandRecord::internal(
+            gt_backend::CommandRoute::Cli,
+            None,
+            "git fetch origin",
+            std::time::Duration::from_millis(5),
+        );
+        record.network = true;
+        let rows = build_console_rows(&[record]);
+        assert!(
+            rows[0].route.contains("网络"),
+            "网络操作必须在 Console 里可区分：{}",
+            rows[0].route
+        );
+    }
+
+    #[test]
     fn console_rows_mark_failures() {
         use gt_backend::{CommandRecord, CommandRoute};
         use std::time::Duration;
@@ -906,5 +1042,515 @@ mod tests {
         let (title, detail) = discard_selection_confirmation("a.txt", 4);
         assert!(title.contains("丢弃"));
         assert!(detail.contains("4 行"));
+    }
+
+    fn preview_with(
+        commits: usize,
+        behind: usize,
+        protected: Option<&str>,
+    ) -> gt_backend::PushPreview {
+        gt_backend::PushPreview {
+            remote: "origin".to_owned(),
+            local_branch: "main".to_owned(),
+            remote_branch: "main".to_owned(),
+            upstream: Some("origin/main".to_owned()),
+            ahead: commits,
+            behind,
+            commits: (0..commits)
+                .map(|index| gt_backend::PushCommit {
+                    id: format!("{index:040}"),
+                    short_id: format!("c{index}"),
+                    author: "张三".to_owned(),
+                    timestamp: 1_700_000_000 - i64::try_from(index).unwrap_or(0) * 60,
+                    subject: format!("提交 {index}"),
+                })
+                .collect(),
+            truncated: false,
+            creates_branch: false,
+            protection: protected.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn push_rows_keep_the_preview_order_and_relative_time() {
+        let preview = preview_with(3, 0, None);
+        let rows = build_push_rows(&preview, 1_700_000_000);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].short_id.as_str(), "c0");
+        assert_eq!(rows[0].when.as_str(), "刚刚");
+        assert_eq!(rows[2].when.as_str(), "2 分钟前");
+    }
+
+    #[test]
+    fn push_hints_explain_protection_and_divergence() {
+        let protected = preview_with(2, 1, Some("^main$"));
+        let hints = push_hints(&protected, true);
+        assert!(hints.contains("受保护"), "{hints}");
+        assert!(
+            hints.contains("先 Update"),
+            "落后远端时必须提示先更新：{hints}"
+        );
+        assert!(hints.contains("force-with-lease"), "{hints}");
+
+        let summary = push_preview_text(&protected);
+        assert!(summary.contains('2'), "{summary}");
+    }
+
+    #[test]
+    fn remote_rows_surface_credential_leaks() {
+        let remotes = vec![
+            gt_backend::RemoteInfo {
+                name: "origin".to_owned(),
+                fetch_url: Some("https://github.com/o/r.git".to_owned()),
+                push_url: None,
+                has_embedded_credentials: false,
+            },
+            gt_backend::RemoteInfo {
+                name: "legacy".to_owned(),
+                fetch_url: Some("https://bob:***@git.example.com/r.git".to_owned()),
+                push_url: Some("ssh://git@git.example.com/r.git".to_owned()),
+                has_embedded_credentials: true,
+            },
+        ];
+        let rows = build_remote_rows(&remotes, Some(1));
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].selected);
+        assert!(rows[1].selected);
+        assert!(rows[1].detail.contains("内嵌凭据"), "必须提示改掉内嵌凭据");
+    }
+
+    #[test]
+    fn credential_help_names_the_actual_mechanism() {
+        let listing = gt_backend::RemoteListing {
+            remotes: Vec::new(),
+            helpers: vec!["manager".to_owned()],
+            ssh_agent: true,
+            keyring_available: true,
+        };
+        let text = credential_help(&listing, &["github.com".to_owned()]);
+        assert!(text.contains("manager"), "{text}");
+        assert!(text.contains("SSH agent 可用"), "{text}");
+        assert!(text.contains("github.com"), "{text}");
+
+        let bare = gt_backend::RemoteListing::default();
+        let text = credential_help(&bare, &[]);
+        assert!(text.contains("未检测到 credential helper"), "{text}");
+        assert!(text.contains("未运行"), "{text}");
+    }
+
+    #[test]
+    fn network_failure_text_is_actionable() {
+        let failure = gt_service::NetworkFailure {
+            summary: "origin：远端拒绝了本次认证".to_owned(),
+            kind: gt_backend::CredentialKind::AuthRejected,
+            hints: vec!["更新本机保存的凭据".to_owned(), "使用访问 token".to_owned()],
+            detail: String::new(),
+        };
+        let text = network_error_text(&failure);
+        assert!(text.contains("认证"), "{text}");
+        assert!(text.contains("1. 更新本机保存的凭据"), "{text}");
+        assert!(failure.suggests_token(), "401/403 应引导去存 token");
+    }
+}
+
+// ------------------------------------------------------------ 高级操作视图模型
+
+/// 冲突块在界面上的解法编码（与 Slint 回调参数一一对应）。
+///
+/// 用整数而不是字符串：Slint 侧的按钮组按下标取值，整数映射不需要解析，
+/// 也不会因为文案改动（本地化）而失效。
+pub mod resolve_code {
+    /// 取当前分支（ours）。
+    pub const OURS: i32 = 0;
+    /// 取合入分支（theirs）。
+    pub const THEIRS: i32 = 1;
+    /// 两边都保留。
+    pub const BOTH: i32 = 2;
+    /// 取共同祖先（diff3 风格才有内容）。
+    pub const BASE: i32 = 3;
+}
+
+/// 把"界面解法编号"翻译成领域解法。
+#[must_use]
+pub fn resolution_from_code(code: i32) -> Option<gt_diff::Resolution> {
+    match code {
+        resolve_code::OURS => Some(gt_diff::Resolution::Ours),
+        resolve_code::THEIRS => Some(gt_diff::Resolution::Theirs),
+        resolve_code::BOTH => Some(gt_diff::Resolution::Both),
+        resolve_code::BASE => Some(gt_diff::Resolution::Base),
+        _ => None,
+    }
+}
+
+/// 构造贮藏列表行。
+#[must_use]
+pub fn build_stash_rows(entries: &[gt_backend::StashEntry]) -> Vec<StashRow> {
+    entries
+        .iter()
+        .map(|entry| StashRow {
+            index: i32::try_from(entry.index).unwrap_or(i32::MAX),
+            selector: SharedString::from(entry.selector.as_str()),
+            summary: SharedString::from(entry.summary()),
+            branch: SharedString::from(entry.branch().unwrap_or_default()),
+        })
+        .collect()
+}
+
+/// 构造冲突文件行（三路编辑器的左侧列表）。
+#[must_use]
+pub fn build_conflict_file_rows(
+    entries: &[gt_service::ConflictedEntry],
+    selected: Option<usize>,
+) -> Vec<ConflictFileRow> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| ConflictFileRow {
+            row_index: i32::try_from(index).unwrap_or(i32::MAX),
+            path: SharedString::from(entry.path.as_str()),
+            code: SharedString::from(entry.code.as_str()),
+            hunks: i32::try_from(entry.hunks).unwrap_or(i32::MAX),
+            selected: selected == Some(index),
+        })
+        .collect()
+}
+
+/// 构造三路编辑器的内容行。
+///
+/// 上下文行与冲突块共用一种行结构：`kind == 0` 时三列都为空、只有 `result`
+/// 有内容（渲染成一行灰字）；`kind == 1` 时渲染成三栏卡片。
+/// 用一种结构而不是两种，是因为 Slint 的 `ListView` 同一次只能迭代一种模型。
+#[must_use]
+pub fn build_conflict_rows(
+    file: &gt_diff::ConflictFile,
+    resolutions: &[Option<gt_diff::Resolution>],
+) -> Vec<ConflictRow> {
+    let mut rows = Vec::new();
+    let mut block = 0_usize;
+    for peer in &file.peers {
+        match peer {
+            gt_diff::ConflictPeer::Context(lines) => {
+                if lines.is_empty() {
+                    continue;
+                }
+                rows.push(ConflictRow {
+                    kind: 0,
+                    block: -1,
+                    label: SharedString::new(),
+                    ours: SharedString::new(),
+                    theirs: SharedString::new(),
+                    result: SharedString::from(lines.join("\n")),
+                    decided: true,
+                });
+            }
+            gt_diff::ConflictPeer::Hunk(hunk) => {
+                let resolution = resolutions.get(block).and_then(Option::as_ref);
+                let result = match resolution {
+                    Some(gt_diff::Resolution::Ours) => hunk.ours.join("\n"),
+                    Some(gt_diff::Resolution::Theirs) => hunk.theirs.join("\n"),
+                    Some(gt_diff::Resolution::Both) => {
+                        format!("{}\n{}", hunk.ours.join("\n"), hunk.theirs.join("\n"))
+                    }
+                    Some(gt_diff::Resolution::Base) => {
+                        hunk.base.as_deref().unwrap_or(&[]).join("\n")
+                    }
+                    Some(gt_diff::Resolution::Manual(lines)) => lines.join("\n"),
+                    None => "（未解决）".to_owned(),
+                };
+                rows.push(ConflictRow {
+                    kind: 1,
+                    block: i32::try_from(block).unwrap_or(i32::MAX),
+                    label: SharedString::from(format!(
+                        "第 {} 处冲突 · 起始第 {} 行 · {} 行 / {} 行",
+                        block + 1,
+                        hunk.start_line,
+                        hunk.ours.len(),
+                        hunk.theirs.len()
+                    )),
+                    ours: SharedString::from(hunk.ours.join("\n")),
+                    theirs: SharedString::from(hunk.theirs.join("\n")),
+                    result: SharedString::from(result),
+                    decided: resolution.is_some(),
+                });
+                block += 1;
+            }
+        }
+    }
+    rows
+}
+
+/// 冲突遮罩的摘要：还剩多少处未决定。
+#[must_use]
+pub fn conflict_summary(
+    file: &gt_diff::ConflictFile,
+    resolutions: &[Option<gt_diff::Resolution>],
+) -> String {
+    let total = file.hunk_count();
+    let decided = resolutions
+        .iter()
+        .take(total)
+        .filter(|item| item.is_some())
+        .count();
+    if total == 0 {
+        return "该文件已无冲突标记，可直接标记为已解决".to_owned();
+    }
+    format!(
+        "{decided} / {total} 处冲突已决定{}",
+        if decided == total {
+            "　（全部已决定，可标记为已解决）"
+        } else {
+            ""
+        }
+    )
+}
+
+/// 构造交互式变基的步骤行。
+#[must_use]
+pub fn build_rebase_step_rows(
+    plan: &gt_backend::RebasePlan,
+    selected: Option<usize>,
+) -> Vec<RebaseStepRow> {
+    plan.steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| RebaseStepRow {
+            row_index: i32::try_from(index).unwrap_or(i32::MAX),
+            short_id: SharedString::from(step.short()),
+            subject: SharedString::from(step.subject.as_str()),
+            action: rebase_action_code(step.action),
+            selected: selected == Some(index),
+            has_message: step
+                .message
+                .as_deref()
+                .is_some_and(|message| !message.trim().is_empty()),
+        })
+        .collect()
+}
+
+/// 变基动作 → 界面下标（与下拉/按钮顺序一致）。
+#[must_use]
+pub fn rebase_action_code(action: gt_backend::RebaseAction) -> i32 {
+    match action {
+        gt_backend::RebaseAction::Pick => 0,
+        gt_backend::RebaseAction::Reword => 1,
+        gt_backend::RebaseAction::Squash => 2,
+        gt_backend::RebaseAction::Fixup => 3,
+        gt_backend::RebaseAction::Drop => 4,
+    }
+}
+
+/// 界面下标 → 变基动作。
+#[must_use]
+pub fn rebase_action_from_code(code: i32) -> Option<gt_backend::RebaseAction> {
+    match code {
+        0 => Some(gt_backend::RebaseAction::Pick),
+        1 => Some(gt_backend::RebaseAction::Reword),
+        2 => Some(gt_backend::RebaseAction::Squash),
+        3 => Some(gt_backend::RebaseAction::Fixup),
+        4 => Some(gt_backend::RebaseAction::Drop),
+        _ => None,
+    }
+}
+
+/// 构造"两提交比较 / 快照浏览"的文件行。
+#[must_use]
+pub fn build_compare_rows(
+    changes: &[gt_core::FileChange],
+    selected: Option<usize>,
+) -> Vec<CompareRow> {
+    changes
+        .iter()
+        .enumerate()
+        .map(|(index, change)| CompareRow {
+            path: SharedString::from(change.path.as_str()),
+            code: SharedString::from(change.kind.letter().to_string()),
+            status: SharedString::from(change.kind.label()),
+            selected: selected == Some(index),
+        })
+        .collect()
+}
+
+/// 重置的确认文案（FR-MRG-06 / D4：丢失什么 / 不可逆 / 替代做法）。
+#[must_use]
+pub fn reset_confirmation(target: &str, mode: gt_backend::ResetMode) -> (String, String, bool) {
+    match mode {
+        gt_backend::ResetMode::Soft => (
+            format!("把当前分支重置到 {target}？"),
+            "软重置只移动分支指针：被回退的提交内容会完整保留在暂存区，\
+             你可以立刻重新提交或修改。\n\n这是三种模式里唯一不丢东西的一种。"
+                .to_owned(),
+            false,
+        ),
+        gt_backend::ResetMode::Mixed => (
+            format!("把当前分支重置到 {target}？"),
+            "混合重置会移动分支指针并清空暂存区：被回退的提交内容仍在工作区，\
+             但「已暂存」状态会丢失，需要重新选择要提交的改动。\n\n\
+             替代做法：用软重置，保留暂存状态。"
+                .to_owned(),
+            false,
+        ),
+        gt_backend::ResetMode::Hard => (
+            format!("硬重置到 {target}？"),
+            "硬重置会把分支、索引与工作区全部改成目标提交的状态：\
+             当前所有未提交的修改与未推送的提交都将永久丢失，Git 无法找回。\n\n\
+             替代做法：先「贮藏」当前改动，或改用软重置后再手动处理。"
+                .to_owned(),
+            true,
+        ),
+    }
+}
+
+/// 贮藏删除的确认文案。
+#[must_use]
+pub fn stash_drop_confirmation(selector: &str) -> (String, String, bool) {
+    (
+        format!("删除 {selector}？"),
+        "删除后该条贮藏不再出现在列表里。它的提交通常还留在对象库中，\
+         但只能通过 `git fsck --lost-found` 手工找回。\n\n\
+         替代做法：需要时先「应用」再用，或「从贮藏创建分支」把它固定下来。"
+            .to_owned(),
+        true,
+    )
+}
+
+/// 变基跳过的确认文案。
+#[must_use]
+pub fn rebase_skip_confirmation() -> (String, String, bool) {
+    (
+        "跳过当前提交？".to_owned(),
+        "被跳过的这个提交不会出现在变基结果里。如果它的改动还没别的地方保存，\
+         这些改动将只存在于 reflog（`git reflog`）可追溯的旧提交中。\n\n\
+         替代做法：先「中止变基」，把该提交拣选到别处，或解决冲突后「继续」。"
+            .to_owned(),
+        true,
+    )
+}
+
+/// 取某一侧解决冲突的确认文案（会覆盖工作区文件）。
+#[must_use]
+pub fn take_side_confirmation(path: &str, side: &str) -> (String, String, bool) {
+    (
+        format!("用{side}的版本覆盖 {path}？"),
+        "这会丢弃该文件里另一侧的改动与所有冲突标记，且无法撤销。\n\n\
+         替代做法：在冲突编辑器里逐块选择，只保留你需要的部分。"
+            .to_owned(),
+        true,
+    )
+}
+
+#[cfg(test)]
+mod advanced_tests {
+    use super::{
+        build_compare_rows, build_conflict_rows, build_rebase_step_rows, build_stash_rows,
+        conflict_summary, rebase_action_code, rebase_action_from_code, reset_confirmation,
+        resolution_from_code, resolve_code,
+    };
+    use gt_backend::{RebaseAction, RebasePlan, RebaseStep, ResetMode, StashEntry};
+    use gt_core::{ChangeKind, FileChange};
+    use gt_diff::{ConflictFile, Resolution};
+
+    #[test]
+    fn stash_rows_strip_the_wip_prefix() {
+        let entries = vec![StashEntry {
+            index: 0,
+            selector: "stash@{0}".to_owned(),
+            message: "WIP on main: 1a2b3c4 修复登录".to_owned(),
+        }];
+        let rows = build_stash_rows(&entries);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].summary.as_str(), "修复登录");
+        assert_eq!(rows[0].branch.as_str(), "main");
+        assert_eq!(rows[0].index, 0);
+    }
+
+    #[test]
+    fn conflict_rows_pairs_context_and_blocks() {
+        let text = "line 1\n<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x\nline 2\n";
+        let file = ConflictFile::parse("a.txt", text);
+        let rows = build_conflict_rows(&file, &[None]);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[0].kind, 0);
+        assert_eq!(rows[1].kind, 1);
+        assert_eq!(rows[1].block, 0);
+        assert!(!rows[1].decided);
+        assert!(rows[1].label.as_str().contains("第 1 处冲突"));
+        assert_eq!(rows[2].kind, 0);
+        assert_eq!(conflict_summary(&file, &[None]), "0 / 1 处冲突已决定");
+
+        let decided = build_conflict_rows(&file, &[Some(Resolution::Theirs)]);
+        assert!(decided[1].decided);
+        assert_eq!(decided[1].result.as_str(), "b");
+        assert!(conflict_summary(&file, &[Some(Resolution::Theirs)]).contains("可标记为已解决"));
+    }
+
+    #[test]
+    fn resolution_codes_round_trip() {
+        assert_eq!(
+            resolution_from_code(resolve_code::OURS),
+            Some(Resolution::Ours)
+        );
+        assert_eq!(
+            resolution_from_code(resolve_code::BASE),
+            Some(Resolution::Base)
+        );
+        assert_eq!(resolution_from_code(9), None);
+    }
+
+    #[test]
+    fn rebase_action_codes_round_trip() {
+        for action in RebaseAction::ALL {
+            assert_eq!(
+                rebase_action_from_code(rebase_action_code(action)),
+                Some(action)
+            );
+        }
+        assert_eq!(rebase_action_from_code(9), None);
+    }
+
+    #[test]
+    fn rebase_rows_carry_actions_and_message_state() {
+        let mut plan = RebasePlan {
+            onto: "main".to_owned(),
+            base: "abc".to_owned(),
+            head: None,
+            merges_dropped: 0,
+            steps: vec![
+                RebaseStep::new("1111111111", "一"),
+                RebaseStep::new("2222222222", "二"),
+            ],
+        };
+        plan.steps[1].action = RebaseAction::Reword;
+        let rows = build_rebase_step_rows(&plan, Some(1));
+        assert_eq!(rows[0].action, 0);
+        assert_eq!(rows[1].action, 1);
+        assert!(rows[1].selected);
+        assert!(!rows[1].has_message, "未填消息时应提示用户补");
+
+        plan.steps[1].message = Some("新消息".to_owned());
+        let rows = build_rebase_step_rows(&plan, None);
+        assert!(rows[1].has_message);
+    }
+
+    #[test]
+    fn compare_rows_use_git_letters() {
+        let changes = vec![
+            FileChange::new("a.txt", ChangeKind::Modified),
+            FileChange::with_old_path("b.txt", "c.txt", ChangeKind::Renamed),
+        ];
+        let rows = build_compare_rows(&changes, Some(0));
+        assert_eq!(rows[0].code.as_str(), "M");
+        assert_eq!(rows[1].code.as_str(), "R");
+        assert!(rows[0].selected);
+    }
+
+    #[test]
+    fn reset_confirmation_flags_hard_as_dangerous() {
+        let (_, _, danger) = reset_confirmation("HEAD~1", ResetMode::Soft);
+        assert!(!danger);
+        let (title, detail, danger) = reset_confirmation("HEAD~1", ResetMode::Hard);
+        assert!(danger);
+        assert!(title.contains("硬重置"));
+        assert!(detail.contains("永久丢失"));
+        assert!(detail.contains("替代做法"), "高危文案必须给出替代做法");
     }
 }

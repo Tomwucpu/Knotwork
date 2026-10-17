@@ -45,12 +45,15 @@ pub use pool::{
     default_thread_count, Job, SubmitError, WorkerPool, DEFAULT_QUEUE_CAPACITY, MAX_THREADS,
 };
 pub use service::{
-    default_branch_scope, default_debounce, first_log_page, silent_observer, Capabilities,
-    ChangeImpact, GitService, RepoHandle, MAX_BLOB_BYTES,
+    default_branch_scope, default_debounce, first_log_page, silent_observer, AdvancedSlot,
+    Capabilities, ChangeImpact, GitService, NetworkSnapshot, NetworkState, RepoHandle,
+    MAX_BLOB_BYTES,
 };
 pub use task::{
-    Delivery, DiffSide, LogPageResult, Outcome, RepoOverview, RequestError, RequestKind,
-    RequestLane, SearchRequest, SearchResult, SelectionMode, WriteRequest,
+    AdvancedResult, ConflictedEntry, CredentialOutcome, Delivery, DiffSide, LogPageResult,
+    NetworkFailure, NetworkOutcome, NetworkRequest, Outcome, PushPreviewRequest, RemoteEntry,
+    RepoOverview, RequestError, RequestKind, RequestLane, SearchRequest, SearchResult,
+    SelectionMode, WriteRequest,
 };
 pub use watch::{
     merge_events, ChangeBatch, ChangeSink, Relevance, RepoPaths, RepoWatcher, WatchError,

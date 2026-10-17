@@ -36,19 +36,56 @@
 //! | 提交消息搜索 | [`RepoWriter::search_commits`] | FR-LOG-03 |
 //! | 仓库写锁（只读降级） | [`WriteLock`]、[`LockAttempt`] | FR-MR-04 |
 
+//! # M4 新增
+//!
+//! | 能力 | 实现 | 需求 |
+//! |---|---|---|
+//! | 合并（策略 / 冲突清单 / 中止） | [`AdvancedOps::merge`] | FR-MRG-01 |
+//! | 变基（start / continue / skip / abort / 进度） | [`AdvancedOps::rebase`] | FR-MRG-02 |
+//! | 交互式变基（plan → todo → 执行） | [`AdvancedOps::interactive_rebase`] | FR-MRG-03 |
+//! | 拣选 / 回滚 / 重置 / 撤销提交 | [`AdvancedOps::cherry_pick`] | FR-MRG-04/05/06 |
+//! | 贮藏全套 | [`AdvancedOps::stash`] | FR-STH |
+//! | 补丁生成与应用 | [`AdvancedOps::create_patch`] | FR-PTC |
+//! | 标签增删 | [`AdvancedOps::tag`] | FR-BR-03 |
+//! | 冲突三方读取与"标记为已解决" | [`AdvancedOps::resolve_conflict`] | FR-CFL-01/03 |
+
+pub mod advanced;
 pub mod cli;
+pub mod credential;
 pub mod error;
 pub mod lock;
+pub mod protect;
 pub mod record;
+pub mod remote;
 pub mod repo;
 pub mod work;
 
-pub use cli::{CancelProbe, CliOutput, GitCli, LOCAL_TIMEOUT, NETWORK_TIMEOUT};
+pub use advanced::{
+    read_rebase_progress, AdvancedOps, AdvancedOutcome, CherryPickRequest, MergeRequest,
+    MergeStrategy, PatchApplyRequest, PatchSource, PlanError, RebaseAction, RebaseControl,
+    RebasePlan, RebaseProgress, RebaseRequest, RebaseStep, ResetMode, ResetRequest, RevertRequest,
+    StashEntry, StashOp, TagOp, ADVANCED_TIMEOUT, PLAN_DIR_NAME, REBASE_TIMEOUT,
+};
+pub use cli::{
+    active_processes, CancelProbe, CliOutput, GitCli, NetworkOptions, ProgressSink, LOCAL_TIMEOUT,
+    MAX_CONCURRENT_PROCESSES, NETWORK_TIMEOUT,
+};
+pub use credential::{
+    askpass_from_env, diagnose, host_of, is_ssh_url, redact, redact_url, CredentialDiagnosis,
+    CredentialKind, KeyringStore, MemoryTokenStore, TokenStore, ASKPASS_SECRET_ENV,
+    ASKPASS_USERNAME_ENV,
+};
 pub use error::{BackendError, Result};
 pub use lock::{LockAttempt, WriteLock};
+pub use protect::{BranchProtection, ProtectionVerdict};
 pub use record::{
     noop_observer, CommandObserver, CommandRecord, CommandRoute, NoopObserver, SharedObserver,
     MAX_CAPTURE_BYTES,
+};
+pub use remote::{
+    FetchRequest, NetworkCredential, NetworkResult, PullRequest, PullStrategy, PushCommit,
+    PushPreview, PushRequest, PushTarget, PushUpdate, RemoteEdit, RemoteInfo, RemoteListing,
+    RemoteOps, PUSH_PREVIEW_LIMIT,
 };
 pub use repo::{
     collapse_linear, topo_order, BlobPair, GitRepo, GraphNode, RepoLocation, SharedGitRepo,

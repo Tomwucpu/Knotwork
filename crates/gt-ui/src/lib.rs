@@ -62,10 +62,13 @@ pub use generated::MainWindow;
 pub fn recent_model(recent: &[gt_config::RecentRepo]) -> slint::ModelRc<generated::RecentRow> {
     view_model::rc_model(view_model::build_recent_rows(recent))
 }
-pub use session::{Session, LOG_PAGE_SIZE};
+pub use session::{ConfigEvent, Session, LOG_PAGE_SIZE};
 pub use view_model::{
-    branch_text, build_change_rows, build_console_rows, build_diff_rows, build_graph_cells,
-    build_log_rows, build_recent_rows, build_ref_rows, diff_selection_hint, discard_confirmation,
-    discard_selection_confirmation, head_text, lane_color, ordered_refs, relative_time,
+    branch_text, build_change_rows, build_compare_rows, build_conflict_file_rows,
+    build_conflict_rows, build_console_rows, build_diff_rows, build_graph_cells, build_log_rows,
+    build_rebase_step_rows, build_recent_rows, build_ref_rows, build_remote_rows, build_stash_rows,
+    conflict_summary, diff_selection_hint, discard_confirmation, discard_selection_confirmation,
+    head_text, lane_color, ordered_refs, rebase_action_code, rebase_action_from_code,
+    relative_time, reset_confirmation, resolution_from_code, resolve_code, stash_drop_confirmation,
     state_banner, GraphKind,
 };

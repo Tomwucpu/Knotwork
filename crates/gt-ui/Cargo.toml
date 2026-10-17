@@ -20,6 +20,9 @@ gt-config.workspace = true
 crossbeam-channel.workspace = true
 slint.workspace = true
 tracing.workspace = true
+# 剪贴板（FR-LOG-07「复制哈希」）：纯 Rust、无外部进程。
+# 不用 `clip.exe` 子进程是因为 UI 线程不允许起进程（架构规划 4.2）。
+arboard = { version = "3", default-features = false }
 
 [build-dependencies]
 slint-build.workspace = true

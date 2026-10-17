@@ -271,7 +271,7 @@ impl WindowManager {
 
     /// 把共享配置里的"应用级设置"对齐到窗口（主题 / staging 模式 / 告警）。
     fn sync_preferences(state: &Rc<RefCell<SlotState>>, window: &MainWindow) {
-        let (dark, staging, warn_detached) = {
+        let (dark, staging, warn_detached, strategy, patterns, hosts) = {
             let shared = {
                 let guard = state.borrow();
                 Rc::clone(&guard.config)
@@ -281,6 +281,9 @@ impl WindowManager {
                 matches!(config.appearance.theme, Theme::Dark | Theme::System),
                 config.git.staging_mode,
                 config.git.warn_detached_commit,
+                pull_strategy(config.git.update_strategy),
+                config.branches.protected_patterns.clone(),
+                config.remote.stored_token_hosts.clone(),
             )
         };
 
@@ -291,6 +294,7 @@ impl WindowManager {
         let mut guard = state.borrow_mut();
         if let Some(session) = guard.session.as_mut() {
             session.set_preferences(staging, warn_detached);
+            session.set_remote_preferences(strategy, patterns, hosts);
         }
         drop(guard);
 
@@ -325,13 +329,7 @@ impl WindowManager {
         );
         window.set_set_cache_mib(i32::try_from(config.cache.memory_mib).unwrap_or(32));
         window.set_set_log_level(log_level_index(config.diagnostics.log_level));
-        window.set_set_update_strategy(
-            i32::try_from(usize::from(matches!(
-                config.git.update_strategy,
-                UpdateStrategy::Rebase
-            )))
-            .unwrap_or(0),
-        );
+        window.set_set_update_strategy(strategy_index(config.git.update_strategy));
     }
 
     /// 连接窗口回调。
@@ -355,8 +353,16 @@ impl WindowManager {
             let Some(session) = guard.session.as_mut() else {
                 return;
             };
-            if session.drain() {
+            let changed = session.drain();
+            // 凭据操作会改变"哪些主机存过 token"：这类事实要落盘，
+            // 但会话不碰配置文件 —— 由应用层消费事件后写回。
+            let events = session.take_config_events();
+            if changed {
                 session.apply_to(&window);
+            }
+            drop(guard);
+            if !events.is_empty() {
+                Self::apply_config_events(&poll_state, &events);
             }
         });
 
@@ -561,6 +567,14 @@ impl WindowManager {
 
         let weak = window.as_weak();
         let slot = Rc::clone(state);
+        window.on_delete_tag(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::delete_selected_tag);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
         window.on_checkout_selected_commit(move || {
             if let Some(window) = weak.upgrade() {
                 Self::with_session(&slot, &window, Session::request_checkout_selected_commit);
@@ -713,11 +727,7 @@ impl WindowManager {
                 config.git.staging_mode = window.get_staging_mode();
                 config.git.warn_detached_commit = window.get_set_warn_detached();
                 config.git.warn_crlf = window.get_set_warn_crlf();
-                config.git.update_strategy = if window.get_set_update_strategy() == 1 {
-                    UpdateStrategy::Rebase
-                } else {
-                    UpdateStrategy::Merge
-                };
+                config.git.update_strategy = strategy_from_index(window.get_set_update_strategy());
                 config.branches.protected_patterns = window
                     .get_set_protected()
                     .split(',')
@@ -746,6 +756,516 @@ impl WindowManager {
             window.set_settings_visible(false);
         });
 
+        // ---- 远端（FR-RMT）----
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_fetch_selected(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.request_fetch(false));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_fetch_all(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.request_fetch(true));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_update_project(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::request_update);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_push_request(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::request_push);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_push_confirm(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::push_confirm);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_push_cancel(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::push_cancel);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_toggle_push_force(move |on| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.toggle_push_force(on));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_toggle_push_upstream(move |on| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.toggle_push_upstream(on));
+            }
+        });
+
+        // 更新策略要"记住用户选择"（FR-RMT-02）：会话改一档，配置同步落盘。
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_set_pull_strategy(move |index| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.set_pull_strategy(index);
+                });
+            }
+            {
+                let shared = {
+                    let guard = slot.borrow();
+                    Rc::clone(&guard.config)
+                };
+                shared.borrow_mut().git.update_strategy = strategy_from_index(index);
+            }
+            if let Err(err) = persist_shared(&slot) {
+                tracing::warn!(%err, "保存更新策略失败");
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_select_remote(move |index| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.select_remote(usize::try_from(index).unwrap_or(usize::MAX));
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_cancel_network(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::cancel_network);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_dismiss_network_error(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::dismiss_network_error);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_open_remotes(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::open_remotes);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_close_remotes(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::close_remotes);
+            }
+        });
+
+        let slot = Rc::clone(state);
+        window.on_set_remote_name(move |text| {
+            if let Some(session) = slot.borrow_mut().session.as_mut() {
+                session.set_remote_name(text.as_str());
+            }
+        });
+
+        let slot = Rc::clone(state);
+        window.on_set_remote_url(move |text| {
+            if let Some(session) = slot.borrow_mut().session.as_mut() {
+                session.set_remote_url(text.as_str());
+            }
+        });
+
+        let slot = Rc::clone(state);
+        window.on_set_token_input(move |text| {
+            if let Some(session) = slot.borrow_mut().session.as_mut() {
+                session.set_token_input(text.as_str());
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_remote_add(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::add_remote);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_remote_remove(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::remove_remote);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_remote_set_url(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::set_remote_url_from_input);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_save_token(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::save_token);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_forget_token(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::forget_token);
+            }
+        });
+
+        // ---- M4：提交上下文菜单 ----
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_open_commit_menu(move |index, x, y| {
+            let Ok(index) = usize::try_from(index) else {
+                return;
+            };
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.open_commit_menu(index, x, y);
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_close_commit_menu(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::close_commit_menu);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_commit_action(move |action| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.commit_action(action.as_str());
+                });
+            }
+        });
+
+        // ---- M4：通用操作对话框 ----
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_set_op_input(move |text| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.set_op_input(text.as_str());
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_set_op_input2(move |text| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.set_op_input2(text.as_str());
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_set_op_mode(move |mode| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.set_op_mode(mode));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_op_confirm(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::op_confirm);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_op_cancel(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::op_cancel);
+            }
+        });
+
+        // ---- M4：交互式变基 ----
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_iplan_select(move |index| {
+            let Ok(index) = usize::try_from(index) else {
+                return;
+            };
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.iplan_select(index));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_iplan_action(move |index, action| {
+            let Ok(index) = usize::try_from(index) else {
+                return;
+            };
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.iplan_action(index, action);
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_iplan_set_message(move |text| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.iplan_set_message(text.as_str());
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_iplan_confirm(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::iplan_confirm);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_iplan_cancel(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::iplan_cancel);
+            }
+        });
+
+        // ---- M4：三路冲突解决 ----
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_cfl_select(move |index| {
+            let Ok(index) = usize::try_from(index) else {
+                return;
+            };
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.cfl_select(index));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_cfl_pick_block(move |block| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.cfl_pick_block(block));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_cfl_take_side(move |stage| {
+            let Ok(side) = u8::try_from(stage) else {
+                return;
+            };
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.cfl_take_side(side));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_cfl_resolve(move |block, code| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.cfl_resolve(block, code));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_cfl_resolve_all(move |code| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.cfl_resolve_all(code));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_cfl_set_manual(move |text| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.cfl_set_manual(text.as_str());
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_cfl_apply_manual(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::cfl_apply_manual);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_cfl_mark_resolved(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::cfl_mark_resolved);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_cfl_close(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::cfl_close);
+            }
+        });
+
+        // ---- M4：贮藏 ----
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_request_stash_list(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::request_stash_list);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_set_stash_message(move |text| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.set_stash_message(text.as_str());
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_toggle_stash_untracked(move |on| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.toggle_stash_untracked(on));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_stash_create(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::stash_create);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_stash_apply(move |index| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.stash_apply(index));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_stash_pop(move |index| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.stash_pop(index));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_stash_drop(move |index| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.stash_drop(index));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_stash_branch(move |index| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.stash_branch(index));
+            }
+        });
+
+        // ---- M4：比较 / 快照浏览 ----
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_compare_select(move |index| {
+            let Ok(index) = usize::try_from(index) else {
+                return;
+            };
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.compare_select(index));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_compare_close(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::compare_close);
+            }
+        });
+
+        // ---- M4：中断恢复 ----
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_resume_continue(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::resume_continue);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_resume_skip(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::resume_skip);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_resume_abort(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::resume_abort);
+            }
+        });
+
         // ---- 关闭 ----
         //
         // 关闭请求挂在低层 `Window` 上：Slint 没有为 `Window` 元素生成
@@ -760,6 +1280,28 @@ impl WindowManager {
             }
             slint::CloseRequestResponse::HideWindow
         });
+    }
+
+    /// 把会话产生的配置事件写到共享配置并落盘。
+    ///
+    /// 只记录主机名，**不记录 token**：token 在系统密钥链里（NFR-SEC-01）。
+    fn apply_config_events(state: &Rc<RefCell<SlotState>>, events: &[gt_ui::ConfigEvent]) {
+        let shared = {
+            let guard = state.borrow();
+            Rc::clone(&guard.config)
+        };
+        {
+            let mut config = shared.borrow_mut();
+            for event in events {
+                match event {
+                    gt_ui::ConfigEvent::TokenSaved(host) => config.remote.remember_host(host),
+                    gt_ui::ConfigEvent::TokenForgotten(host) => config.remote.forget_host(host),
+                }
+            }
+        }
+        if let Err(err) = persist_shared(state) {
+            tracing::warn!(%err, "保存凭据主机列表失败");
+        }
     }
 
     /// 有会话时执行 `action` 并把状态写回窗口。
@@ -797,13 +1339,7 @@ impl WindowManager {
         );
         window.set_set_cache_mib(i32::try_from(config.cache.memory_mib).unwrap_or(32));
         window.set_set_log_level(log_level_index(config.diagnostics.log_level));
-        window.set_set_update_strategy(
-            i32::try_from(usize::from(matches!(
-                config.git.update_strategy,
-                UpdateStrategy::Rebase
-            )))
-            .unwrap_or(0),
-        );
+        window.set_set_update_strategy(strategy_index(config.git.update_strategy));
 
         let mut guard = state.borrow_mut();
         if guard.empty {
@@ -814,7 +1350,14 @@ impl WindowManager {
         }
         if let Some(session) = guard.session.as_mut() {
             session.set_preferences(config.git.staging_mode, config.git.warn_detached_commit);
+            session.set_remote_preferences(
+                pull_strategy(config.git.update_strategy),
+                config.branches.protected_patterns.clone(),
+                config.remote.stored_token_hosts.clone(),
+            );
             session.request_initial();
+            // 远端名用于工具栏提示与推送目标：首屏静默取一次（不弹提示条）。
+            session.prime_remotes();
             session.apply_to(window);
         }
     }
@@ -850,6 +1393,33 @@ fn non_empty(text: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_owned())
+    }
+}
+
+/// 配置里的更新策略 → 后端策略（FR-RMT-02）。
+fn pull_strategy(strategy: UpdateStrategy) -> gt_backend::PullStrategy {
+    match strategy {
+        UpdateStrategy::Merge => gt_backend::PullStrategy::Merge,
+        UpdateStrategy::Rebase => gt_backend::PullStrategy::Rebase,
+        UpdateStrategy::FastForwardOnly => gt_backend::PullStrategy::FastForwardOnly,
+    }
+}
+
+/// 界面/会话下标 → 配置策略。
+fn strategy_from_index(index: i32) -> UpdateStrategy {
+    match index {
+        1 => UpdateStrategy::Rebase,
+        2 => UpdateStrategy::FastForwardOnly,
+        _ => UpdateStrategy::Merge,
+    }
+}
+
+/// 配置策略 → 界面/会话下标。
+fn strategy_index(strategy: UpdateStrategy) -> i32 {
+    match strategy {
+        UpdateStrategy::Merge => 0,
+        UpdateStrategy::Rebase => 1,
+        UpdateStrategy::FastForwardOnly => 2,
     }
 }
 

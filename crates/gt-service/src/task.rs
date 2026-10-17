@@ -4,7 +4,16 @@
 //! 消息里**不含任何句柄**（不携带 `GitRepo`、不携带 `Arc<Vec<..>>` 之外的共享状态），
 //! 因此可以在任意线程之间自由移动。
 
-use gt_backend::{BranchOp, CommitRequest, IgnoreTarget, RepoLocation, WriteOutcome};
+use std::fmt::Write as _;
+use std::path::PathBuf;
+
+use gt_backend::{
+    BranchOp, CherryPickRequest, CommitRequest, CredentialKind, FetchRequest, IgnoreTarget,
+    MergeRequest, NetworkResult, PatchApplyRequest, PatchSource, PullRequest, PushPreview,
+    PushRequest, RebaseControl, RebasePlan, RebaseProgress, RebaseRequest, RemoteEdit, RemoteInfo,
+    RemoteListing, RepoLocation, ResetRequest, RevertRequest, StashEntry, StashOp, TagOp,
+    WriteOutcome,
+};
 use gt_core::{ChangeSet, FileChange, HeadInfo, LogNodePage, LogPageRequest, RefInfo, RepoState};
 use gt_diff::HunkSelection;
 
@@ -109,6 +118,63 @@ pub enum WriteRequest {
         /// 被忽略的路径。
         path: String,
     },
+
+    // ---- M4：高级操作 ----
+    /// 合并到当前分支（FR-MRG-01）。
+    Merge(MergeRequest),
+    /// 变基到指定修订（FR-MRG-02）。
+    Rebase(RebaseRequest),
+    /// 变基的三键：继续 / 跳过 / 中止。
+    RebaseControl(RebaseControl),
+    /// 交互式变基（FR-MRG-03）。
+    InteractiveRebase(Box<RebasePlan>),
+    /// 拣选提交（FR-MRG-04）。
+    CherryPick(CherryPickRequest),
+    /// 回滚提交（FR-MRG-05）。
+    Revert(RevertRequest),
+    /// 重置到指定修订（FR-MRG-06）。
+    Reset(ResetRequest),
+    /// 撤销当前分支最新提交（软重置）。
+    UndoCommit {
+        /// 目标提交 id（必须是 HEAD）。
+        id: String,
+    },
+    /// 贮藏操作（FR-STH）。
+    Stash(StashOp),
+    /// 生成补丁（FR-PTC）。
+    CreatePatch {
+        /// 来源。
+        source: PatchSource,
+        /// 输出文件。
+        output: PathBuf,
+    },
+    /// 应用补丁（FR-PTC）。
+    ApplyPatch(PatchApplyRequest),
+    /// 标签增删（FR-BR-03）。
+    Tag(TagOp),
+    /// 把解决后的内容写回并 `git add`（FR-CFL-01）。
+    ResolveConflict {
+        /// 仓库相对路径。
+        path: String,
+        /// 解决后的完整内容。
+        content: Vec<u8>,
+    },
+    /// 整体取某一侧（stage 2 = 当前分支，3 = 合入分支，1 = 共同祖先）。
+    TakeSide {
+        /// 仓库相对路径。
+        path: String,
+        /// 冲突 stage。
+        stage: u8,
+    },
+    /// 中止进行中的合并。
+    AbortMerge,
+    /// 继续 / 中止进行中的拣选或回滚。
+    ContinueState {
+        /// 进行中的操作。
+        state: gt_core::RepoState,
+        /// 为真表示中止。
+        abort: bool,
+    },
 }
 
 impl WriteRequest {
@@ -124,23 +190,271 @@ impl WriteRequest {
             Self::Commit(_) => "提交",
             Self::Branch(_) => "分支操作",
             Self::Ignore { .. } => "写入忽略规则",
+            Self::Merge(_) => "合并",
+            Self::Rebase(_) => "变基",
+            Self::RebaseControl(control) => control.label(),
+            Self::InteractiveRebase(_) => "交互式变基",
+            Self::CherryPick(_) => "拣选",
+            Self::Revert(_) => "回滚",
+            Self::Reset(_) => "重置",
+            Self::UndoCommit { .. } => "撤销提交",
+            Self::Stash(op) => op.label(),
+            Self::CreatePatch { .. } => "生成补丁",
+            Self::ApplyPatch(_) => "应用补丁",
+            Self::Tag(_) => "标签操作",
+            Self::ResolveConflict { .. } => "标记冲突已解决",
+            Self::TakeSide { .. } => "取冲突一侧",
+            Self::AbortMerge => "中止合并",
+            Self::ContinueState { abort, .. } => {
+                if *abort {
+                    "中止进行中的操作"
+                } else {
+                    "继续进行中的操作"
+                }
+            }
         }
+    }
+
+    /// 是否属于 M4 引入的高级操作（决定它走哪条执行路径）。
+    #[must_use]
+    pub const fn is_advanced(&self) -> bool {
+        matches!(
+            self,
+            Self::Merge(_)
+                | Self::Rebase(_)
+                | Self::RebaseControl(_)
+                | Self::InteractiveRebase(_)
+                | Self::CherryPick(_)
+                | Self::Revert(_)
+                | Self::Reset(_)
+                | Self::UndoCommit { .. }
+                | Self::Stash(_)
+                | Self::CreatePatch { .. }
+                | Self::ApplyPatch(_)
+                | Self::Tag(_)
+                | Self::ResolveConflict { .. }
+                | Self::TakeSide { .. }
+                | Self::AbortMerge
+                | Self::ContinueState { .. }
+        )
+    }
+
+    /// 是否属于"高级操作"（需要独占该仓库的操作槽位）。
+    ///
+    /// 判据是"会不会长时间持有 index/HEAD 并可能停在冲突状态"：
+    /// 合并、变基、拣选、回滚、重置、贮藏、补丁、冲突落盘都算；
+    /// 暂存与提交是秒级操作，串行化它们只会让界面变钝。
+    #[must_use]
+    pub const fn needs_advanced_slot(&self) -> bool {
+        matches!(
+            self,
+            Self::Merge(_)
+                | Self::Rebase(_)
+                | Self::RebaseControl(_)
+                | Self::InteractiveRebase(_)
+                | Self::CherryPick(_)
+                | Self::Revert(_)
+                | Self::Reset(_)
+                | Self::UndoCommit { .. }
+                | Self::Stash(_)
+                | Self::ApplyPatch(_)
+                | Self::ResolveConflict { .. }
+                | Self::TakeSide { .. }
+                | Self::AbortMerge
+                | Self::ContinueState { .. }
+        )
     }
 
     /// 是否不可逆（供高危确认清单使用）。
     #[must_use]
     pub const fn is_destructive(&self) -> bool {
         match self {
+            // 丢弃类：直接销毁工作区内容，无 Git 层面的找回手段。
             Self::Discard(_)
             | Self::DeleteUntracked(_)
             | Self::Branch(
                 BranchOp::CheckoutDetached { .. } | BranchOp::Delete { force: true, .. },
-            ) => true,
+            )
+            | Self::TakeSide { .. } => true,
             Self::Selection { mode, .. } => mode.needs_confirmation(),
+            Self::Reset(request) => request.mode.is_destructive(),
+            Self::Stash(op) => op.is_destructive(),
+            Self::RebaseControl(control) => control.is_destructive(),
             _ => false,
         }
     }
 }
+
+/// 推送预览请求。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushPreviewRequest {
+    /// 远端名。
+    pub remote: String,
+    /// 分支；[`None`] 表示当前分支。
+    pub branch: Option<String>,
+    /// 受保护分支正则（来自设置，由界面填入）。
+    pub protected_patterns: Vec<String>,
+}
+
+/// 一次网络操作请求（FR-RMT）。
+///
+/// 与 [`WriteRequest`] 并列而不是塞进去：网络操作的失败原因（凭据/网络/远端策略）
+/// 与本地写完全不同，混在一起会让错误处理变成一堆 `if`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkRequest {
+    /// 列出远端与凭据能力（只读）。
+    Remotes,
+    /// 增删改远端配置。
+    EditRemote(RemoteEdit),
+    /// 获取更新。
+    Fetch(FetchRequest),
+    /// 拉取并整合。
+    Pull(PullRequest),
+    /// 推送（含受保护分支拦截）。
+    Push {
+        /// 推送参数。
+        request: PushRequest,
+        /// 受保护分支正则。
+        protected_patterns: Vec<String>,
+    },
+    /// 生成推送预览（只读，不产生远端动作）。
+    Preview(PushPreviewRequest),
+    /// 把 HTTPS token 存入系统密钥链。
+    SaveToken {
+        /// 主机名。
+        host: String,
+        /// 用户名。
+        username: String,
+        /// token（不落盘、不入审计）。
+        secret: String,
+    },
+    /// 删除某主机的 token。
+    ForgetToken {
+        /// 主机名。
+        host: String,
+    },
+}
+
+impl NetworkRequest {
+    /// 审计与提示用的标签。
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Remotes => "读取远端",
+            Self::EditRemote(_) => "修改远端配置",
+            Self::Fetch(_) => "获取更新",
+            Self::Pull(_) => "拉取更新",
+            Self::Push { .. } => "推送",
+            Self::Preview(_) => "推送预览",
+            Self::SaveToken { .. } => "保存凭据",
+            Self::ForgetToken { .. } => "删除凭据",
+        }
+    }
+
+    /// 是否会改变仓库状态（决定只读模式是否一律拒绝）。
+    ///
+    /// 只读模式下"读到远端有什么"仍然有意义（能让用户看懂状态），
+    /// 所以只有真正写引用的操作才拦。
+    #[must_use]
+    pub const fn mutates_repo(&self) -> bool {
+        matches!(
+            self,
+            Self::EditRemote(_) | Self::Fetch(_) | Self::Pull(_) | Self::Push { .. }
+        )
+    }
+
+    /// 是否需要"同一仓库同时只允许一个网络操作"的独占。
+    ///
+    /// 凭据读写不占用网络槽位：它们不碰远端，且用户在失败后立刻补 token 是
+    /// 最常见的动作 —— 此时若还被"上一个 fetch 未收尾"挡住，体验会很糟。
+    #[must_use]
+    pub const fn needs_exclusive_slot(&self) -> bool {
+        match self {
+            Self::Remotes
+            | Self::Preview(_)
+            | Self::SaveToken { .. }
+            | Self::ForgetToken { .. } => false,
+            Self::EditRemote(_) | Self::Fetch(_) | Self::Pull(_) | Self::Push { .. } => true,
+        }
+    }
+}
+
+/// 一次网络失败的完整描述。
+///
+/// 比 [`Outcome::Failed`] 多带三个字段，全部是为了让界面能给出**可执行的下一步**：
+/// `kind` 决定是否提示"为此主机保存 token"，`hints` 直接展示，`detail` 进 Console。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkFailure {
+    /// 一句话结论。
+    pub summary: String,
+    /// 失败类别。
+    pub kind: CredentialKind,
+    /// 建议动作。
+    pub hints: Vec<String>,
+    /// git 原始输出（已脱敏）。
+    pub detail: String,
+}
+
+impl NetworkFailure {
+    /// 是否值得提示"保存 token"。
+    #[must_use]
+    pub fn suggests_token(&self) -> bool {
+        matches!(
+            self.kind,
+            CredentialKind::AuthRequired | CredentialKind::AuthRejected
+        )
+    }
+
+    /// 拼成可直接展示的文本（结论 + 建议）。
+    #[must_use]
+    pub fn message(&self) -> String {
+        let mut out = self.summary.clone();
+        if !self.hints.is_empty() {
+            out.push_str("\n建议：");
+            for (index, hint) in self.hints.iter().enumerate() {
+                let _ = write!(out, "\n  {}. {hint}", index + 1);
+            }
+        }
+        out
+    }
+}
+
+/// 凭据存储操作的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialOutcome {
+    /// 主机名。
+    pub host: String,
+    /// 是保存（`true`）还是删除（`false`）。
+    pub saved: bool,
+    /// 面向用户的说明。
+    pub message: String,
+}
+
+/// 网络操作的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkOutcome {
+    /// 远端与凭据能力清单。
+    Remotes(Box<RemoteListing>),
+    /// 推送预览。
+    Preview(Box<PushPreview>),
+    /// 执行完成（fetch/pull/push/edit）。
+    Done(Box<NetworkResult>),
+    /// 凭据存取结果。
+    Token(Box<CredentialOutcome>),
+    /// 失败（结构化，便于界面引导）。
+    Failed(Box<NetworkFailure>),
+}
+
+impl NetworkOutcome {
+    /// 是否成功。
+    #[must_use]
+    pub const fn is_ok(&self) -> bool {
+        !matches!(self, Self::Failed(_))
+    }
+}
+
+/// 远端列表项的便捷别名（界面层不需要直接依赖 `gt-backend`）。
+pub type RemoteEntry = RemoteInfo;
 
 /// 一次搜索请求（FR-LOG-03）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,8 +513,26 @@ pub enum RequestKind {
     },
     /// 提交消息搜索。
     Search(SearchRequest),
+    /// 待解决的冲突文件清单（FR-CFL-02）。
+    Conflicts,
+    /// 单个冲突文件的解析结果（三路编辑器数据源，FR-CFL-01/03）。
+    ConflictFile {
+        /// 仓库相对路径。
+        path: String,
+    },
+    /// 生成交互式变基的提交计划（FR-MRG-03）。
+    RebasePlan {
+        /// 变基目标。
+        onto: String,
+        /// 区间起点（不含）。
+        base: String,
+    },
+    /// 贮藏列表（FR-STH）。
+    StashList,
     /// 写操作（不经代次闸门）。
     Write(Box<WriteRequest>),
+    /// 网络操作（FR-RMT，不经代次闸门，但可取消）。
+    Network(Box<NetworkRequest>),
 }
 
 /// 请求所属的**视图通道**。
@@ -223,16 +555,28 @@ pub enum RequestLane {
     /// 单独一条通道，且**不参与代次作废**：写请求的结果必须送达界面，
     /// 无论在此期间用户又点了几次别的东西。
     Write,
+    /// 网络操作。
+    ///
+    /// 同样不作废结果（一次 fetch 的成败必须被看见），但**显式可取消**：
+    /// 用户要能在"拉一个巨型远端"时按下停止，并且真的杀掉进程树。
+    Network,
+    /// 高级操作的读取需求（冲突清单 / 冲突文件 / 变基计划 / 贮藏列表）。
+    ///
+    /// 这些读取都是为了填满某个遮罩或面板；用户关掉遮罩或刷新仓库时，
+    /// 在飞的结果已经没有接收方，按代次作废是正确的。
+    Advanced,
 }
 
 impl RequestLane {
     /// 全部通道。
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Overview,
         Self::Status,
         Self::Log,
         Self::Diff,
         Self::Write,
+        Self::Network,
+        Self::Advanced,
     ];
 
     /// 诊断标签。
@@ -244,13 +588,15 @@ impl RequestLane {
             Self::Log => "日志",
             Self::Diff => "差异",
             Self::Write => "写操作",
+            Self::Network => "网络操作",
+            Self::Advanced => "高级操作",
         }
     }
 
     /// 该通道的结果是否受代次闸门约束。
     #[must_use]
     pub const fn is_gated(self) -> bool {
-        !matches!(self, Self::Write)
+        !matches!(self, Self::Write | Self::Network)
     }
 }
 
@@ -263,7 +609,12 @@ impl RequestKind {
             Self::Status => RequestLane::Status,
             Self::LogPage(_) | Self::Search(_) => RequestLane::Log,
             Self::TreeChanges { .. } | Self::FileDiff { .. } => RequestLane::Diff,
+            Self::Conflicts
+            | Self::ConflictFile { .. }
+            | Self::RebasePlan { .. }
+            | Self::StashList => RequestLane::Advanced,
             Self::Write(_) => RequestLane::Write,
+            Self::Network(_) => RequestLane::Network,
         }
     }
 
@@ -277,8 +628,69 @@ impl RequestKind {
             Self::TreeChanges { .. } => "文件级变更",
             Self::FileDiff { .. } => "文件差异",
             Self::Search(_) => "提交搜索",
+            Self::Conflicts => "冲突清单",
+            Self::ConflictFile { .. } => "冲突文件",
+            Self::RebasePlan { .. } => "变基计划",
+            Self::StashList => "贮藏列表",
             Self::Write(write) => write.label(),
+            Self::Network(network) => network.label(),
         }
+    }
+}
+
+/// 一个待解决的冲突文件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictedEntry {
+    /// 仓库相对路径。
+    pub path: String,
+    /// porcelain 的两个字母（`UU` / `AA` …）。
+    pub code: String,
+    /// 冲突类型。
+    pub kind: gt_core::ConflictKind,
+    /// 文件里当前的冲突块数量（0 表示文件已无标记、只差 `git add`）。
+    pub hunks: usize,
+}
+
+/// 一次高级操作的结果（FR-MRG / FR-STH / FR-PTC / FR-CFL）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvancedResult {
+    /// 一句话结论。
+    pub summary: String,
+    /// git 原始输出（已脱敏）。
+    pub detail: String,
+    /// 仍处于冲突的文件。
+    pub conflicts: Vec<String>,
+    /// 操作后的仓库状态。
+    pub state: gt_core::RepoState,
+}
+
+impl Default for AdvancedResult {
+    fn default() -> Self {
+        Self {
+            summary: String::new(),
+            detail: String::new(),
+            conflicts: Vec::new(),
+            state: gt_core::RepoState::Clean,
+        }
+    }
+}
+
+impl From<gt_backend::AdvancedOutcome> for AdvancedResult {
+    fn from(outcome: gt_backend::AdvancedOutcome) -> Self {
+        Self {
+            summary: outcome.summary,
+            detail: outcome.detail,
+            conflicts: outcome.conflicts,
+            state: outcome.state,
+        }
+    }
+}
+
+impl AdvancedResult {
+    /// 是否停在冲突上。
+    #[must_use]
+    pub fn is_conflicted(&self) -> bool {
+        !self.conflicts.is_empty()
     }
 }
 
@@ -297,6 +709,8 @@ pub struct RepoOverview {
     pub read_only: Option<String>,
     /// 仓库配置的 `user.email`（FR-LOG-06 的"我的提交"判定）。
     pub user_email: Option<String>,
+    /// 变基进度（FR-MRG-02 的"第 x/y 个"）；无进行中的变基时为 [`None`]。
+    pub rebase: Option<RebaseProgress>,
 }
 
 /// 日志页结果。
@@ -351,6 +765,18 @@ pub enum Outcome {
     Search(Box<SearchResult>),
     /// 写操作结果。
     Write(Box<WriteOutcome>),
+    /// 网络操作结果。
+    Network(Box<NetworkOutcome>),
+    /// 高级操作的写结果（合并 / 变基 / 贮藏 / 补丁 / 冲突落盘…）。
+    Advanced(Box<AdvancedResult>),
+    /// 冲突文件清单。
+    Conflicts(Vec<ConflictedEntry>),
+    /// 冲突文件的解析结果。
+    ConflictFile(Box<gt_diff::ConflictFile>),
+    /// 交互式变基的提交计划。
+    RebasePlan(Box<RebasePlan>),
+    /// 贮藏列表。
+    StashList(Vec<StashEntry>),
     /// 失败：错误文本已经过"面向用户"的转换，可直接展示。
     Failed(String),
 }
@@ -359,7 +785,11 @@ impl Outcome {
     /// 是否成功。
     #[must_use]
     pub const fn is_ok(&self) -> bool {
-        !matches!(self, Self::Failed(_))
+        match self {
+            Self::Failed(_) => false,
+            Self::Network(network) => network.is_ok(),
+            _ => true,
+        }
     }
 
     /// 失败原因；成功时为 [`None`]。
@@ -374,7 +804,7 @@ impl Outcome {
     /// 是否为写操作结果（供界面触发写后刷新）。
     #[must_use]
     pub const fn is_write(&self) -> bool {
-        matches!(self, Self::Write(_))
+        matches!(self, Self::Write(_) | Self::Network(_) | Self::Advanced(_))
     }
 }
 
@@ -389,6 +819,10 @@ pub enum RequestError {
     #[error("{0}")]
     ReadOnly(String),
 
+    /// 该仓库已有网络操作在进行。
+    #[error("该仓库已有网络操作在进行（{0}），请等待其完成或先取消")]
+    NetworkBusy(String),
+
     /// 工作队列已满。
     #[error("请求过多，请稍后重试（{0}）")]
     QueueFull(#[from] crate::pool::SubmitError),
@@ -397,8 +831,8 @@ pub enum RequestError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Delivery, DiffSide, Outcome, RequestError, RequestKind, RequestLane, SearchRequest,
-        SelectionMode, WriteRequest,
+        Delivery, DiffSide, NetworkRequest, Outcome, RequestError, RequestKind, RequestLane,
+        SearchRequest, SelectionMode, WriteRequest,
     };
     use crate::generation::Generation;
     use gt_core::{LogPageRequest, RepoId};
@@ -455,12 +889,18 @@ mod tests {
             .lane(),
             RequestLane::Write
         );
+        assert_eq!(
+            RequestKind::Network(Box::new(NetworkRequest::Remotes)).lane(),
+            RequestLane::Network,
+            "网络操作必须单独成道：它可取消，但不能被后续请求作废"
+        );
 
-        assert_eq!(RequestLane::ALL.len(), 5);
+        assert_eq!(RequestLane::ALL.len(), 7);
         for lane in RequestLane::ALL {
             assert!(!lane.label().is_empty());
-            // 写通道必须不受代次闸门约束，其余通道必须受约束。
-            assert_eq!(lane.is_gated(), lane != RequestLane::Write);
+            // 写通道与网络通道不受代次闸门约束（结果必须送达），其余必须受约束。
+            let expect_gated = !matches!(lane, RequestLane::Write | RequestLane::Network);
+            assert_eq!(lane.is_gated(), expect_gated, "{lane:?} 的闸门语义不符");
         }
     }
 

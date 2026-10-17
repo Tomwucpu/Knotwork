@@ -21,22 +21,34 @@
 //! 而不是在写路径里夹带读 —— 这样 Console 里一次用户操作只有一条记录。
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
+use gt_backend::{
+    CherryPickRequest, FetchRequest, MergeRequest, MergeStrategy, PatchApplyRequest, PatchSource,
+    PullRequest, PullStrategy, PushRequest, PushTarget, RebaseAction, RebaseControl, RebasePlan,
+    RebaseProgress, RebaseRequest, RemoteEdit, RemoteInfo, RemoteListing, ResetMode, ResetRequest,
+    RevertRequest, StashEntry, StashOp, TagOp,
+};
 use gt_core::{ChangeSet, CommitCheck, CommitCheckInput, CommitMeta, HeadInfo, LogNode, RepoState};
 use gt_diff::{FileDiff, HunkSelection};
 use gt_graph::LaneLayout;
 use gt_service::{
-    first_log_page, ConsoleBuffer, Delivery, DiffSide, GitService, Outcome, RepoHandle,
-    RequestKind, SearchRequest, SelectionMode, WriteRequest,
+    first_log_page, AdvancedResult, ConflictedEntry, ConsoleBuffer, Delivery, DiffSide, GitService,
+    NetworkFailure, NetworkOutcome, NetworkRequest, NetworkSnapshot, Outcome, PushPreviewRequest,
+    RepoHandle, RequestKind, SearchRequest, SelectionMode, WriteRequest,
 };
 
 use crate::generated::{DiffRow, MainWindow};
 use crate::view_model::{
-    branch_text, build_change_rows, build_console_rows, build_diff_rows, build_log_rows,
-    build_ref_rows, diff_selection_hint, discard_confirmation, discard_selection_confirmation,
-    head_text, ordered_refs, rc_model, state_banner,
+    branch_text, build_change_rows, build_compare_rows, build_conflict_file_rows,
+    build_conflict_rows, build_console_rows, build_diff_rows, build_log_rows, build_push_rows,
+    build_rebase_step_rows, build_ref_rows, build_remote_rows, build_stash_rows, conflict_summary,
+    credential_help, diff_selection_hint, discard_confirmation, discard_selection_confirmation,
+    head_text, network_error_text, ordered_refs, push_hints, push_preview_text, rc_model,
+    rebase_action_from_code, rebase_skip_confirmation, reset_confirmation, resolution_from_code,
+    stash_drop_confirmation, state_banner, take_side_confirmation,
 };
 
 /// 距离已加载末尾多少行时预取下一页。
@@ -47,6 +59,18 @@ pub const LOG_PAGE_SIZE: usize = 200;
 
 /// 提示条的显示时长（以轮询次数计，100ms/次 → 约 6 秒）。
 const TOAST_TICKS: u8 = 60;
+
+/// 会话希望写回配置的事件。
+///
+/// 凭据是唯一会改配置的远端操作（"哪些主机存过 token"要落盘，token 本身不落盘）。
+/// 会话不直接持有配置文件路径 —— 那是应用层的职责，这里只排队、由应用层消费。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigEvent {
+    /// 某主机已保存 token。
+    TokenSaved(String),
+    /// 某主机已删除 token。
+    TokenForgotten(String),
+}
 
 /// 需要在执行前取得强确认的动作。
 ///
@@ -76,6 +100,43 @@ pub enum Confirm {
     CheckoutDetached {
         /// 修订。
         revision: String,
+    },
+    /// 重置当前分支（FR-MRG-06；hard 不可逆）。
+    Reset {
+        /// 目标修订。
+        target: String,
+        /// 模式。
+        mode: ResetMode,
+    },
+    /// 整体用某一侧覆盖冲突文件（FR-CFL-03）。
+    TakeSide {
+        /// 仓库相对路径。
+        path: String,
+        /// 2 = 当前分支，3 = 合入分支。
+        stage: u8,
+    },
+    /// 删除一条贮藏（FR-STH）。
+    StashDrop {
+        /// 选择子（`stash@{0}`）。
+        selector: String,
+        /// 下标。
+        index: u32,
+    },
+    /// 跳过变基中的当前提交（会丢弃该提交的改动）。
+    RebaseSkip,
+    /// 中止进行中的操作。
+    AbortInProgress {
+        /// 进行中的状态。
+        state: RepoState,
+    },
+    /// 强制推送到受保护/已存在的分支（FR-RMT-03）。
+    ForcePush {
+        /// 远端名。
+        remote: String,
+        /// 远端分支。
+        branch: String,
+        /// 待推提交数（仅用于文案）。
+        commits: usize,
     },
 }
 
@@ -121,7 +182,275 @@ impl Confirm {
                     .to_owned(),
                 false,
             ),
+            Self::Reset { target, mode } => reset_confirmation(target, *mode),
+            Self::TakeSide { path, stage } => {
+                let side = if *stage == 3 {
+                    "合入分支"
+                } else {
+                    "当前分支"
+                };
+                take_side_confirmation(path, side)
+            }
+            Self::StashDrop { selector, .. } => stash_drop_confirmation(selector),
+            Self::RebaseSkip => rebase_skip_confirmation(),
+            Self::AbortInProgress { state } => (
+                format!("中止{}？", state.label()),
+                "中止会把仓库恢复到操作开始前的状态：已做的冲突解决会被丢弃，\
+                 已重放的部分提交也会被撤销。\n\n\
+                 替代做法：解决完冲突后「继续」；只想丢掉当前这一个提交时用「跳过」。"
+                    .to_owned(),
+                true,
+            ),
+            Self::ForcePush {
+                remote,
+                branch,
+                commits,
+            } => (
+                format!("强制推送到 {remote}/{branch}？"),
+                format!(
+                    "强制推送会用本地历史覆盖远端分支：远端上不在本地的提交将从该分支消失，\
+                     其他人已经拉取的历史会出现分叉。本次会推上去 {commits} 个提交。\n\n\
+                     替代做法：先 Fetch 后 Update（合并或变基），再普通推送 —— \
+                     这样别人的提交会保留在历史里。"
+                ),
+                true,
+            ),
         }
+    }
+}
+
+/// 提交上下文菜单指向的目标（FR-LOG-07/08）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CtxTarget {
+    /// 完整提交 id。
+    id: String,
+    /// 缩写 id（展示与预填用）。
+    short: String,
+    /// 在已加载列表里的下标。
+    index: usize,
+    /// 是否为当前 HEAD（决定"撤销提交"是否可用）。
+    is_head: bool,
+    /// 父提交 id；根提交为 [`None`]（不能交互式变基、不能浏览版本）。
+    parent: Option<String>,
+}
+
+/// 通用操作对话框的状态（合并 / 变基 / 重置 / 补丁 / 标签）。
+///
+/// 字段与 Slint 侧属性一一对应：界面只是这组字段的渲染，
+/// 会话持有真值，避免"界面改了但会话不知道"的双份状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpDialog {
+    /// 1 合并 / 2 变基 / 3 重置 / 4 生成补丁 / 5 应用补丁 / 6 新建标签。
+    kind: i32,
+    /// 关联的提交 id（合并/变基/补丁/标签的默认目标）。
+    commit: Option<String>,
+    title: String,
+    hint: String,
+    input: String,
+    placeholder: String,
+    input2: String,
+    placeholder2: String,
+    show_input2: bool,
+    modes: Vec<String>,
+    mode: i32,
+    danger: bool,
+}
+
+impl OpDialog {
+    /// 合并对话框。
+    fn merge(commit: Option<String>) -> Self {
+        Self {
+            kind: 1,
+            commit: commit.clone(),
+            title: "合并到当前分支".to_owned(),
+            hint: "填写要合入的修订（分支名 / 标签 / 提交 id）。冲突时会进入三路冲突编辑器。"
+                .to_owned(),
+            input: commit.unwrap_or_default(),
+            placeholder: "例如 feature/login 或 origin/main".to_owned(),
+            input2: String::new(),
+            placeholder2: String::new(),
+            show_input2: false,
+            modes: vec![
+                MergeStrategy::Default.label().to_owned(),
+                MergeStrategy::NoFastForward.label().to_owned(),
+                MergeStrategy::FastForwardOnly.label().to_owned(),
+                MergeStrategy::Squash.label().to_owned(),
+            ],
+            mode: 0,
+            danger: false,
+        }
+    }
+
+    /// 变基对话框。
+    fn rebase(commit: Option<String>) -> Self {
+        Self {
+            kind: 2,
+            commit: commit.clone(),
+            title: "变基到指定修订".to_owned(),
+            hint: "当前分支的提交会被重放到该修订之上。冲突时可继续 / 跳过 / 中止。".to_owned(),
+            input: commit.unwrap_or_default(),
+            placeholder: "例如 main 或 origin/main".to_owned(),
+            input2: String::new(),
+            placeholder2: String::new(),
+            show_input2: false,
+            modes: Vec::new(),
+            mode: 0,
+            danger: false,
+        }
+    }
+
+    /// 重置对话框。
+    fn reset(commit: Option<String>) -> Self {
+        Self {
+            kind: 3,
+            commit: commit.clone(),
+            title: "重置当前分支".to_owned(),
+            hint: "软重置保留暂存；混合重置取消暂存；硬重置会丢弃全部未提交改动（需二次确认）。"
+                .to_owned(),
+            input: commit.unwrap_or_default(),
+            placeholder: "例如 HEAD~1 或提交 id".to_owned(),
+            input2: String::new(),
+            placeholder2: String::new(),
+            show_input2: false,
+            modes: vec![
+                ResetMode::Soft.label().to_owned(),
+                ResetMode::Mixed.label().to_owned(),
+                ResetMode::Hard.label().to_owned(),
+            ],
+            mode: 0,
+            danger: false,
+        }
+    }
+
+    /// 生成补丁对话框。
+    fn patch(commit: String, short: &str, default_output: String) -> Self {
+        Self {
+            kind: 4,
+            commit: Some(commit),
+            title: "生成补丁".to_owned(),
+            hint: "提交补丁（format-patch）带作者与消息，可用 `git am` 应用；\
+                   区间差异（diff）是纯文本差异，用 `git apply` 应用。"
+                .to_owned(),
+            input: default_output,
+            placeholder: "补丁输出路径".to_owned(),
+            input2: String::new(),
+            placeholder2: "区间起点（如 origin/main）".to_owned(),
+            show_input2: false,
+            modes: vec![
+                format!("提交补丁（{short}）"),
+                "区间差异".to_owned(),
+                "工作区差异".to_owned(),
+            ],
+            mode: 0,
+            danger: false,
+        }
+    }
+
+    /// 拣选对话框（FR-MRG-04）。
+    ///
+    /// 输入框里预填所选提交，但**允许修改**：`git cherry-pick` 本身就接受
+    /// `A^..B` 这样的区间，用户想拣选一串提交时不必去终端。
+    fn cherry_pick(commit: String, short: &str) -> Self {
+        Self {
+            kind: 7,
+            commit: Some(commit),
+            title: "拣选提交".to_owned(),
+            hint: "把该提交的改动复制到当前分支（生成新提交）。输入框可填单个提交，\
+                   也可填区间（如 `A^..B`）。冲突时可继续或中止。"
+                .to_owned(),
+            input: short.to_owned(),
+            placeholder: "要拣选的提交或区间".to_owned(),
+            input2: String::new(),
+            placeholder2: String::new(),
+            show_input2: false,
+            modes: vec!["不追加来源行".to_owned(), "追加来源行（-x）".to_owned()],
+            mode: 0,
+            danger: false,
+        }
+    }
+
+    /// 应用补丁对话框。
+    fn apply_patch() -> Self {
+        Self {
+            kind: 5,
+            commit: None,
+            title: "应用补丁".to_owned(),
+            hint: "三方合并（--3way）在上下文不匹配时会用 blob 信息尝试合并，冲突进入三路编辑器。"
+                .to_owned(),
+            input: String::new(),
+            placeholder: "补丁文件路径".to_owned(),
+            input2: String::new(),
+            placeholder2: String::new(),
+            show_input2: false,
+            modes: vec!["普通应用".to_owned(), "三方合并（--3way）".to_owned()],
+            mode: 0,
+            danger: false,
+        }
+    }
+
+    /// 新建标签对话框。
+    fn tag(commit: String) -> Self {
+        Self {
+            kind: 6,
+            commit: Some(commit),
+            title: "新建标签".to_owned(),
+            hint: "附注消息留空即创建轻量标签；填写则会创建附注标签（含创建者与日期）。".to_owned(),
+            input: String::new(),
+            placeholder: "标签名，例如 v1.0.0".to_owned(),
+            input2: String::new(),
+            placeholder2: "附注消息（可留空）".to_owned(),
+            show_input2: true,
+            modes: Vec::new(),
+            mode: 0,
+            danger: false,
+        }
+    }
+}
+
+/// 两提交比较 / 快照浏览的状态（FR-LOG-08）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CompareState {
+    /// 遮罩标题。
+    title: String,
+    /// 旧侧（[`None`] 表示空树）。
+    old: Option<String>,
+    /// 新侧。
+    new: String,
+    /// 是否为只读浏览（禁止任何写操作）。
+    browse: bool,
+    /// 文件清单。
+    files: Vec<gt_core::FileChange>,
+    /// 当前选中项。
+    selected: Option<usize>,
+}
+
+/// 把"进行中的操作状态"翻译成一条中止请求。
+///
+/// 三种族的恢复入口不同：变基走 `rebase --abort`，拣选/回滚走 `--abort`，
+/// 合并走 `merge --abort`。把它们收在一处，界面上的"中止"按钮就只有一条路径。
+fn abort_request(state: RepoState) -> WriteRequest {
+    match state {
+        RepoState::RebaseMerge | RepoState::RebaseApply => {
+            WriteRequest::RebaseControl(RebaseControl::Abort)
+        }
+        RepoState::Merge => WriteRequest::AbortMerge,
+        other => WriteRequest::ContinueState {
+            state: other,
+            abort: true,
+        },
+    }
+}
+
+/// 把"进行中的操作状态"翻译成一条继续请求。
+fn continue_request(state: RepoState) -> WriteRequest {
+    match state {
+        RepoState::RebaseMerge | RepoState::RebaseApply => {
+            WriteRequest::RebaseControl(RebaseControl::Continue)
+        }
+        other => WriteRequest::ContinueState {
+            state: other,
+            abort: false,
+        },
     }
 }
 
@@ -161,6 +490,16 @@ struct Dirty {
     diff: bool,
     console: bool,
     commit: bool,
+    remotes: bool,
+    push: bool,
+    network: bool,
+    // ---- M4 ----
+    ctx: bool,
+    op: bool,
+    iplan: bool,
+    cfl: bool,
+    stash: bool,
+    compare: bool,
 }
 
 impl Dirty {
@@ -174,6 +513,15 @@ impl Dirty {
             diff: true,
             console: true,
             commit: true,
+            remotes: true,
+            push: true,
+            network: true,
+            ctx: true,
+            op: true,
+            iplan: true,
+            cfl: true,
+            stash: true,
+            compare: true,
         }
     }
 }
@@ -238,10 +586,71 @@ pub struct Session {
     branch_input: String,
     selected_ref: Option<usize>,
 
+    // ---- 远端（FR-RMT）----
+    remotes: Vec<RemoteInfo>,
+    remote_listing: Option<RemoteListing>,
+    remotes_open: bool,
+    selected_remote: Option<usize>,
+    remote_name_input: String,
+    remote_url_input: String,
+    remote_help: String,
+    token_input: String,
+    /// 更新策略下标：0 合并 / 1 变基 / 2 仅快进（与设置项共享）。
+    pull_strategy: i32,
+    /// 受保护分支正则（来自设置，用于推送拦截与预览提示）。
+    protected_patterns: Vec<String>,
+    /// 已把 token 存入密钥链的主机（来自配置，仅用于展示）。
+    stored_hosts: Vec<String>,
+
+    // ---- 推送预览（FR-RMT-03）----
+    push_open: bool,
+    push_preview: Option<gt_backend::PushPreview>,
+    push_force: bool,
+    push_set_upstream: bool,
+    push_summary: String,
+    push_hint: String,
+    push_rows: Vec<crate::generated::PushRow>,
+    /// 已请求预览、等结果到达后自动弹窗。
+    awaiting_preview: bool,
+
+    // ---- 网络状态 ----
+    network: NetworkSnapshot,
+    network_failure: Option<NetworkFailure>,
+    /// 待应用层消费的配置事件。
+    config_events: Vec<ConfigEvent>,
+
     // ---- 交互 ----
     confirm: Option<Confirm>,
     toast: Option<(String, u8)>,
     pending_write: Option<PendingWrite>,
+
+    // ---- M4：高级操作（FR-MRG / FR-CFL / FR-STH / FR-PTC / FR-LOG-08）----
+    /// 上下文菜单目标与展开位置。
+    ctx: Option<CtxTarget>,
+    ctx_pos: (f32, f32),
+    /// 通用操作对话框。
+    op: Option<OpDialog>,
+    /// 交互式变基计划与其编辑态。
+    plan: Option<RebasePlan>,
+    plan_selected: Option<usize>,
+    plan_message: String,
+    /// 冲突文件清单与三路编辑器的状态。
+    conflicts: Vec<ConflictedEntry>,
+    conflict_selected: Option<usize>,
+    conflict_file: Option<gt_diff::ConflictFile>,
+    conflict_resolutions: Vec<Option<gt_diff::Resolution>>,
+    conflict_block: Option<usize>,
+    conflict_manual: String,
+    /// 贮藏。
+    stashes: Vec<StashEntry>,
+    stash_message: String,
+    stash_untracked: bool,
+    /// 比较 / 快照浏览。
+    compare: Option<CompareState>,
+    /// 变基进度（来自概览）。
+    rebase: Option<RebaseProgress>,
+    /// 高级操作忙碌标签（来自仓库句柄）。
+    advanced_label: Option<String>,
 
     // ---- 在飞标记（避免重复投递同一请求）----
     overview_in_flight: bool,
@@ -300,9 +709,49 @@ impl Session {
             commit_reset_author: false,
             branch_input: String::new(),
             selected_ref: None,
+            remotes: Vec::new(),
+            remote_listing: None,
+            remotes_open: false,
+            selected_remote: None,
+            remote_name_input: String::new(),
+            remote_url_input: String::new(),
+            remote_help: String::new(),
+            token_input: String::new(),
+            pull_strategy: 0,
+            protected_patterns: Vec::new(),
+            stored_hosts: Vec::new(),
+            push_open: false,
+            push_preview: None,
+            push_force: false,
+            push_set_upstream: false,
+            push_summary: String::new(),
+            push_hint: String::new(),
+            push_rows: Vec::new(),
+            awaiting_preview: false,
+            network: NetworkSnapshot::default(),
+            network_failure: None,
+            config_events: Vec::new(),
             confirm: None,
             toast: None,
             pending_write: None,
+            ctx: None,
+            ctx_pos: (0.0, 0.0),
+            op: None,
+            plan: None,
+            plan_selected: None,
+            plan_message: String::new(),
+            conflicts: Vec::new(),
+            conflict_selected: None,
+            conflict_file: None,
+            conflict_resolutions: Vec::new(),
+            conflict_block: None,
+            conflict_manual: String::new(),
+            stashes: Vec::new(),
+            stash_message: String::new(),
+            stash_untracked: false,
+            compare: None,
+            rebase: None,
+            advanced_label: None,
             overview_in_flight: false,
             status_in_flight: false,
             log_in_flight: false,
@@ -385,11 +834,30 @@ impl Session {
                 changed = true;
             }
         }
+        // 网络进度以 git 的 stderr 为准，可能在两帧之间变化几十次：
+        // 这里只比较快照，不产生额外分配，也不需要工作线程通知。
+        // 高级操作的忙碌状态同样来自句柄（工作线程持有），按帧比较即可。
+        let advanced = self.handle.advanced_label();
+        if advanced != self.advanced_label {
+            self.advanced_label = advanced;
+            self.dirty.header = true;
+            changed = true;
+        }
+        let snapshot = self.handle.network_snapshot();
+        if snapshot != self.network {
+            self.network = snapshot;
+            self.dirty.network = true;
+            changed = true;
+        }
         changed |= self.maybe_prefetch();
         changed
     }
 
     /// 把当前会话状态写进窗口。
+    ///
+    /// 长度来自"按脏标记逐面板写回"这一张平铺的对照表：拆开会让
+    /// "哪些状态在什么时候写回"变得难以一眼核对（同 `execute_network` 的取舍）。
+    #[allow(clippy::too_many_lines)]
     pub fn apply_to(&mut self, window: &MainWindow) {
         let dirty = std::mem::take(&mut self.dirty);
         window.set_has_repo(true);
@@ -411,7 +879,13 @@ impl Session {
                 window.set_branch_text("—".into());
                 window.set_head_text("—".into());
             }
-            match state_banner(self.state) {
+            // 变基时优先展示"第 x/y 个提交"：只显示"变基进行中"会让用户
+            // 不知道还剩多少（FR-MRG-02 的验收口径）。
+            let banner = match (&self.rebase, state_banner(self.state)) {
+                (Some(progress), _) => Some(progress.label()),
+                (None, text) => text,
+            };
+            match banner {
                 Some(text) => {
                     window.set_state_text(text.into());
                     window.set_state_banner_visible(true);
@@ -491,6 +965,42 @@ impl Session {
             self.apply_commit_panel(window);
         }
 
+        if dirty.remotes {
+            self.apply_remote_panel(window);
+        }
+
+        if dirty.push {
+            self.apply_push_panel(window);
+        }
+
+        if dirty.network {
+            self.apply_network_strip(window);
+        }
+
+        // ---- M4 ----
+        if dirty.ctx {
+            self.apply_ctx_menu(window);
+        }
+        if dirty.op {
+            self.apply_op_dialog(window);
+        }
+        if dirty.iplan {
+            self.apply_rebase_plan(window);
+        }
+        if dirty.cfl {
+            self.apply_conflict_editor(window);
+        }
+        if dirty.stash {
+            self.apply_stash_panel(window);
+        }
+        if dirty.compare {
+            self.apply_compare_panel(window);
+        }
+        // 变基进度 / 高级操作忙碌标签随时可能变化，跟随头部一起刷新。
+        if dirty.header {
+            self.apply_advanced_header(window);
+        }
+
         self.apply_overlays(window);
     }
 
@@ -522,6 +1032,72 @@ impl Session {
         window.set_commit_message(self.commit_message.clone().into());
         window.set_commit_amend(self.commit_amend);
         window.set_commit_reset_author(self.commit_reset_author);
+    }
+
+    /// 写远端管理遮罩（列表 / 输入框 / 策略 / 凭据说明）。
+    fn apply_remote_panel(&self, window: &MainWindow) {
+        window.set_remotes_visible(self.remotes_open);
+        window.set_remote_rows(rc_model(build_remote_rows(
+            &self.remotes,
+            self.selected_remote,
+        )));
+        let names: Vec<slint::SharedString> = self
+            .remotes
+            .iter()
+            .map(|remote| slint::SharedString::from(remote.name.as_str()))
+            .collect();
+        window.set_remote_names(rc_model(names));
+        window.set_remote_current(self.default_remote().unwrap_or_default().into());
+        window.set_remote_selected(
+            self.selected_remote
+                .and_then(|index| i32::try_from(index).ok())
+                .unwrap_or(-1),
+        );
+        window.set_remote_name_input(self.remote_name_input.clone().into());
+        window.set_remote_url_input(self.remote_url_input.clone().into());
+        window.set_remote_help(self.remote_help.clone().into());
+        window.set_token_input(self.token_input.clone().into());
+        window.set_token_host(self.target_host().unwrap_or_default().into());
+        window.set_pull_strategy(self.pull_strategy);
+        window.set_keyring_available(
+            self.remote_listing
+                .as_ref()
+                .is_none_or(|listing| listing.keyring_available),
+        );
+    }
+
+    /// 写推送预览遮罩。
+    fn apply_push_panel(&self, window: &MainWindow) {
+        window.set_push_visible(self.push_open);
+        window.set_push_rows(rc_model(self.push_rows.clone()));
+        window.set_push_summary(self.push_summary.clone().into());
+        window.set_push_hint(self.push_hint.clone().into());
+        window.set_push_force(self.push_force);
+        window.set_push_set_upstream(self.push_set_upstream);
+        window.set_push_creates_branch(
+            self.push_preview
+                .as_ref()
+                .is_some_and(|preview| preview.creates_branch),
+        );
+        window.set_push_protected(
+            self.push_preview
+                .as_ref()
+                .is_some_and(|preview| preview.protection.is_some()),
+        );
+    }
+
+    /// 写网络进度条与失败提示。
+    fn apply_network_strip(&self, window: &MainWindow) {
+        window.set_network_busy(self.network.busy);
+        window.set_network_label(self.network.label.clone().into());
+        window.set_network_progress(self.network.line.clone().into());
+        match self.network_failure.as_ref() {
+            Some(failure) => {
+                window.set_network_error_visible(true);
+                window.set_network_error(network_error_text(failure).into());
+            }
+            None => window.set_network_error_visible(false),
+        }
     }
 
     /// 写确认遮罩、提示条与加载指示。
@@ -1049,6 +1625,24 @@ impl Session {
             .map(|entry| entry.name)
     }
 
+    /// 删除侧栏里选中的标签（FR-BR-03）。
+    ///
+    /// 只删本地标签：`git tag -d` 不动远端，推送/删除远端标签属于网络操作，
+    /// 需要单独的远端交互（M5 评估）。
+    pub fn delete_selected_tag(&mut self) {
+        let Some(entry) = self
+            .selected_ref_entry()
+            .filter(|entry| entry.kind == gt_core::RefKind::Tag)
+        else {
+            self.show_toast("请先在侧栏选中一个标签");
+            return;
+        };
+        self.submit_write(
+            WriteRequest::Tag(TagOp::Delete { name: entry.name }),
+            PendingWrite::Other,
+        );
+    }
+
     // ---------------------------------------------------------------- 搜索
 
     /// 设置搜索关键字。
@@ -1122,6 +1716,503 @@ impl Session {
         self.request_overview();
     }
 
+    // ---------------------------------------------------------------- 远端
+
+    /// 应用远端相关设置（更新策略 / 受保护分支 / 已保存 token 的主机）。
+    ///
+    /// 只在值真的变化时标脏：这些值来自共享配置，每次轮询都会被对齐一次。
+    pub fn set_remote_preferences(
+        &mut self,
+        strategy: PullStrategy,
+        patterns: Vec<String>,
+        stored_hosts: Vec<String>,
+    ) {
+        let index = strategy_index(strategy);
+        if self.pull_strategy == index
+            && self.protected_patterns == patterns
+            && self.stored_hosts == stored_hosts
+        {
+            return;
+        }
+        self.pull_strategy = index;
+        self.protected_patterns = patterns;
+        self.stored_hosts = stored_hosts;
+        self.dirty.remotes = true;
+    }
+
+    /// 当前的更新策略。
+    #[must_use]
+    pub fn pull_strategy(&self) -> PullStrategy {
+        strategy_from_index(self.pull_strategy)
+    }
+
+    /// 界面选中的推送/更新目标远端。
+    ///
+    /// 顺序：用户显式选中的 → `origin` → 第一个远端。空仓库无远端时返回 [`None`]，
+    /// 界面据此提示"先添加远端"而不是让按钮点了没反应。
+    #[must_use]
+    pub fn default_remote(&self) -> Option<String> {
+        if let Some(name) = self
+            .selected_remote
+            .and_then(|index| self.remotes.get(index))
+            .map(|remote| remote.name.clone())
+        {
+            return Some(name);
+        }
+        if let Some(origin) = self.remotes.iter().find(|remote| remote.name == "origin") {
+            return Some(origin.name.clone());
+        }
+        self.remotes.first().map(|remote| remote.name.clone())
+    }
+
+    /// 打开远端管理遮罩并拉取列表。
+    pub fn open_remotes(&mut self) {
+        self.remotes_open = true;
+        self.dirty.remotes = true;
+        self.request_remotes();
+    }
+
+    /// 关闭远端管理遮罩。
+    pub fn close_remotes(&mut self) {
+        self.remotes_open = false;
+        self.dirty.remotes = true;
+    }
+
+    /// 请求远端列表（只读，只读模式下也可用）。
+    pub fn request_remotes(&mut self) {
+        self.submit_network(NetworkRequest::Remotes, false);
+    }
+
+    /// 首屏静默拉取远端列表（不弹"正在读取远端…"）。
+    ///
+    /// 首屏已经在同时发三个读请求，再弹一条提示只会让用户以为出了问题；
+    /// 拉不到列表也不影响任何主流程（远端名在工具栏留空）。
+    pub fn prime_remotes(&mut self) {
+        self.submit_network(NetworkRequest::Remotes, true);
+    }
+
+    /// 选中一个远端，并把它的信息回填到输入框。
+    pub fn select_remote(&mut self, index: usize) {
+        let Some(remote) = self.remotes.get(index).cloned() else {
+            return;
+        };
+        self.selected_remote = Some(index);
+        self.remote_name_input.clone_from(&remote.name);
+        remote.display_url().clone_into(&mut self.remote_url_input);
+        self.token_input.clear();
+        self.dirty.remotes = true;
+    }
+
+    /// 编辑远端名输入框。
+    pub fn set_remote_name(&mut self, text: &str) {
+        text.clone_into(&mut self.remote_name_input);
+        self.dirty.remotes = true;
+    }
+
+    /// 编辑远端地址输入框。
+    pub fn set_remote_url(&mut self, text: &str) {
+        text.clone_into(&mut self.remote_url_input);
+        self.dirty.remotes = true;
+    }
+
+    /// 编辑 token 输入框。
+    pub fn set_token_input(&mut self, text: &str) {
+        text.clone_into(&mut self.token_input);
+        self.dirty.remotes = true;
+    }
+
+    /// 新增远端（FR-RMT-01）。
+    pub fn add_remote(&mut self) {
+        let name = self.remote_name_input.trim().to_owned();
+        let url = self.remote_url_input.trim().to_owned();
+        if name.is_empty() || url.is_empty() {
+            self.show_toast("请填写远端名称与地址");
+            return;
+        }
+        self.submit_network(
+            NetworkRequest::EditRemote(RemoteEdit::Add { name, url }),
+            false,
+        );
+    }
+
+    /// 删除选中的远端。
+    pub fn remove_remote(&mut self) {
+        let Some(name) = self.selected_remote_name() else {
+            self.show_toast("请先选择一个远端");
+            return;
+        };
+        self.submit_network(
+            NetworkRequest::EditRemote(RemoteEdit::Remove { name }),
+            false,
+        );
+    }
+
+    /// 把选中的远端的地址改成输入框里的值。
+    pub fn set_remote_url_from_input(&mut self) {
+        let Some(name) = self.selected_remote_name() else {
+            self.show_toast("请先选择一个远端");
+            return;
+        };
+        let url = self.remote_url_input.trim().to_owned();
+        if url.is_empty() {
+            self.show_toast("地址不能为空");
+            return;
+        }
+        self.submit_network(
+            NetworkRequest::EditRemote(RemoteEdit::SetUrl {
+                name,
+                url,
+                push: false,
+            }),
+            false,
+        );
+    }
+
+    /// 把输入框里的 token 存进系统密钥链（FR-RMT-04）。
+    pub fn save_token(&mut self) {
+        let Some(host) = self.target_host() else {
+            self.show_toast("当前远端不是 HTTPS 地址，无法保存 token");
+            return;
+        };
+        let secret = self.token_input.trim().to_owned();
+        if secret.is_empty() {
+            self.show_toast("请先填写 token");
+            return;
+        }
+        let username = self.selected_remote_username();
+        self.submit_network(
+            NetworkRequest::SaveToken {
+                host,
+                username,
+                secret,
+            },
+            false,
+        );
+        self.token_input.clear();
+        self.dirty.remotes = true;
+    }
+
+    /// 删除当前主机保存的 token。
+    pub fn forget_token(&mut self) {
+        let Some(host) = self.target_host() else {
+            self.show_toast("当前远端不是 HTTPS 地址，没有可删除的 token");
+            return;
+        };
+        self.submit_network(NetworkRequest::ForgetToken { host }, false);
+    }
+
+    /// 获取更新：`all` 为真时拉取全部远端。
+    pub fn request_fetch(&mut self, all: bool) {
+        let remote = if all {
+            None
+        } else {
+            let Some(remote) = self.default_remote() else {
+                self.show_toast("该仓库没有配置远端，请先在「远端」里添加");
+                return;
+            };
+            Some(remote)
+        };
+        self.submit_network(
+            NetworkRequest::Fetch(FetchRequest {
+                remote,
+                // 默认清理远端已删除的跟踪分支（与 IDEA 的 Update 行为一致）。
+                prune: true,
+                tags: false,
+            }),
+            false,
+        );
+    }
+
+    /// 拉取并整合（FR-RMT-02）。
+    pub fn request_update(&mut self) {
+        let Some(remote) = self.default_remote() else {
+            self.show_toast("该仓库没有配置远端，请先在「远端」里添加");
+            return;
+        };
+        let branch = self.head.as_ref().and_then(|head| head.branch.clone());
+        self.submit_network(
+            NetworkRequest::Pull(PullRequest {
+                remote,
+                branch,
+                strategy: self.pull_strategy(),
+            }),
+            false,
+        );
+    }
+
+    /// 请求推送预览（先看再推，FR-RMT-03）。
+    pub fn request_push(&mut self) {
+        let Some(remote) = self.default_remote() else {
+            self.show_toast("该仓库没有配置远端，请先在「远端」里添加");
+            return;
+        };
+        let branch = self.head.as_ref().and_then(|head| head.branch.clone());
+        self.awaiting_preview = true;
+        self.submit_network(
+            NetworkRequest::Preview(PushPreviewRequest {
+                remote,
+                branch,
+                protected_patterns: self.protected_patterns.clone(),
+            }),
+            false,
+        );
+    }
+
+    /// 关闭推送预览。
+    pub fn push_cancel(&mut self) {
+        self.push_open = false;
+        self.awaiting_preview = false;
+        self.dirty.push = true;
+    }
+
+    /// 切换强制推送选项。
+    pub fn toggle_push_force(&mut self, on: bool) {
+        self.push_force = on;
+        self.refresh_push_hint();
+        self.dirty.push = true;
+    }
+
+    /// 切换"设置上游"。
+    pub fn toggle_push_upstream(&mut self, on: bool) {
+        self.push_set_upstream = on;
+        self.dirty.push = true;
+    }
+
+    /// 切换更新策略（0 合并 / 1 变基 / 2 仅快进）。
+    pub fn set_pull_strategy(&mut self, index: i32) {
+        self.pull_strategy = index.clamp(0, 2);
+        self.dirty.remotes = true;
+    }
+
+    /// 确认推送（强制推送先走二次确认）。
+    pub fn push_confirm(&mut self) {
+        let Some(preview) = self.push_preview.clone() else {
+            return;
+        };
+        // 受保护分支即使勾了强制也不允许（FR-RMT-03），这里再拦一次。
+        let force = self.push_force && preview.protection.is_none();
+        if preview.is_empty() && !force {
+            self.show_toast("没有需要推送的提交");
+            return;
+        }
+        if force {
+            self.push_open = false;
+            self.dirty.push = true;
+            self.confirm = Some(Confirm::ForcePush {
+                remote: preview.remote.clone(),
+                branch: preview.remote_branch.clone(),
+                commits: preview.ahead.max(preview.commits.len()),
+            });
+            return;
+        }
+        self.submit_push(&preview, false);
+    }
+
+    /// 取消正在进行的网络操作（FR-RMT-05）。
+    pub fn cancel_network(&mut self) {
+        if self.handle.cancel_network() {
+            self.show_toast("已请求取消，正在终止 git 子进程…");
+        } else {
+            self.show_toast("当前没有进行中的网络操作");
+        }
+        self.dirty.network = true;
+    }
+
+    /// 关闭远端失败提示条。
+    pub fn dismiss_network_error(&mut self) {
+        self.network_failure = None;
+        self.dirty.network = true;
+    }
+
+    /// 取走待写回配置的事件。
+    pub fn take_config_events(&mut self) -> Vec<ConfigEvent> {
+        std::mem::take(&mut self.config_events)
+    }
+
+    /// 最近一次网络失败（供测试与状态栏使用）。
+    #[must_use]
+    pub fn network_failure(&self) -> Option<&NetworkFailure> {
+        self.network_failure.as_ref()
+    }
+
+    /// 推送预览（供测试与状态栏使用）。
+    #[must_use]
+    pub fn push_preview(&self) -> Option<&gt_backend::PushPreview> {
+        self.push_preview.as_ref()
+    }
+
+    fn selected_remote_name(&self) -> Option<String> {
+        self.selected_remote
+            .and_then(|index| self.remotes.get(index))
+            .map(|remote| remote.name.clone())
+    }
+
+    /// 凭据操作的目标远端：优先用户显式选中的，其次默认远端。
+    ///
+    /// 不能让"没点过列表"就导致 token 按钮全灰：只有单一远端的仓库是最常见的
+    /// 情形，那时默认远端就是用户心里的那个。
+    fn target_remote(&self) -> Option<&RemoteInfo> {
+        if let Some(remote) = self
+            .selected_remote
+            .and_then(|index| self.remotes.get(index))
+        {
+            return Some(remote);
+        }
+        let name = self.default_remote()?;
+        self.remotes.iter().find(|remote| remote.name == name)
+    }
+
+    /// 当前目标的 HTTPS 主机名（用于密钥链存取）。
+    fn target_host(&self) -> Option<String> {
+        gt_backend::host_of(self.target_remote()?.display_url())
+    }
+
+    /// 从 URL 的 userinfo 段取用户名（为空时由服务层补占位符）。
+    fn selected_remote_username(&self) -> String {
+        let Some(url) = self.target_remote().map(RemoteInfo::display_url) else {
+            return String::new();
+        };
+        let Some((_, rest)) = url.split_once("://") else {
+            return String::new();
+        };
+        let authority = rest.split('/').next().unwrap_or(rest);
+        let Some((userinfo, _)) = authority.rsplit_once('@') else {
+            return String::new();
+        };
+        let user = userinfo.split(':').next().unwrap_or_default();
+        if user == "***" {
+            // URL 里的口令被脱敏后用户名可能整体变成 `***`：此时不猜。
+            String::new()
+        } else {
+            user.to_owned()
+        }
+    }
+
+    /// 投递一次推送。
+    fn submit_push(&mut self, preview: &gt_backend::PushPreview, force: bool) {
+        self.push_open = false;
+        self.dirty.push = true;
+        self.submit_network(
+            NetworkRequest::Push {
+                request: PushRequest {
+                    remote: preview.remote.clone(),
+                    targets: vec![PushTarget {
+                        local_branch: preview.local_branch.clone(),
+                        remote_branch: preview.remote_branch.clone(),
+                    }],
+                    force_with_lease: force,
+                    set_upstream: self.push_set_upstream,
+                    tags: false,
+                },
+                protected_patterns: self.protected_patterns.clone(),
+            },
+            false,
+        );
+    }
+
+    /// 投递一次网络请求。
+    ///
+    /// `silent` 为真时不弹"正在…"提示：用于首屏的静默预取。
+    fn submit_network(&mut self, request: NetworkRequest, silent: bool) {
+        let label = request.label();
+        match self.service.request(
+            self.handle.id(),
+            RequestKind::Network(Box::new(request)),
+            self.sender.clone(),
+        ) {
+            Ok(_) => {
+                self.network = self.handle.network_snapshot();
+                self.dirty.network = true;
+                if !silent {
+                    self.show_toast(format!("正在{label}…"));
+                }
+            }
+            Err(err) => {
+                // 预览请求失败时不能把 awaiting 留在真：否则下次用户点 Push
+                // 会莫名其妙弹出一个旧预览。
+                self.awaiting_preview = false;
+                self.show_toast(err.to_string());
+            }
+        }
+    }
+
+    /// 重算推送提示行（选项变化时）。
+    fn refresh_push_hint(&mut self) {
+        self.push_hint = self
+            .push_preview
+            .as_ref()
+            .map_or_else(String::new, |preview| push_hints(preview, self.push_force));
+    }
+
+    /// 应用一次网络结果。
+    fn apply_network(&mut self, outcome: NetworkOutcome) -> bool {
+        self.network = self.handle.network_snapshot();
+        self.dirty.network = true;
+        match outcome {
+            NetworkOutcome::Remotes(listing) => {
+                self.remotes.clone_from(&listing.remotes);
+                if self
+                    .selected_remote
+                    .is_some_and(|index| index >= self.remotes.len())
+                {
+                    self.selected_remote = None;
+                }
+                self.remote_help = credential_help(&listing, &self.stored_hosts);
+                self.remote_listing = Some(*listing);
+                self.dirty.remotes = true;
+                true
+            }
+            NetworkOutcome::Preview(preview) => {
+                self.push_summary = push_preview_text(&preview);
+                self.push_rows = build_push_rows(&preview, now_unix());
+                // 已有上游时默认不勾"设置上游"；新分支默认勾上（否则下次推送
+                // 仍然没有跟踪关系，ahead/behind 永远是 0）。
+                self.push_set_upstream = preview.upstream.is_none();
+                self.push_preview = Some(*preview);
+                self.refresh_push_hint();
+                if self.awaiting_preview {
+                    self.awaiting_preview = false;
+                    self.push_open = true;
+                }
+                self.dirty.push = true;
+                true
+            }
+            NetworkOutcome::Done(result) => {
+                self.network_failure = None;
+                self.show_toast(result.summary.clone());
+                // 引用可能已变：整体刷新（概览 / 状态 / 日志）。
+                self.refresh();
+                true
+            }
+            NetworkOutcome::Token(token) => {
+                self.show_toast(token.message.clone());
+                self.config_events.push(if token.saved {
+                    ConfigEvent::TokenSaved(token.host.clone())
+                } else {
+                    ConfigEvent::TokenForgotten(token.host.clone())
+                });
+                self.request_remotes();
+                true
+            }
+            NetworkOutcome::Failed(failure) => {
+                self.awaiting_preview = false;
+                self.push_open = false;
+                self.show_toast(
+                    failure
+                        .summary
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+                self.network_failure = Some(*failure);
+                self.dirty.network = true;
+                self.dirty.push = true;
+                true
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- 确认
 
     /// 确认当前待确认操作。
@@ -1156,6 +2247,19 @@ impl Session {
             }
             Confirm::CheckoutDetached { revision } => {
                 WriteRequest::Branch(gt_backend::BranchOp::CheckoutDetached { revision })
+            }
+            Confirm::Reset { target, mode } => WriteRequest::Reset(ResetRequest { target, mode }),
+            Confirm::TakeSide { path, stage } => WriteRequest::TakeSide { path, stage },
+            Confirm::StashDrop { index, .. } => WriteRequest::Stash(StashOp::Drop { index }),
+            Confirm::RebaseSkip => WriteRequest::RebaseControl(RebaseControl::Skip),
+            Confirm::AbortInProgress { state } => abort_request(state),
+            Confirm::ForcePush { .. } => {
+                // 强制推送是网络操作，不走写通道。
+                if let Some(preview) = self.push_preview.clone() {
+                    self.push_force = true;
+                    self.submit_push(&preview, true);
+                }
+                return;
             }
         };
         self.submit_write(request, PendingWrite::Other);
@@ -1372,6 +2476,10 @@ impl Session {
     }
 
     /// 合并一条结果；返回是否改变了视图状态。
+    ///
+    /// 这是一个按 `Outcome` 平铺的分派表，长度即"结果类型有多少种"。
+    /// 拆成多函数只会把"每种结果由谁消费"藏进调用链里。
+    #[allow(clippy::too_many_lines)]
     fn apply(&mut self, delivery: Delivery) -> bool {
         let lane = delivery.kind.lane();
         match delivery.outcome {
@@ -1382,6 +2490,7 @@ impl Session {
                 self.state = overview.state;
                 self.user_email.clone_from(&overview.user_email);
                 self.read_only.clone_from(&overview.read_only);
+                self.rebase.clone_from(&overview.rebase);
                 self.dirty.header = true;
                 self.dirty.refs = true;
                 self.dirty.commit = true;
@@ -1413,7 +2522,13 @@ impl Session {
             }
             Outcome::TreeChanges(changes) => {
                 self.diff_in_flight = false;
-                let _ = changes;
+                // 这里的 TreeChanges 只服务"两提交比较 / 快照浏览"（FR-LOG-08）：
+                // 若当前没有比较视图在等结果，就当作无人认领的响应丢弃。
+                if let Some(compare) = self.compare.as_mut() {
+                    compare.files = changes;
+                    compare.selected = None;
+                    self.dirty.compare = true;
+                }
                 true
             }
             Outcome::FileDiff(diff) => {
@@ -1452,6 +2567,75 @@ impl Session {
                 }
                 // 写后统一刷新：状态、概览、日志都重新取一次。
                 self.refresh();
+                true
+            }
+            Outcome::Network(outcome) => self.apply_network(*outcome),
+            Outcome::Advanced(result) => {
+                self.write_in_flight = false;
+                self.pending_write = None;
+                self.apply_advanced_result(&result);
+                true
+            }
+            Outcome::Conflicts(entries) => {
+                // 记住当前正在编辑的是哪个文件：刷新后列表可能变短（刚解决掉一个），
+                // 若只按下标沿用，会悄悄把用户切到另一个文件上。
+                let previous = self
+                    .conflict_selected
+                    .and_then(|index| self.conflicts.get(index))
+                    .map(|entry| entry.path.clone());
+                self.conflicts = entries;
+
+                if self.conflicts.is_empty() {
+                    // 冲突全部解决：遮罩自动收起，不再显示已过期的文件内容。
+                    self.conflict_selected = None;
+                    self.conflict_file = None;
+                    self.conflict_resolutions.clear();
+                    self.conflict_block = None;
+                    self.conflict_manual.clear();
+                } else {
+                    let same = previous.as_ref().and_then(|path| {
+                        self.conflicts.iter().position(|entry| entry.path == *path)
+                    });
+                    let index = same.unwrap_or(0);
+                    self.conflict_selected = Some(index);
+                    if same.is_none() {
+                        // 原文件已解决（或首次打开）：载入第一个仍冲突的文件。
+                        self.conflict_file = None;
+                        self.conflict_resolutions.clear();
+                        self.conflict_block = None;
+                    }
+                    let path = self.conflicts[index].path.clone();
+                    self.request_conflict_file(&path);
+                }
+                self.dirty.cfl = true;
+                true
+            }
+            Outcome::ConflictFile(file) => {
+                let mut resolutions = vec![None; file.hunk_count()];
+                // 两侧完全相同的块自动取一侧：这是唯一不会误伤的自动动作，
+                // 也是 IDEA 的默认行为（用户不需要为"双方写成一样"再点一次）。
+                for (index, hunk) in file.hunks().enumerate() {
+                    if hunk.identical_sides() {
+                        resolutions[index] = Some(gt_diff::Resolution::Ours);
+                    }
+                }
+                self.conflict_resolutions = resolutions;
+                self.conflict_block = None;
+                self.conflict_manual.clear();
+                self.conflict_file = Some(*file);
+                self.dirty.cfl = true;
+                true
+            }
+            Outcome::RebasePlan(plan) => {
+                self.plan_selected = None;
+                self.plan_message.clear();
+                self.plan = Some(*plan);
+                self.dirty.iplan = true;
+                true
+            }
+            Outcome::StashList(list) => {
+                self.stashes = list;
+                self.dirty.stash = true;
                 true
             }
             Outcome::Failed(message) => {
@@ -1533,6 +2717,26 @@ impl Session {
     }
 }
 
+/// 更新策略 → 界面下标（0 合并 / 1 变基 / 2 仅快进）。
+#[must_use]
+fn strategy_index(strategy: PullStrategy) -> i32 {
+    match strategy {
+        PullStrategy::Merge => 0,
+        PullStrategy::Rebase => 1,
+        PullStrategy::FastForwardOnly => 2,
+    }
+}
+
+/// 界面下标 → 更新策略。
+#[must_use]
+fn strategy_from_index(index: i32) -> PullStrategy {
+    match index {
+        1 => PullStrategy::Rebase,
+        2 => PullStrategy::FastForwardOnly,
+        _ => PullStrategy::Merge,
+    }
+}
+
 /// 该差异两侧的来源是否支持按块落库。
 ///
 /// - `索引 vs 工作区`：可以暂存 / 丢弃（补丁作用于索引或工作区）；
@@ -1586,6 +2790,931 @@ fn now_unix() -> i64 {
         .map_or(0, |elapsed| {
             i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
         })
+}
+
+// ==================================================================== M4 高级操作
+//
+// 这一段的共同结构：界面回调 → 会话更新状态并标脏 → 投递写请求 →
+// `Outcome::Advanced` 回来时统一提示 + 刷新 + （如有冲突）打开三路编辑器。
+// 所有方法都不做 I/O：读走 `RequestKind`，写走 `WriteRequest`。
+
+impl Session {
+    // ---------------------------------------------------------- 提交上下文菜单
+
+    /// 打开提交上下文菜单（右键）。
+    pub fn open_commit_menu(&mut self, index: usize, x: f32, y: f32) {
+        let Some(node) = self.log.nodes.get(index) else {
+            return;
+        };
+        let is_head = self
+            .head
+            .as_ref()
+            .and_then(|head| head.target)
+            .is_some_and(|target| target == node.id);
+        self.ctx = Some(CtxTarget {
+            id: node.id.to_hex(),
+            short: node.short_id(),
+            index,
+            is_head,
+            parent: node.parents.first().map(ToString::to_string),
+        });
+        self.ctx_pos = (x, y);
+        self.dirty.ctx = true;
+    }
+
+    /// 关闭上下文菜单。
+    pub fn close_commit_menu(&mut self) {
+        if self.ctx.take().is_some() {
+            self.dirty.ctx = true;
+        }
+    }
+
+    /// 执行上下文菜单里的一个动作。
+    pub fn commit_action(&mut self, action: &str) {
+        let Some(ctx) = self.ctx.clone() else {
+            return;
+        };
+        self.ctx = None;
+        self.dirty.ctx = true;
+
+        match action {
+            "merge" => self.open_op(OpDialog::merge(Some(ctx.short))),
+            "rebase" => self.open_op(OpDialog::rebase(Some(ctx.short))),
+            "iplan" => self.start_plan(&ctx),
+            "cherry-pick" => self.open_op(OpDialog::cherry_pick(ctx.id, &ctx.short)),
+            "revert" => self.submit_write(
+                WriteRequest::Revert(RevertRequest {
+                    revs: vec![ctx.id],
+                    no_commit: false,
+                }),
+                PendingWrite::Other,
+            ),
+            "reset" => self.open_op(OpDialog::reset(Some(ctx.short))),
+            "undo" => {
+                self.submit_write(WriteRequest::UndoCommit { id: ctx.id }, PendingWrite::Other);
+            }
+            "patch" => {
+                let output = self.default_patch_path(&ctx);
+                self.open_op(OpDialog::patch(ctx.id, &ctx.short, output));
+            }
+            "apply-patch" => self.open_op(OpDialog::apply_patch()),
+            "tag" => self.open_op(OpDialog::tag(ctx.id)),
+            "compare" => self.open_compare(&ctx, false),
+            "browse" => self.open_compare(&ctx, true),
+            "copy" => self.copy_hash(&ctx),
+            "checkout" => {
+                self.confirm = Some(Confirm::CheckoutDetached { revision: ctx.id });
+            }
+            other => tracing::warn!(action = other, "未知的提交菜单动作"),
+        }
+    }
+
+    /// 默认补丁输出路径：仓库根下 `knotwork-<缩写>.patch`。
+    fn default_patch_path(&self, ctx: &CtxTarget) -> String {
+        let location = self.handle.location();
+        let dir = location
+            .work_dir
+            .clone()
+            .unwrap_or_else(|| location.git_dir.clone());
+        dir.join(format!("knotwork-{}.patch", ctx.short))
+            .display()
+            .to_string()
+    }
+
+    /// 把哈希放进系统剪贴板（FR-LOG-07）。
+    fn copy_hash(&mut self, ctx: &CtxTarget) {
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(ctx.id.clone()))
+        {
+            Ok(()) => self.show_toast(format!("已复制哈希 {}", ctx.short)),
+            Err(err) => self.show_toast(format!("复制失败：{err}（哈希：{}）", ctx.id)),
+        }
+    }
+
+    // ------------------------------------------------------ 比较 / 快照浏览
+
+    /// 打开"两提交比较"或"只读浏览某版本"（FR-LOG-08）。
+    fn open_compare(&mut self, ctx: &CtxTarget, browse: bool) {
+        let (old, new, title) = if browse {
+            // 浏览某个版本 = 看"它相对父提交带来了什么"，并明确标注只读。
+            (
+                ctx.parent.clone(),
+                ctx.id.clone(),
+                format!("浏览版本 {}（{}）", ctx.short, "只读"),
+            )
+        } else {
+            (
+                Some(ctx.id.clone()),
+                "HEAD".to_owned(),
+                format!("{} 与 HEAD 比较", ctx.short),
+            )
+        };
+
+        let request = RequestKind::TreeChanges {
+            old: old.clone(),
+            new: new.clone(),
+        };
+        match self
+            .service
+            .request(self.handle.id(), request, self.sender.clone())
+        {
+            Ok(_) => {
+                self.compare = Some(CompareState {
+                    title,
+                    old,
+                    new,
+                    browse,
+                    files: Vec::new(),
+                    selected: None,
+                });
+                self.dirty.compare = true;
+            }
+            Err(err) => self.show_toast(err.to_string()),
+        }
+    }
+
+    /// 选中比较视图里的一个文件，把它的差异送进 Diff 面板。
+    pub fn compare_select(&mut self, index: usize) {
+        let Some(compare) = self.compare.clone() else {
+            return;
+        };
+        let Some(file) = compare.files.get(index).cloned() else {
+            return;
+        };
+        if let Some(state) = self.compare.as_mut() {
+            state.selected = Some(index);
+        }
+        self.dirty.compare = true;
+
+        self.diff_sides = (
+            compare.old.map_or(DiffSide::Empty, DiffSide::Rev),
+            DiffSide::Rev(compare.new.clone()),
+        );
+        self.diff_path = Some(file.path.clone());
+        self.diff_title = format!("{} · {}", compare.title, file.path);
+        self.diff_staged_view = false;
+        self.diff_in_flight = false;
+        self.request_diff(self.diff_sides.clone(), Some(file.path));
+    }
+
+    /// 关闭比较视图。
+    pub fn compare_close(&mut self) {
+        if self.compare.take().is_some() {
+            self.dirty.compare = true;
+        }
+    }
+
+    // ---------------------------------------------------------- 通用操作对话框
+
+    fn open_op(&mut self, dialog: OpDialog) {
+        self.op = Some(dialog);
+        self.dirty.op = true;
+    }
+
+    /// 设置对话框第一个输入框。
+    pub fn set_op_input(&mut self, text: &str) {
+        if let Some(op) = self.op.as_mut() {
+            text.clone_into(&mut op.input);
+        }
+    }
+
+    /// 设置对话框第二个输入框（区间起点 / 附注消息）。
+    pub fn set_op_input2(&mut self, text: &str) {
+        if let Some(op) = self.op.as_mut() {
+            text.clone_into(&mut op.input2);
+        }
+    }
+
+    /// 切换对话框的模式（策略 / 重置档位 / 补丁语义 / 三方合并）。
+    pub fn set_op_mode(&mut self, mode: i32) {
+        let Some(op) = self.op.as_mut() else {
+            return;
+        };
+        op.mode = mode.clamp(
+            0,
+            i32::try_from(op.modes.len()).unwrap_or(1).saturating_sub(1),
+        );
+        // 每个模式下"危险"与"第二个输入框"的语义不同，集中在这里判定，
+        // 避免界面自己写一套 if。
+        op.danger = match op.kind {
+            3 => op.mode == 2, // 硬重置
+            _ => false,
+        };
+        op.show_input2 = match op.kind {
+            4 => op.mode == 1, // 区间差异需要起点
+            6 => true,         // 标签的附注消息
+            _ => false,
+        };
+        self.dirty.op = true;
+    }
+
+    /// 取消对话框。
+    pub fn op_cancel(&mut self) {
+        if self.op.take().is_some() {
+            self.dirty.op = true;
+        }
+    }
+
+    /// 确认对话框：按 kind + mode 构造具体请求。
+    #[allow(clippy::too_many_lines)]
+    pub fn op_confirm(&mut self) {
+        let Some(op) = self.op.take() else {
+            return;
+        };
+        self.dirty.op = true;
+
+        let input = op.input.trim().to_owned();
+        if input.is_empty() {
+            self.show_toast("请先填写必填项");
+            self.op = Some(op);
+            self.dirty.op = true;
+            return;
+        }
+
+        match op.kind {
+            1 => {
+                let strategy = match op.mode {
+                    1 => MergeStrategy::NoFastForward,
+                    2 => MergeStrategy::FastForwardOnly,
+                    3 => MergeStrategy::Squash,
+                    _ => MergeStrategy::Default,
+                };
+                self.submit_write(
+                    WriteRequest::Merge(MergeRequest {
+                        rev: input,
+                        strategy,
+                        message: None,
+                    }),
+                    PendingWrite::Other,
+                );
+            }
+            2 => {
+                self.submit_write(
+                    WriteRequest::Rebase(RebaseRequest { onto: input }),
+                    PendingWrite::Other,
+                );
+            }
+            3 => {
+                let mode = match op.mode {
+                    1 => ResetMode::Mixed,
+                    2 => ResetMode::Hard,
+                    _ => ResetMode::Soft,
+                };
+                if mode.is_destructive() {
+                    // 硬重置必须先过确认遮罩（D4：强确认，且文案包含三要素）。
+                    self.confirm = Some(Confirm::Reset {
+                        target: input,
+                        mode,
+                    });
+                } else {
+                    self.submit_write(
+                        WriteRequest::Reset(ResetRequest {
+                            target: input,
+                            mode,
+                        }),
+                        PendingWrite::Other,
+                    );
+                }
+            }
+            4 => {
+                let source = match op.mode {
+                    1 => {
+                        if op.input2.trim().is_empty() {
+                            self.show_toast("区间差异需要填写起点");
+                            self.op = Some(op);
+                            self.dirty.op = true;
+                            return;
+                        }
+                        PatchSource::Range {
+                            from: op.input2.trim().to_owned(),
+                            to: op.commit.clone().unwrap_or_else(|| "HEAD".to_owned()),
+                        }
+                    }
+                    2 => PatchSource::Worktree,
+                    _ => PatchSource::Commit {
+                        rev: op.commit.clone().unwrap_or_else(|| "HEAD".to_owned()),
+                    },
+                };
+                self.submit_write(
+                    WriteRequest::CreatePatch {
+                        source,
+                        output: PathBuf::from(input),
+                    },
+                    PendingWrite::Other,
+                );
+            }
+            5 => {
+                self.submit_write(
+                    WriteRequest::ApplyPatch(PatchApplyRequest {
+                        file: PathBuf::from(input),
+                        three_way: op.mode == 1,
+                        reverse: false,
+                    }),
+                    PendingWrite::Other,
+                );
+            }
+            6 => {
+                let message = op.input2.trim();
+                self.submit_write(
+                    WriteRequest::Tag(TagOp::Create {
+                        name: input,
+                        message: (!message.is_empty()).then(|| message.to_owned()),
+                        target: op.commit,
+                    }),
+                    PendingWrite::Other,
+                );
+            }
+            7 => {
+                self.submit_write(
+                    WriteRequest::CherryPick(CherryPickRequest {
+                        revs: vec![input],
+                        record_source: op.mode == 1,
+                        no_commit: false,
+                    }),
+                    PendingWrite::Other,
+                );
+            }
+            other => tracing::warn!(kind = other, "未知的操作对话框类型"),
+        }
+    }
+
+    // ---------------------------------------------------------- 交互式变基
+
+    /// 请求生成变基计划（FR-MRG-03）。
+    fn start_plan(&mut self, ctx: &CtxTarget) {
+        let Some(parent) = ctx.parent.clone() else {
+            self.show_toast("根提交没有父提交，无法从此处开始交互式变基");
+            return;
+        };
+        let request = RequestKind::RebasePlan {
+            onto: parent.clone(),
+            base: parent,
+        };
+        match self
+            .service
+            .request(self.handle.id(), request, self.sender.clone())
+        {
+            Ok(_) => self.show_toast("正在生成变基计划…"),
+            Err(err) => self.show_toast(err.to_string()),
+        }
+    }
+
+    /// 选中计划里的一步（把它的消息装进编辑框）。
+    pub fn iplan_select(&mut self, index: usize) {
+        let Some(plan) = self.plan.as_ref() else {
+            return;
+        };
+        let Some(step) = plan.steps.get(index) else {
+            return;
+        };
+        self.plan_selected = Some(index);
+        self.plan_message = step.message.clone().unwrap_or_default();
+        self.dirty.iplan = true;
+    }
+
+    /// 设置某一步的动作。
+    pub fn iplan_action(&mut self, index: usize, action: i32) {
+        let Some(action) = rebase_action_from_code(action) else {
+            return;
+        };
+        // 第一条不能"压缩/吞并"：它没有可并入的上一条。与其等到确认时报错，
+        // 不如在点下去的瞬间就说明白。
+        if index == 0 && action.is_squash_like() {
+            self.show_toast("第一个提交没有上一条可并入：请改用「保留」或「改写」");
+            return;
+        }
+        let Some(plan) = self.plan.as_mut() else {
+            return;
+        };
+        let Some(step) = plan.steps.get_mut(index) else {
+            return;
+        };
+        step.action = action;
+        if action == RebaseAction::Reword && step.message.is_none() {
+            // 改写消息的默认值就是原消息：用户通常在原文上改几个字，
+            // 让空消息框启动等于强迫用户重写一遍。
+            step.message = Some(step.subject.clone());
+        }
+        if self.plan_selected == Some(index) {
+            self.plan_message = plan
+                .steps
+                .get(index)
+                .and_then(|step| step.message.clone())
+                .unwrap_or_default();
+        }
+        self.dirty.iplan = true;
+    }
+
+    /// 编辑所选步骤的新消息。
+    pub fn iplan_set_message(&mut self, text: &str) {
+        text.clone_into(&mut self.plan_message);
+        if let (Some(plan), Some(index)) = (self.plan.as_mut(), self.plan_selected) {
+            if let Some(step) = plan.steps.get_mut(index) {
+                step.message = Some(text.to_owned());
+            }
+        }
+        self.dirty.iplan = true;
+    }
+
+    /// 执行计划。
+    pub fn iplan_confirm(&mut self) {
+        let Some(plan) = self.plan.clone() else {
+            return;
+        };
+        if let Err(error) = plan.validate() {
+            self.show_toast(error.to_string());
+            return;
+        }
+        self.plan = None;
+        self.plan_selected = None;
+        self.plan_message.clear();
+        self.dirty.iplan = true;
+        self.submit_write(
+            WriteRequest::InteractiveRebase(Box::new(plan)),
+            PendingWrite::Other,
+        );
+    }
+
+    /// 放弃编辑。
+    pub fn iplan_cancel(&mut self) {
+        self.handle.cancel_lane(gt_service::RequestLane::Advanced);
+        self.plan = None;
+        self.plan_selected = None;
+        self.plan_message.clear();
+        self.dirty.iplan = true;
+    }
+
+    // ---------------------------------------------------------- 冲突解决
+
+    /// 请求冲突文件清单（FR-CFL-02）。
+    pub fn request_conflicts(&mut self) {
+        match self.service.request(
+            self.handle.id(),
+            RequestKind::Conflicts,
+            self.sender.clone(),
+        ) {
+            Ok(_) => {}
+            Err(err) => self.show_toast(err.to_string()),
+        }
+    }
+
+    fn request_conflict_file(&mut self, path: &str) {
+        if let Err(err) = self.service.request(
+            self.handle.id(),
+            RequestKind::ConflictFile {
+                path: path.to_owned(),
+            },
+            self.sender.clone(),
+        ) {
+            self.show_toast(err.to_string());
+        }
+    }
+
+    /// 选中一个冲突文件并加载它的冲突块。
+    pub fn cfl_select(&mut self, index: usize) {
+        if index >= self.conflicts.len() {
+            return;
+        }
+        self.conflict_selected = Some(index);
+        self.conflict_file = None;
+        self.conflict_resolutions.clear();
+        self.conflict_block = None;
+        self.conflict_manual.clear();
+        let path = self.conflicts[index].path.clone();
+        self.request_conflict_file(&path);
+        self.dirty.cfl = true;
+    }
+
+    /// 决定某一处冲突的解法。
+    pub fn cfl_resolve(&mut self, block: i32, code: i32) {
+        let Some(resolution) = resolution_from_code(code) else {
+            return;
+        };
+        let Ok(index) = usize::try_from(block) else {
+            return;
+        };
+        if let Some(slot) = self.conflict_resolutions.get_mut(index) {
+            *slot = Some(resolution);
+            self.dirty.cfl = true;
+        }
+    }
+
+    /// 全部冲突块取同一种解法（FR-CFL-03 的"按标记解析"快捷入口）。
+    pub fn cfl_resolve_all(&mut self, code: i32) {
+        let Some(resolution) = resolution_from_code(code) else {
+            return;
+        };
+        for slot in &mut self.conflict_resolutions {
+            *slot = Some(resolution.clone());
+        }
+        self.dirty.cfl = true;
+    }
+
+    /// 选中某处冲突进行手动编辑（把手写框填上当前结果）。
+    pub fn cfl_pick_block(&mut self, block: i32) {
+        let Ok(index) = usize::try_from(block) else {
+            return;
+        };
+        let Some(file) = self.conflict_file.as_ref() else {
+            return;
+        };
+        let Some(hunk) = file.hunks().nth(index) else {
+            return;
+        };
+        let current = match self
+            .conflict_resolutions
+            .get(index)
+            .and_then(Option::as_ref)
+        {
+            Some(gt_diff::Resolution::Ours) | None => hunk.ours.join("\n"),
+            Some(gt_diff::Resolution::Theirs) => hunk.theirs.join("\n"),
+            Some(gt_diff::Resolution::Both) => {
+                format!("{}\n{}", hunk.ours.join("\n"), hunk.theirs.join("\n"))
+            }
+            Some(gt_diff::Resolution::Base) => hunk.base.as_deref().unwrap_or(&[]).join("\n"),
+            Some(gt_diff::Resolution::Manual(lines)) => lines.join("\n"),
+        };
+        self.conflict_block = Some(index);
+        self.conflict_manual = current;
+        self.dirty.cfl = true;
+    }
+
+    /// 编辑手写结果。
+    pub fn cfl_set_manual(&mut self, text: &str) {
+        text.clone_into(&mut self.conflict_manual);
+    }
+
+    /// 把手写结果应用到当前冲突块。
+    pub fn cfl_apply_manual(&mut self) {
+        let Some(block) = self.conflict_block else {
+            self.show_toast("请先在某一处冲突上点「手动编辑」");
+            return;
+        };
+        let lines: Vec<String> = if self.conflict_manual.is_empty() {
+            Vec::new()
+        } else {
+            self.conflict_manual
+                .split('\n')
+                .map(str::to_owned)
+                .collect()
+        };
+        if let Some(slot) = self.conflict_resolutions.get_mut(block) {
+            *slot = Some(gt_diff::Resolution::Manual(lines));
+            self.dirty.cfl = true;
+        }
+    }
+
+    /// 全部冲突块已决定时，写回文件并 `git add`。
+    pub fn cfl_mark_resolved(&mut self) {
+        let Some(file) = self.conflict_file.as_ref() else {
+            self.show_toast("请先选择一个冲突文件");
+            return;
+        };
+        if file.hunk_count() == 0 {
+            // 没有标记就无法重建内容（二进制冲突、`merge.conflictStyle=union`）。
+            // 这时只能整体取一侧，硬写会把文件写坏。
+            self.show_toast("该文件没有冲突标记：请用「整文件取当前分支 / 合入分支」");
+            return;
+        }
+        let undecided = self
+            .conflict_resolutions
+            .iter()
+            .filter(|slot| slot.is_none())
+            .count();
+        if undecided > 0 {
+            self.show_toast(format!("还有 {undecided} 处冲突未决定"));
+            return;
+        }
+        let resolutions: Vec<gt_diff::Resolution> = self
+            .conflict_resolutions
+            .iter()
+            .filter_map(Clone::clone)
+            .collect();
+        let content = match file.solve(&resolutions) {
+            Ok(content) => content,
+            Err(error) => {
+                self.show_toast(error.to_string());
+                return;
+            }
+        };
+        let path = file.path.clone();
+        self.submit_write(
+            WriteRequest::ResolveConflict {
+                path,
+                content: content.into_bytes(),
+            },
+            PendingWrite::Other,
+        );
+    }
+
+    /// 整文件用某一侧解决（stage 2 = 当前分支，3 = 合入分支）。
+    pub fn cfl_take_side(&mut self, stage: u8) {
+        let Some(index) = self.conflict_selected else {
+            return;
+        };
+        let Some(entry) = self.conflicts.get(index) else {
+            return;
+        };
+        self.confirm = Some(Confirm::TakeSide {
+            path: entry.path.clone(),
+            stage,
+        });
+    }
+
+    /// 关闭冲突编辑器。
+    ///
+    /// 同时作废"高级操作"通道上的在飞读取：否则刚关掉的遮罩会被迟到的
+    /// 冲突清单重新弹回来（用户会以为关不掉）。
+    pub fn cfl_close(&mut self) {
+        self.handle.cancel_lane(gt_service::RequestLane::Advanced);
+        self.conflicts.clear();
+        self.conflict_selected = None;
+        self.conflict_file = None;
+        self.conflict_resolutions.clear();
+        self.conflict_block = None;
+        self.conflict_manual.clear();
+        self.dirty.cfl = true;
+    }
+
+    // ---------------------------------------------------------- 贮藏
+
+    /// 请求贮藏列表。
+    pub fn request_stash_list(&mut self) {
+        if let Err(err) = self.service.request(
+            self.handle.id(),
+            RequestKind::StashList,
+            self.sender.clone(),
+        ) {
+            self.show_toast(err.to_string());
+        }
+    }
+
+    /// 创建贮藏。
+    pub fn stash_create(&mut self) {
+        let message = self.stash_message.clone();
+        self.stash_message.clear();
+        self.dirty.stash = true;
+        self.submit_write(
+            WriteRequest::Stash(StashOp::Create {
+                message,
+                include_untracked: self.stash_untracked,
+            }),
+            PendingWrite::Other,
+        );
+    }
+
+    /// 设置贮藏消息。
+    pub fn set_stash_message(&mut self, text: &str) {
+        text.clone_into(&mut self.stash_message);
+    }
+
+    /// 切换"包含未跟踪文件"。
+    pub fn toggle_stash_untracked(&mut self, on: bool) {
+        self.stash_untracked = on;
+        self.dirty.stash = true;
+    }
+
+    /// 应用贮藏（保留该条）。
+    pub fn stash_apply(&mut self, index: i32) {
+        if let Ok(index) = u32::try_from(index) {
+            self.submit_write(
+                WriteRequest::Stash(StashOp::Apply { index }),
+                PendingWrite::Other,
+            );
+        }
+    }
+
+    /// 弹出贮藏。
+    pub fn stash_pop(&mut self, index: i32) {
+        if let Ok(index) = u32::try_from(index) {
+            self.submit_write(
+                WriteRequest::Stash(StashOp::Pop { index }),
+                PendingWrite::Other,
+            );
+        }
+    }
+
+    /// 删除贮藏（先确认）。
+    pub fn stash_drop(&mut self, index: i32) {
+        let Ok(index) = u32::try_from(index) else {
+            return;
+        };
+        let selector = self
+            .stashes
+            .iter()
+            .find(|entry| entry.index == index)
+            .map_or_else(
+                || format!("stash@{{{index}}}"),
+                |entry| entry.selector.clone(),
+            );
+        self.confirm = Some(Confirm::StashDrop { selector, index });
+    }
+
+    /// 从贮藏创建分支（分支名取侧栏输入框）。
+    pub fn stash_branch(&mut self, index: i32) {
+        let name = self.branch_input.trim().to_owned();
+        if name.is_empty() {
+            self.show_toast("请先在侧栏输入新分支名");
+            return;
+        }
+        if let Ok(index) = u32::try_from(index) {
+            self.submit_write(
+                WriteRequest::Stash(StashOp::Branch { index, name }),
+                PendingWrite::Other,
+            );
+        }
+    }
+
+    // ---------------------------------------------------------- 中断恢复
+
+    /// 继续进行中的操作（合并提交 / 变基 continue / 拣选 continue）。
+    pub fn resume_continue(&mut self) {
+        if !self.state.is_in_progress() {
+            self.show_toast("当前没有进行中的操作");
+            return;
+        }
+        self.submit_write(continue_request(self.state), PendingWrite::Other);
+    }
+
+    /// 跳过变基中的当前提交（会丢弃该提交的改动，需确认）。
+    pub fn resume_skip(&mut self) {
+        if !self.state.is_rebase() {
+            self.show_toast("当前操作不支持跳过");
+            return;
+        }
+        self.confirm = Some(Confirm::RebaseSkip);
+    }
+
+    /// 中止进行中的操作（需确认）。
+    pub fn resume_abort(&mut self) {
+        if !self.state.is_in_progress() {
+            self.show_toast("当前没有进行中的操作");
+            return;
+        }
+        self.confirm = Some(Confirm::AbortInProgress { state: self.state });
+    }
+
+    // ---------------------------------------------------------- 结果落地
+
+    /// 高级操作结果落地：提示 + （有冲突则）打开三路编辑器 + 整体刷新。
+    fn apply_advanced_result(&mut self, result: &AdvancedResult) {
+        self.advanced_label = self.handle.advanced_label();
+        self.show_toast(first_line(&result.summary));
+
+        let conflicted = result.is_conflicted();
+        if !conflicted {
+            self.conflicts.clear();
+            self.conflict_selected = None;
+            self.conflict_file = None;
+            self.conflict_resolutions.clear();
+            self.conflict_block = None;
+            self.conflict_manual.clear();
+            self.dirty.cfl = true;
+        }
+
+        // 写操作后统一刷新：状态 / 概览 / 日志 / 差异。
+        self.refresh();
+
+        if conflicted {
+            self.request_conflicts();
+        }
+        // 贮藏面板打开时就顺手刷新一次列表：用户刚做完 stash 操作，
+        // 最想看到的是"列表变了没有"。
+        self.request_stash_list();
+    }
+
+    // ---------------------------------------------------------- 属性写回
+
+    fn apply_ctx_menu(&self, window: &MainWindow) {
+        window.set_ctx_visible(self.ctx.is_some());
+        if let Some(ctx) = &self.ctx {
+            window.set_ctx_x(self.ctx_pos.0);
+            window.set_ctx_y(self.ctx_pos.1);
+            window.set_ctx_subject(ctx.short.clone().into());
+            window.set_ctx_is_head(ctx.is_head);
+        }
+    }
+
+    fn apply_op_dialog(&self, window: &MainWindow) {
+        let Some(op) = &self.op else {
+            window.set_op_visible(false);
+            return;
+        };
+        window.set_op_visible(true);
+        window.set_op_kind(op.kind);
+        window.set_op_title(op.title.clone().into());
+        window.set_op_hint(op.hint.clone().into());
+        window.set_op_input(op.input.clone().into());
+        window.set_op_placeholder(op.placeholder.clone().into());
+        window.set_op_input2(op.input2.clone().into());
+        window.set_op_placeholder2(op.placeholder2.clone().into());
+        window.set_op_show_input2(op.show_input2);
+        window.set_op_modes(rc_model(
+            op.modes
+                .iter()
+                .map(|label| slint::SharedString::from(label.as_str()))
+                .collect(),
+        ));
+        window.set_op_mode(op.mode);
+        window.set_op_danger(op.danger);
+    }
+
+    fn apply_rebase_plan(&self, window: &MainWindow) {
+        let Some(plan) = &self.plan else {
+            window.set_iplan_visible(false);
+            return;
+        };
+        window.set_iplan_visible(true);
+        window.set_iplan_rows(rc_model(build_rebase_step_rows(plan, self.plan_selected)));
+        window.set_iplan_title(format!("交互式变基：{} → {}", plan.base, "HEAD").into());
+        let kept = plan.kept();
+        let merges = if plan.merges_dropped > 0 {
+            format!(
+                " ⚠ 区间内还有 {} 个合并提交：交互式变基会线性化历史，这些合并提交不会保留。",
+                plan.merges_dropped
+            )
+        } else {
+            String::new()
+        };
+        window.set_iplan_summary(
+            format!(
+                "共 {} 个提交，其中 {kept} 个会保留。压缩/吞并会把该提交并入上一条；改写会先重放再改消息。{merges}",
+                plan.steps.len()
+            )
+            .into(),
+        );
+        window.set_iplan_selected(
+            self.plan_selected
+                .and_then(|index| i32::try_from(index).ok())
+                .unwrap_or(-1),
+        );
+        window.set_iplan_message(self.plan_message.clone().into());
+        window.set_iplan_message_visible(self.plan_selected.is_some());
+    }
+
+    fn apply_conflict_editor(&self, window: &MainWindow) {
+        let open = !self.conflicts.is_empty() || self.conflict_file.is_some();
+        window.set_cfl_visible(open);
+        if !open {
+            return;
+        }
+        window.set_cfl_files(rc_model(build_conflict_file_rows(
+            &self.conflicts,
+            self.conflict_selected,
+        )));
+        let Some(file) = &self.conflict_file else {
+            window.set_cfl_rows(rc_model(Vec::new()));
+            window.set_cfl_title("冲突解决（正在读取文件…）".into());
+            window.set_cfl_summary(format!("还有 {} 个文件待解决", self.conflicts.len()).into());
+            return;
+        };
+        window.set_cfl_rows(rc_model(build_conflict_rows(
+            file,
+            &self.conflict_resolutions,
+        )));
+        window.set_cfl_title(
+            format!(
+                "冲突解决：{}（还有 {} 个文件待解决）",
+                file.path,
+                self.conflicts.len()
+            )
+            .into(),
+        );
+        window.set_cfl_summary(conflict_summary(file, &self.conflict_resolutions).into());
+        window.set_cfl_manual(self.conflict_manual.clone().into());
+        window.set_cfl_manual_visible(self.conflict_block.is_some());
+        window.set_cfl_block(
+            self.conflict_block
+                .and_then(|index| i32::try_from(index).ok())
+                .unwrap_or(-1),
+        );
+    }
+
+    fn apply_stash_panel(&self, window: &MainWindow) {
+        window.set_stash_rows(rc_model(build_stash_rows(&self.stashes)));
+        window.set_stash_summary(format!("({})", self.stashes.len()).into());
+        window.set_stash_message(self.stash_message.clone().into());
+        window.set_stash_untracked(self.stash_untracked);
+    }
+
+    fn apply_compare_panel(&self, window: &MainWindow) {
+        let Some(compare) = &self.compare else {
+            window.set_compare_visible(false);
+            return;
+        };
+        window.set_compare_visible(true);
+        window.set_compare_title(compare.title.clone().into());
+        window.set_compare_browse(compare.browse);
+        window.set_compare_rows(rc_model(build_compare_rows(
+            &compare.files,
+            compare.selected,
+        )));
+    }
+
+    fn apply_advanced_header(&self, window: &MainWindow) {
+        window.set_advanced_label(self.advanced_label.clone().unwrap_or_default().into());
+        window.set_resume_visible(self.state.is_in_progress());
+        window.set_resume_can_skip(self.state.is_rebase());
+    }
 }
 
 #[cfg(test)]
@@ -1703,6 +3832,67 @@ mod tests {
 
         append_log_page(&mut state, 0, vec![commit(2, Vec::new())]);
         assert_eq!(state.nodes.len(), 1);
+    }
+
+    #[test]
+    fn force_push_confirmation_states_loss_and_alternative() {
+        let confirm = Confirm::ForcePush {
+            remote: "origin".to_owned(),
+            branch: "main".to_owned(),
+            commits: 3,
+        };
+        let (title, detail, danger) = confirm.text();
+        assert!(title.contains("origin/main"), "{title}");
+        assert!(danger, "强制推送必须是危险色");
+        assert!(detail.contains("消失"), "必须说清失去什么：{detail}");
+        assert!(detail.contains("分叉"), "必须说清不可逆的后果：{detail}");
+        assert!(detail.contains("替代做法"), "必须给出替代做法：{detail}");
+        assert!(detail.contains('3'), "必须给出待推提交数：{detail}");
+    }
+
+    #[test]
+    fn pull_strategy_indices_round_trip() {
+        for index in 0..=2 {
+            let strategy = super::strategy_from_index(index);
+            assert_eq!(
+                super::strategy_index(strategy),
+                index,
+                "策略与界面下标必须一一对应"
+            );
+        }
+        // 越界值归到合并，而不是 panic 或静默变成别的策略。
+        assert_eq!(
+            super::strategy_from_index(99),
+            gt_backend::PullStrategy::Merge
+        );
+    }
+
+    #[test]
+    fn push_without_remotes_is_refused_with_a_toast_instead_of_a_request() {
+        let Some(root) = tmp_repo("no-remote") else {
+            return;
+        };
+        let service = std::sync::Arc::new(
+            gt_service::GitService::new(gt_service::silent_observer()).expect("建服务"),
+        );
+        let handle = service.open_repo(&root).expect("打开仓库");
+        let console = gt_service::ConsoleBuffer::shared(8);
+        let mut session =
+            super::Session::new(std::sync::Arc::clone(&service), handle.clone(), console, 8);
+
+        assert!(session.default_remote().is_none(), "临时仓库没有远端");
+        session.request_push();
+        assert!(
+            session.push_preview().is_none(),
+            "没有远端时不应产生预览，更不能起子进程"
+        );
+        assert!(!handle.network_snapshot().busy);
+
+        drop(session);
+        drop(handle);
+        let mut service = std::sync::Arc::try_unwrap(service).expect("服务不应还有其它强引用");
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
