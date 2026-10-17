@@ -7,6 +7,7 @@
 //! knotwork <路径> [路径...]       # 每个路径一个窗口（FR-MR-03）
 //! knotwork --isolate <路径>       # 跳过单实例守卫，强制起独立进程（FR-MR-05）
 //! knotwork --probe 3             # 阶段 0 的多窗口内存探针（M0 基线采集入口）
+//! knotwork --askpass <提示>       # GIT_ASKPASS 回调（由 git 调用，不面向用户）
 //! SLINT_BACKEND=winit-femtovg knotwork   # 切换 GPU 后端做内存 A/B 对比
 //! ```
 //!
@@ -51,6 +52,27 @@ mod generated {
 
 use generated::ProbeWindow;
 
+/// `--askpass` 模式：把环境变量里的口令打到 stdout（FR-RMT-04）。
+///
+/// 这条路径对应 [`gt_backend::ASKPASS_SECRET_ENV`] 的注入方案：口令只活在
+/// git 子进程的环境里，本程序读出来应答，不落盘、不进命令行参数。
+/// 不是 `--askpass` 时返回 [`None`]，由正常启动流程接管。
+fn askpass_mode(mut args: impl Iterator<Item = String>) -> Option<ExitCode> {
+    if args.next().as_deref() != Some("--askpass") {
+        return None;
+    }
+    let prompt = args.next().unwrap_or_default();
+    match gt_backend::askpass_from_env(&prompt) {
+        Some(answer) => {
+            println!("{answer}");
+            Some(ExitCode::SUCCESS)
+        }
+        // 没有环境变量时以非零码退出：git 会按"取不到凭据"处理，
+        // 于是失败原因仍然是正常的认证错误，而不是挂住。
+        None => Some(ExitCode::FAILURE),
+    }
+}
+
 /// 探针模式的默认窗口数，对应架构规划 4.2 的 3 窗口验收场景。
 const DEFAULT_PROBE_WINDOWS: usize = 3;
 
@@ -64,6 +86,13 @@ const BACKEND_ENV: &str = "SLINT_BACKEND";
 const SOFTWARE_BACKEND: &str = "winit-software";
 
 fn main() -> ExitCode {
+    // `GIT_ASKPASS` 模式必须最先处理：git 会反向调用本程序取口令，
+    // 此时任何初始化（日志、配置、单实例守卫）都是多余的，
+    // 而 stdout 上除了口令**不能出现任何东西** —— 多一行日志就等于错误的口令。
+    if let Some(code) = askpass_mode(std::env::args().skip(1)) {
+        return code;
+    }
+
     configure_default_backend();
     logging::init();
 

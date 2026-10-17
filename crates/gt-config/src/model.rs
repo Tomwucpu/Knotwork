@@ -44,6 +44,8 @@ pub enum UpdateStrategy {
     Merge,
     /// 变基（`git pull --rebase`）。
     Rebase,
+    /// 仅快进（`git pull --ff-only`）：出现分叉即失败，绝不产生合并提交。
+    FastForwardOnly,
 }
 
 /// 日志级别（对应 `tracing` 的过滤级别）。
@@ -152,6 +154,32 @@ impl BranchProtectionConfig {
     }
 }
 
+/// 远端与凭据设置（M3）。
+///
+/// 只记"哪些主机存过 token"，**不记 token 本身**：真值在系统密钥链里
+/// （NFR-SEC-01 要求明文不落盘，配置文件同样不能例外）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteSettings {
+    /// 已把 token 存入系统密钥链的主机名。
+    pub stored_token_hosts: Vec<String>,
+}
+
+impl RemoteSettings {
+    /// 记录一个主机（幂等）。
+    pub fn remember_host(&mut self, host: &str) {
+        if host.is_empty() || self.stored_token_hosts.iter().any(|item| item == host) {
+            return;
+        }
+        self.stored_token_hosts.push(host.to_owned());
+    }
+
+    /// 忘记一个主机。
+    pub fn forget_host(&mut self, host: &str) {
+        self.stored_token_hosts.retain(|item| item != host);
+    }
+}
+
 /// 缓存预算（对应架构规划 5.4 的硬上限 LRU 缓存）。
 ///
 /// 超出预算按 LRU 淘汰，**绝不自动扩容**。
@@ -203,6 +231,8 @@ pub struct UserConfig {
     pub git: GitBehaviorConfig,
     /// 受保护分支。
     pub branches: BranchProtectionConfig,
+    /// 远端与凭据。
+    pub remote: RemoteSettings,
     /// 缓存预算。
     pub cache: CacheBudget,
     /// 外部工具。
@@ -240,7 +270,7 @@ impl UserConfig {
 mod tests {
     use super::{
         AppearanceConfig, BranchProtectionConfig, CacheBudget, DiagnosticsConfig,
-        GitBehaviorConfig, LogLevel, UpdateStrategy, UserConfig,
+        GitBehaviorConfig, LogLevel, RemoteSettings, UpdateStrategy, UserConfig,
     };
 
     #[test]
@@ -259,6 +289,7 @@ mod tests {
         );
         assert_eq!(config.diagnostics.log_level, LogLevel::Info);
         assert!(config.branches.protected_patterns.is_empty());
+        assert!(config.remote.stored_token_hosts.is_empty());
         assert!(config.recent.is_empty());
         assert!(config.keybindings.is_empty());
     }
@@ -285,6 +316,32 @@ mod tests {
                 .protected_patterns
                 .len(),
             3
+        );
+    }
+
+    #[test]
+    fn remote_settings_track_hosts_not_secrets() {
+        let mut settings = RemoteSettings::default();
+        settings.remember_host("github.com");
+        settings.remember_host("github.com");
+        settings.remember_host("");
+        assert_eq!(settings.stored_token_hosts, vec!["github.com".to_owned()]);
+
+        settings.forget_host("github.com");
+        assert!(settings.stored_token_hosts.is_empty());
+    }
+
+    #[test]
+    fn update_strategy_round_trips_through_toml() {
+        let mut config = UserConfig::default();
+        config.git.update_strategy = UpdateStrategy::FastForwardOnly;
+        let text = config.to_toml().expect("序列化");
+        assert!(text.contains("fast-forward-only"), "{text}");
+        let back = UserConfig::from_toml(&text).expect("反序列化");
+        assert_eq!(
+            back.git.update_strategy,
+            UpdateStrategy::FastForwardOnly,
+            "仅快进必须能被记住（FR-RMT-02）"
         );
     }
 }

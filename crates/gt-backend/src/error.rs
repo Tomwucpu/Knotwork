@@ -108,6 +108,20 @@ pub enum BackendError {
         detail: String,
     },
 
+    /// 网络操作失败（fetch / pull / push），已带上可行动的诊断。
+    ///
+    /// 与 [`BackendError::Rejected`] 分开：`summary` 里已经含建议文案（供直接展示），
+    /// 而 `kind` 供上层决定是否提供"为此主机保存 token"这类针对性入口。
+    #[error("{summary}")]
+    Network {
+        /// 面向用户的结论 + 建议（多行）。
+        summary: String,
+        /// git 原始输出（已脱敏）。
+        detail: String,
+        /// 失败类别。
+        kind: crate::credential::CredentialKind,
+    },
+
     /// 操作被取消（取消令牌在子进程等待期间被触发）。
     #[error("操作已取消")]
     Cancelled,

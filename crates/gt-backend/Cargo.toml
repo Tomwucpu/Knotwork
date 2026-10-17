@@ -15,3 +15,7 @@ gt-core.workspace = true
 gix.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# M3：受保护分支正则匹配（FR-RMT-03）
+regex.workspace = true
+# M3：HTTPS token 存系统密钥链（FR-RMT-04 / NFR-SEC-01）
+keyring.workspace = true

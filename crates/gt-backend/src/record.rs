@@ -72,6 +72,11 @@ pub struct CommandRecord {
     pub truncated: bool,
     /// 失败原因（成功时为 [`None`]）。
     pub error: Option<String>,
+    /// 是否为网络操作（FR-RMT-05 / FR-CON-01 的网络审计标记）。
+    ///
+    /// Console 用它把 fetch / pull / push 与本地命令区分开：网络操作的耗时
+    /// 与失败原因的解释方式完全不同（见 `credential` 模块的诊断）。
+    pub network: bool,
 }
 
 impl CommandRecord {
@@ -95,6 +100,7 @@ impl CommandRecord {
             stderr_tail: None,
             truncated: false,
             error: None,
+            network: false,
         }
     }
 
@@ -129,20 +135,30 @@ impl CommandRecord {
         } else {
             ""
         };
+        let route = self.route_label();
         match &self.cwd {
             Some(cwd) => format!(
-                "[{}] {}  ·  {status}  ·  {}ms{suffix}  ·  {}",
-                self.route.label(),
+                "[{route}] {}  ·  {status}  ·  {}ms{suffix}  ·  {}",
                 self.command_line,
                 self.duration_ms(),
                 display_path(cwd)
             ),
             None => format!(
-                "[{}] {}  ·  {status}  ·  {}ms{suffix}",
-                self.route.label(),
+                "[{route}] {}  ·  {status}  ·  {}ms{suffix}",
                 self.command_line,
                 self.duration_ms()
             ),
+        }
+    }
+
+    /// 审计标签：网络操作在路由名后追加"·网络"，让用户一眼看出这是耗时更长、
+    /// 失败原因不同的一类命令。
+    #[must_use]
+    pub fn route_label(&self) -> String {
+        if self.network {
+            format!("{}·网络", self.route.label())
+        } else {
+            self.route.label().to_owned()
         }
     }
 

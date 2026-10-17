@@ -53,6 +53,13 @@ crossbeam-channel = "0.5"
 notify = "8.2"
 notify-debouncer-full = "0.7"
 
+# ---- 远端（M3 引入）----
+# 受保护分支用正则匹配（FR-RMT-03）：用户按 IDEA 习惯填正则，不用自定义语法。
+regex = "1"
+# HTTPS token 存系统密钥链（NFR-SEC-01）：Windows 走凭据管理器。
+# 关掉默认特性只保留 windows-native，避免把 Linux 的 dbus/secret-service 拖进来。
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+
 # ---- GUI（阶段 0 验证软件渲染与多窗口路径）----
 # 使用 Slint 默认特性：已同时包含 renderer-software（软件渲染，低内存路线前提，
 # 架构规划 2.3）与 renderer-femtovg（GPU 后端，保留用于内存 A/B 对比），
