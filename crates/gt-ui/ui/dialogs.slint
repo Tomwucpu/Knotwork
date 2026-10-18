@@ -1,0 +1,1351 @@
+// Knotwork 遮罩层与对话框（M4.5 UI 专项 S3 + S4）。
+//
+// 九个浮层从 main-window.slint 迁出并组件化：二次确认 / 设置 / 推送预览 /
+// 远端管理 / 提交上下文菜单 / 通用操作 / 交互式变基 / 三路冲突 / 比较浏览。
+//
+// 接口约定：
+//   - 每个组件用 in / in-out 属性声明自己的数据需求，in-out 表示组件内部
+//     会写回（复选框、输入框），实例化处用双向绑定接到主窗口同名属性；
+//   - 组件回调在实例化处转发到主窗口的 Rust 注册回调 —— **主窗口的回调
+//     契约不变**（app/src/windows.rs 的 on_* 表原样工作）；
+//   - 骨架统一走 widgets.slint 的 DialogShell（遮罩 + 居中卡片 + 标题 +
+//     分隔线），此前九套各自为政的尺寸样式收口为一套。
+//
+// 纪律：颜色/字号/圆角一律取自 Palette / Metrics，不写裸值。
+
+import { CheckBox, ListView } from "std-widgets.slint";
+import { Palette, Metrics } from "theme.slint";
+import { Texts } from "texts.slint";
+import {
+    PushRow, RemoteRow, RebaseStepRow, ConflictFileRow, ConflictRow, CompareRow, HistRow,
+} from "model.slint";
+import {
+    FlatButton, TabButton, Field, OptionToggle, MenuItem,
+    DialogShell, Divider, VDivider, SectionLabel,
+} from "widgets.slint";
+
+export component DlgButton inherits FlatButton {
+    variant: "outline";
+}
+
+export component DlgPrimary inherits FlatButton {
+    variant: "primary";
+}
+
+// ================================================================ 二次确认遮罩（FR-LC-02 / D4）
+
+export component ConfirmDialog inherits DialogShell {
+    in property <string> confirm-title: Texts.s2;
+    in property <string> confirm-detail: "";
+    in property <bool> confirm-danger: true;
+    callback yes();
+    callback no();
+
+    danger: root.confirm-danger;
+    dialog-max-width: 520px;
+    dialog-max-height: 240px;
+    title: root.confirm-title;
+
+    Text {
+        vertical-stretch: 1;
+        text: root.confirm-detail;
+        color: Palette.text-dim;
+        font-size: Palette.font-sm;
+        wrap: word-wrap;
+    }
+
+    HorizontalLayout {
+        spacing: Metrics.space-2;
+        alignment: end;
+
+        DlgButton {
+            text: Texts.s12;
+            clicked => { root.no(); }
+        }
+        DlgButton {
+            text: Texts.s71;
+            danger: root.confirm-danger;
+            clicked => { root.yes(); }
+        }
+    }
+}
+
+// ================================================================ 设置遮罩（FR-SET）
+
+export component SettingsDialog inherits DialogShell {
+    // 双向绑定项：组件内部（复选框 / chip）直接写，经双向绑定同步回主窗口，
+    // Rust 侧 apply-settings 仍从主窗口属性读取 —— 契约不变。
+    in-out property <bool> dark-theme: true;
+    in-out property <bool> staging-mode: true;
+    in-out property <bool> set-warn-detached: true;
+    in-out property <bool> set-warn-crlf: true;
+    in-out property <int> set-update-strategy: 0;
+    in-out property <int> set-cache-mib: 32;
+    in-out property <string> set-protected: "";
+    in-out property <string> set-diff-tool: "";
+    in-out property <string> set-merge-tool: "";
+    in-out property <int> set-log-level: 2;
+    // 单向展示项。
+    in property <string> set-status: "";
+    // 界面语言：中文（默认）/ English（NFR-L10N-01）。
+    in-out property <bool> set-language-en: false;
+
+    callback toggle-theme(bool);
+    callback apply();
+    callback cancel();
+
+    dialog-max-width: 620px;
+    dialog-max-height: 540px;
+    title: Texts.s6;
+
+    // 外观
+    SectionLabel { text: Texts.s72; }
+    HorizontalLayout {
+        spacing: Metrics.space-2;
+
+        CheckBox {
+            text: Texts.s73;
+            checked: root.dark-theme;
+            toggled => { root.toggle-theme(!root.dark-theme); }
+        }
+    }
+
+    HorizontalLayout {
+        spacing: Metrics.space-2;
+
+        Text {
+            text: Texts.lang_label;
+            color: Palette.text-faint;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+        }
+        OptionToggle {
+            text: Texts.lang_zh;
+            checked: !root.set-language-en;
+            toggled => { root.set-language-en = false; }
+        }
+        OptionToggle {
+            text: "English";
+            checked: root.set-language-en;
+            toggled => { root.set-language-en = true; }
+        }
+    }
+
+    // Git 行为
+    SectionLabel { text: Texts.s74; }
+    HorizontalLayout {
+        spacing: Metrics.space-2;
+
+        CheckBox {
+            text: Texts.s75;
+            checked: root.staging-mode;
+            toggled => { root.staging-mode = !root.staging-mode; }
+        }
+        CheckBox {
+            text: Texts.s76;
+            checked: root.set-warn-detached;
+            toggled => { root.set-warn-detached = !root.set-warn-detached; }
+        }
+        CheckBox {
+            text: Texts.s77;
+            checked: root.set-warn-crlf;
+            toggled => { root.set-warn-crlf = !root.set-warn-crlf; }
+        }
+    }
+
+    HorizontalLayout {
+        spacing: Metrics.space-2;
+
+        Text {
+            text: Texts.s78;
+            color: Palette.text-faint;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+        }
+        OptionToggle {
+            text: "merge";
+            checked: root.set-update-strategy == 0;
+            toggled => { root.set-update-strategy = 0; }
+        }
+        OptionToggle {
+            text: "rebase";
+            checked: root.set-update-strategy == 1;
+            toggled => { root.set-update-strategy = 1; }
+        }
+        OptionToggle {
+            text: Texts.s79;
+            checked: root.set-update-strategy == 2;
+            toggled => { root.set-update-strategy = 2; }
+        }
+    }
+
+    // 受保护分支 / 缓存
+    SectionLabel { text: Texts.s80; }
+    Field {
+        text <=> root.set-protected;
+        placeholder: "^main$,^release/";
+        monospace: true;
+    }
+
+    HorizontalLayout {
+        spacing: Metrics.space-2;
+
+        Text {
+            text: Texts.s81;
+            color: Palette.text-faint;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+        }
+        OptionToggle {
+            text: "8";
+            checked: root.set-cache-mib == 8;
+            toggled => { root.set-cache-mib = 8; }
+        }
+        OptionToggle {
+            text: "16";
+            checked: root.set-cache-mib == 16;
+            toggled => { root.set-cache-mib = 16; }
+        }
+        OptionToggle {
+            text: "32";
+            checked: root.set-cache-mib == 32;
+            toggled => { root.set-cache-mib = 32; }
+        }
+        OptionToggle {
+            text: "64";
+            checked: root.set-cache-mib == 64;
+            toggled => { root.set-cache-mib = 64; }
+        }
+
+        Text {
+            text: Texts.s82;
+            color: Palette.text-faint;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+        }
+        OptionToggle {
+            text: "info";
+            checked: root.set-log-level == 2;
+            toggled => { root.set-log-level = 2; }
+        }
+        OptionToggle {
+            text: "debug";
+            checked: root.set-log-level == 3;
+            toggled => { root.set-log-level = 3; }
+        }
+    }
+
+    // 外部工具
+    SectionLabel { text: Texts.s83; }
+    Field {
+        text <=> root.set-diff-tool;
+        placeholder: Texts.s84;
+        monospace: true;
+    }
+    Field {
+        text <=> root.set-merge-tool;
+        placeholder: Texts.s85;
+        monospace: true;
+    }
+
+    Text {
+        text: root.set-status;
+        color: Palette.text-faint;
+        font-size: Palette.font-xs;
+        wrap: word-wrap;
+    }
+
+    HorizontalLayout {
+        spacing: Metrics.space-2;
+        alignment: end;
+
+        DlgButton {
+            text: Texts.s12;
+            clicked => { root.cancel(); }
+        }
+        DlgPrimary {
+            text: Texts.s86;
+            clicked => { root.apply(); }
+        }
+    }
+}
+
+// ================================================================ 推送预览遮罩（FR-RMT-03）
+
+export component PushDialog inherits DialogShell {
+    in property <[PushRow]> push-rows: [];
+    in property <string> push-summary: "";
+    in property <string> push-hint: "";
+    in property <bool> push-protected: false;
+    in property <bool> push-creates-branch: false;
+    in-out property <bool> push-force: false;
+    in-out property <bool> push-set-upstream: false;
+
+    callback confirm();
+    callback cancel();
+    callback toggle-force(bool);
+    callback toggle-upstream(bool);
+
+    dialog-max-width: 720px;
+    dialog-max-height: 520px;
+    title: Texts.s87;
+
+    Text {
+        text: root.push-summary;
+        color: Palette.text-dim;
+        font-size: Palette.font-sm;
+        wrap: word-wrap;
+    }
+
+    ListView {
+        vertical-stretch: 1;
+        for row in root.push-rows: Rectangle {
+            height: 22px;
+
+            HorizontalLayout {
+                padding-left: 4px;
+                spacing: Metrics.space-2;
+
+                Text {
+                    width: 70px;
+                    text: row.short-id;
+                    color: Palette.text-faint;
+                    font-size: Palette.font-xs;
+                    font-family: Palette.mono-font;
+                    vertical-alignment: center;
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: row.subject;
+                    color: Palette.text;
+                    font-size: Palette.font-sm;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Text {
+                    width: 90px;
+                    text: row.author;
+                    color: Palette.text-faint;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Text {
+                    width: 80px;
+                    text: row.when;
+                    color: Palette.text-faint;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                }
+            }
+        }
+    }
+
+    HorizontalLayout {
+        spacing: 14px;
+
+        CheckBox {
+            text: Texts.s88;
+            checked: root.push-force;
+            toggled => { root.toggle-force(!root.push-force); }
+        }
+        CheckBox {
+            text: Texts.s89;
+            checked: root.push-set-upstream;
+            toggled => { root.toggle-upstream(!root.push-set-upstream); }
+        }
+    }
+
+    Text {
+        text: root.push-hint;
+        color: root.push-protected ? Palette.amber : Palette.text-faint;
+        font-size: Palette.font-xs;
+        wrap: word-wrap;
+    }
+
+    HorizontalLayout {
+        spacing: Metrics.space-2;
+        alignment: end;
+
+        DlgButton {
+            text: Texts.s12;
+            clicked => { root.cancel(); }
+        }
+        DlgPrimary {
+            text: Texts.s90;
+            enabled: root.push-rows.length > 0 || root.push-creates-branch;
+            clicked => { root.confirm(); }
+        }
+    }
+}
+
+// ================================================================ 远端管理遮罩（FR-RMT-01/04）
+
+export component RemotesDialog inherits DialogShell {
+    in property <[RemoteRow]> remote-rows: [];
+    in property <int> remote-selected: -1;
+    in property <string> remote-help: "";
+    in property <string> token-host: "";
+    in property <bool> keyring-available: true;
+    in property <bool> read-only: false;
+    in-out property <string> remote-name-input: "";
+    in-out property <string> remote-url-input: "";
+    in-out property <string> token-input: "";
+    in-out property <int> pull-strategy: 0;
+
+    callback select-remote(int);
+    callback name-edited(string);
+    callback url-edited(string);
+    callback add();
+    callback set-url();
+    callback remove();
+    callback close();
+    callback token-edited(string);
+    callback save-token();
+    callback forget-token();
+    callback set-strategy(int);
+
+    dialog-max-width: 700px;
+    dialog-max-height: 540px;
+    title: Texts.s91;
+
+    ListView {
+        vertical-stretch: 1;
+        for entry[index] in root.remote-rows: Rectangle {
+            height: 26px;
+            background: entry.selected ? Palette.hover : transparent;
+
+            HorizontalLayout {
+                padding-left: 6px;
+                spacing: Metrics.space-2;
+
+                Text {
+                    width: 110px;
+                    text: entry.name;
+                    color: Palette.text;
+                    font-size: Palette.font-sm;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: entry.url;
+                    color: Palette.text-dim;
+                    font-size: Palette.font-xs;
+                    font-family: Palette.mono-font;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Text {
+                    width: 150px;
+                    text: entry.detail;
+                    color: Palette.text-faint;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+
+            TouchArea {
+                clicked => { root.select-remote(index); }
+            }
+        }
+    }
+
+    HorizontalLayout {
+        spacing: 6px;
+
+        Field {
+            width: 140px;
+            text <=> root.remote-name-input;
+            placeholder: Texts.s92;
+            edited(v) => { root.name-edited(v); }
+        }
+        Field {
+            horizontal-stretch: 1;
+            text <=> root.remote-url-input;
+            placeholder: Texts.s93;
+            monospace: true;
+            edited(v) => { root.url-edited(v); }
+        }
+    }
+
+    HorizontalLayout {
+        spacing: 6px;
+
+        FlatButton {
+            text: Texts.s94;
+            enabled: !root.read-only;
+            clicked => { root.add(); }
+        }
+        FlatButton {
+            text: Texts.s95;
+            enabled: !root.read-only && root.remote-selected >= 0;
+            clicked => { root.set-url(); }
+        }
+        FlatButton {
+            text: Texts.s20;
+            danger: true;
+            enabled: !root.read-only && root.remote-selected >= 0;
+            clicked => { root.remove(); }
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+
+        FlatButton {
+            text: Texts.s13;
+            clicked => { root.close(); }
+        }
+    }
+
+    Divider { }
+
+    SectionLabel { text: Texts.s96; }
+
+    HorizontalLayout {
+        spacing: 6px;
+
+        OptionToggle {
+            text: Texts.s97;
+            checked: root.pull-strategy == 0;
+            toggled => { root.set-strategy(0); }
+        }
+        OptionToggle {
+            text: Texts.s98;
+            checked: root.pull-strategy == 1;
+            toggled => { root.set-strategy(1); }
+        }
+        OptionToggle {
+            text: Texts.s79;
+            checked: root.pull-strategy == 2;
+            toggled => { root.set-strategy(2); }
+        }
+    }
+
+    Text {
+        text: root.remote-help;
+        color: Palette.text-faint;
+        font-size: Palette.font-xs;
+        wrap: word-wrap;
+    }
+
+    Text {
+        text: Texts.s99
+            + (root.token-host == "" ? Texts.s100 : root.token-host);
+        color: Palette.text-dim;
+        font-size: Palette.font-xs;
+        wrap: word-wrap;
+    }
+
+    HorizontalLayout {
+        spacing: 6px;
+
+        Field {
+            horizontal-stretch: 1;
+            text <=> root.token-input;
+            placeholder: Texts.s101;
+            monospace: true;
+            edited(v) => { root.token-edited(v); }
+        }
+        FlatButton {
+            text: Texts.s102;
+            enabled: root.keyring-available && root.token-host != ""
+                && root.token-input != "";
+            clicked => { root.save-token(); }
+        }
+        FlatButton {
+            text: Texts.s103;
+            enabled: root.keyring-available && root.token-host != "";
+            clicked => { root.forget-token(); }
+        }
+    }
+}
+
+// ================================================================ 提交上下文菜单（FR-LOG-07/08）
+
+// 注意：本组件不是 DialogShell —— 菜单要贴着光标弹出，没有遮罩卡片。
+// 实例化处必须声明在其他遮罩**之后**（菜单在最上层），且仍然早于
+// op / iplan / cfl / compare 的顺序保持与迁出前一致。
+export component CommitCtxMenu inherits Rectangle {
+    in property <length> ctx-x: 0px;
+    in property <length> ctx-y: 0px;
+    in property <bool> ctx-is-head: false;
+    in property <bool> read-only: false;
+    // 菜单项统一走一个回调：动作标识由 Rust 侧解释，避免十三个几乎相同的回调。
+    callback action(string);
+    callback close();
+
+    background: transparent;
+
+    // 点空白处关闭；这层必须在菜单面板**之前**声明，否则会盖住菜单。
+    TouchArea {
+        clicked => { root.close(); }
+    }
+
+    Rectangle {
+        width: 236px;
+        height: menu.preferred-height + 8px;
+        x: min(root.ctx-x, root.width - 248px);
+        y: min(root.ctx-y, root.height - self.height - 16px);
+        background: Palette.panel;
+        border-color: Palette.border;
+        border-width: 1px;
+        border-radius: Palette.radius;
+
+        menu := VerticalLayout {
+            x: 4px;
+            y: 4px;
+            width: parent.width - 8px;
+            spacing: 1px;
+
+            MenuItem {
+                text: Texts.s104;
+                enabled: !root.read-only;
+                clicked => { root.action("merge"); }
+            }
+            MenuItem {
+                text: Texts.s105;
+                enabled: !root.read-only;
+                clicked => { root.action("rebase"); }
+            }
+            MenuItem {
+                text: Texts.s106;
+                enabled: !root.read-only;
+                clicked => { root.action("iplan"); }
+            }
+            MenuItem {
+                text: Texts.s107;
+                enabled: !root.read-only;
+                clicked => { root.action("cherry-pick"); }
+            }
+            MenuItem {
+                text: Texts.s108;
+                enabled: !root.read-only;
+                clicked => { root.action("revert"); }
+            }
+            MenuItem {
+                text: Texts.s109;
+                enabled: !root.read-only;
+                clicked => { root.action("reset"); }
+            }
+            MenuItem {
+                text: Texts.s110;
+                enabled: !root.read-only && root.ctx-is-head;
+                clicked => { root.action("undo"); }
+            }
+
+            Divider { }
+
+            MenuItem {
+                text: Texts.s111;
+                clicked => { root.action("patch"); }
+            }
+            MenuItem {
+                text: Texts.s112;
+                enabled: !root.read-only;
+                clicked => { root.action("tag"); }
+            }
+            MenuItem {
+                text: Texts.s113;
+                enabled: !root.read-only;
+                clicked => { root.action("apply-patch"); }
+            }
+            MenuItem {
+                text: Texts.s114;
+                clicked => { root.action("compare"); }
+            }
+            MenuItem {
+                text: Texts.s115;
+                clicked => { root.action("browse"); }
+            }
+
+            Divider { }
+
+            MenuItem {
+                text: Texts.s116;
+                clicked => { root.action("copy"); }
+            }
+            MenuItem {
+                text: Texts.s117;
+                enabled: !root.read-only;
+                clicked => { root.action("checkout"); }
+            }
+        }
+    }
+}
+
+// ================================================================ 通用操作对话框
+
+export component OpDialog inherits DialogShell {
+    in property <string> op-title: "";
+    in property <string> op-hint: "";
+    in property <string> op-placeholder: "";
+    in property <string> op-placeholder2: "";
+    in property <bool> op-show-input2: false;
+    in property <[string]> op-modes: [];
+    in property <bool> op-danger: false;
+    in-out property <string> op-input: "";
+    in-out property <string> op-input2: "";
+    in-out property <int> op-mode: 0;
+
+    callback mode-changed(int);
+    callback input-edited(string);
+    callback input2-edited(string);
+    callback confirm();
+    callback cancel();
+
+    danger: root.op-danger;
+    dialog-max-width: 520px;
+    dialog-max-height: 320px;
+    title: root.op-title;
+
+    Text {
+        text: root.op-hint;
+        color: Palette.text-faint;
+        font-size: Palette.font-xs;
+        wrap: word-wrap;
+    }
+
+    HorizontalLayout {
+        spacing: 6px;
+        visible: root.op-modes.length > 0;
+
+        for mode-label[index] in root.op-modes: TabButton {
+            // 显式给宽：四个模式并排不能撑破对话框。
+            width: 108px;
+            text: mode-label;
+            active: root.op-mode == index;
+            clicked => { root.mode-changed(index); }
+        }
+    }
+
+    Field {
+        text <=> root.op-input;
+        placeholder: root.op-placeholder;
+        monospace: true;
+        edited(v) => { root.input-edited(v); }
+    }
+
+    Field {
+        visible: root.op-show-input2;
+        text <=> root.op-input2;
+        placeholder: root.op-placeholder2;
+        edited(v) => { root.input2-edited(v); }
+    }
+
+    Rectangle { vertical-stretch: 1; }
+
+    HorizontalLayout {
+        spacing: Metrics.space-2;
+        alignment: end;
+
+        DlgButton {
+            text: Texts.s12;
+            clicked => { root.cancel(); }
+        }
+        FlatButton {
+            text: Texts.s118;
+            variant: root.op-danger ? "outline" : "primary";
+            danger: root.op-danger;
+            clicked => { root.confirm(); }
+        }
+    }
+}
+
+// ================================================================ 交互式变基编辑器（FR-MRG-03）
+
+export component IplanDialog inherits DialogShell {
+    in property <[RebaseStepRow]> iplan-rows: [];
+    in property <string> iplan-summary: "";
+    in property <bool> iplan-message-visible: false;
+    in property <bool> read-only: false;
+    in-out property <string> iplan-message: "";
+
+    callback select(int);
+    callback action(int, int);
+    callback message-edited(string);
+    callback confirm();
+    callback cancel();
+
+    dialog-max-width: 980px;
+    dialog-max-height: 620px;
+    title: root.iplan-title;
+    in property <string> iplan-title: "";
+
+    Text {
+        text: root.iplan-summary;
+        color: Palette.text-faint;
+        font-size: Palette.font-xs;
+        wrap: word-wrap;
+    }
+
+    ListView {
+        vertical-stretch: 1;
+        for row in root.iplan-rows: Rectangle {
+            height: 30px;
+            background: row.selected ? Palette.hover : transparent;
+
+            // 吃掉整行点击（选中）；必须先于布局声明，动作按钮才在其上。
+            TouchArea {
+                clicked => { root.select(row.row-index); }
+            }
+
+            HorizontalLayout {
+                padding-left: 6px;
+                spacing: 6px;
+
+                Text {
+                    width: 64px;
+                    text: row.short-id;
+                    color: Palette.text-faint;
+                    font-size: Palette.font-xs;
+                    font-family: Palette.mono-font;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    horizontal-stretch: 1;
+                    // S4：主题列改为弹性拉伸，不再做 parent.width 算术定位。
+                    text: row.subject + (row.action == 1 && !row.has-message ? Texts.s119 : "");
+                    color: Palette.text;
+                    font-size: Palette.font-sm;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                HorizontalLayout {
+                    width: 336px;
+                    spacing: 3px;
+
+                    for action-label[action-index] in [Texts.s120, Texts.s121, Texts.s122, Texts.s123, Texts.s53]: TabButton {
+                        width: 62px;
+                        text: action-label;
+                        active: row.action == action-index;
+                        clicked => { root.action(row.row-index, action-index); }
+                    }
+                }
+            }
+        }
+    }
+
+    Divider { }
+
+    Text {
+        text: root.iplan-message-visible
+            ? Texts.s124
+            : Texts.s125;
+        color: Palette.text-dim;
+        font-size: Palette.font-xs;
+    }
+
+    Rectangle {
+        height: root.iplan-message-visible ? 54px : 0px;
+        visible: root.iplan-message-visible;
+        background: Palette.bg;
+        border-color: Palette.border;
+        border-width: 1px;
+        border-radius: Palette.radius-sm;
+
+        TextInput {
+            x: 6px;
+            y: 4px;
+            width: parent.width - 12px;
+            height: parent.height - 8px;
+            text <=> root.iplan-message;
+            single-line: false;
+            wrap: word-wrap;
+            color: Palette.text;
+            font-size: Palette.font-sm;
+            font-family: Palette.mono-font;
+            edited => { root.message-edited(root.iplan-message); }
+        }
+    }
+
+    HorizontalLayout {
+        spacing: Metrics.space-2;
+        alignment: end;
+
+        DlgButton {
+            text: Texts.s12;
+            clicked => { root.cancel(); }
+        }
+        DlgButton {
+            text: Texts.s126;
+            danger: true;
+            clicked => { root.confirm(); }
+        }
+    }
+}
+
+// ================================================================ 三路冲突编辑器（FR-CFL）
+
+export component CflDialog inherits DialogShell {
+    in property <[ConflictFileRow]> cfl-files: [];
+    in property <[ConflictRow]> cfl-rows: [];
+    in property <string> cfl-summary: "";
+    in property <bool> cfl-manual-visible: false;
+    in property <int> cfl-block: -1;
+    in property <bool> read-only: false;
+    in-out property <string> cfl-manual: "";
+
+    callback resolve-all(int);
+    callback take-side(int);
+    callback mark-resolved();
+    callback close();
+    callback select(int);
+    callback resolve(int, int);
+    callback pick-block(int);
+    callback manual-edited(string);
+    callback apply-manual();
+
+    dialog-max-width: 1180px;
+    dialog-max-height: 720px;
+    title: root.cfl-title;
+    in property <string> cfl-title: "";
+
+    Text {
+        text: root.cfl-summary;
+        color: Palette.text-faint;
+        font-size: Palette.font-xs;
+        vertical-alignment: center;
+    }
+
+    HorizontalLayout {
+        spacing: 6px;
+
+        FlatButton {
+            text: Texts.s127;
+            enabled: !root.read-only;
+            clicked => { root.resolve-all(0); }
+        }
+        FlatButton {
+            text: Texts.s128;
+            enabled: !root.read-only;
+            clicked => { root.resolve-all(1); }
+        }
+        FlatButton {
+            text: Texts.s129;
+            enabled: !root.read-only;
+            clicked => { root.resolve-all(2); }
+        }
+        FlatButton {
+            text: Texts.s130;
+            enabled: !root.read-only;
+            clicked => { root.take-side(2); }
+        }
+        FlatButton {
+            text: Texts.s131;
+            enabled: !root.read-only;
+            clicked => { root.take-side(3); }
+        }
+        FlatButton {
+            text: Texts.s132;
+            enabled: !root.read-only;
+            clicked => { root.mark-resolved(); }
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+
+        FlatButton {
+            text: Texts.s13;
+            clicked => { root.close(); }
+        }
+    }
+
+    HorizontalLayout {
+        vertical-stretch: 1;
+        spacing: 0px;
+
+        ListView {
+            width: 250px;
+            for file-row in root.cfl-files: Rectangle {
+                height: 26px;
+                background: file-row.selected ? Palette.hover : transparent;
+
+                TouchArea {
+                    clicked => { root.select(file-row.row-index); }
+                }
+
+                Text {
+                    x: 6px;
+                    width: 26px;
+                    text: file-row.code;
+                    color: Palette.amber;
+                    font-size: Palette.font-xs;
+                    font-family: Palette.mono-font;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    x: 34px;
+                    width: parent.width - 74px;
+                    text: file-row.path;
+                    color: Palette.text;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                Text {
+                    x: parent.width - 38px;
+                    width: 32px;
+                    text: file-row.hunks > 0 ? "×" + file-row.hunks : "✓";
+                    color: file-row.hunks > 0 ? Palette.amber : Palette.green;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                }
+            }
+        }
+
+        VDivider { }
+
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 0px;
+
+            Flickable {
+                vertical-stretch: 1;
+                content-height: conflict-content.preferred-height;
+                content-width: self.width;
+
+                conflict-content := VerticalLayout {
+                    width: parent.width;
+                    spacing: 2px;
+
+                    for row in root.cfl-rows: Rectangle {
+                        // 上下文行紧凑，冲突卡片按内容撑开。
+                        height: row.kind == 0
+                            ? max(18px, context-text.preferred-height)
+                            : card.preferred-height + 8px;
+                        background: row.kind == 0 ? transparent : Palette.bg;
+                        border-color: row.kind == 0 ? transparent : (row.decided ? Palette.line : Palette.amber);
+                        border-width: 1px;
+                        border-radius: Palette.radius;
+
+                        context-text := Text {
+                            x: 8px;
+                            width: parent.width - 16px;
+                            visible: row.kind == 0;
+                            text: row.result;
+                            color: Palette.text-dim;
+                            font-size: Palette.font-xs;
+                            font-family: Palette.mono-font;
+                            wrap: word-wrap;
+                        }
+
+                        card := VerticalLayout {
+                            x: 6px;
+                            y: 4px;
+                            width: parent.width - 12px;
+                            visible: row.kind == 1;
+                            spacing: 4px;
+
+                            HorizontalLayout {
+                                spacing: 6px;
+
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: row.label;
+                                    color: row.decided ? Palette.green : Palette.amber;
+                                    font-size: Palette.font-xs;
+                                    vertical-alignment: center;
+                                }
+
+                                FlatButton {
+                                    text: Texts.s133;
+                                    enabled: !root.read-only;
+                                    clicked => { root.resolve(row.block, 0); }
+                                }
+                                FlatButton {
+                                    text: Texts.s134;
+                                    enabled: !root.read-only;
+                                    clicked => { root.resolve(row.block, 1); }
+                                }
+                                FlatButton {
+                                    text: Texts.s135;
+                                    enabled: !root.read-only;
+                                    clicked => { root.resolve(row.block, 2); }
+                                }
+                                FlatButton {
+                                    text: Texts.s136;
+                                    enabled: !root.read-only;
+                                    clicked => { root.resolve(row.block, 3); }
+                                }
+                                FlatButton {
+                                    text: Texts.s137;
+                                    enabled: !root.read-only;
+                                    clicked => { root.pick-block(row.block); }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 6px;
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 1px;
+                                    Text {
+                                        text: Texts.s138;
+                                        color: Palette.text-faint;
+                                        font-size: 10px;
+                                    }
+                                    Text {
+                                        text: row.ours == "" ? Texts.s139 : row.ours;
+                                        color: Palette.text;
+                                        font-size: Palette.font-xs;
+                                        font-family: Palette.mono-font;
+                                        wrap: word-wrap;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 1px;
+                                    Text {
+                                        text: Texts.s140;
+                                        color: Palette.green;
+                                        font-size: 10px;
+                                    }
+                                    Text {
+                                        text: row.result;
+                                        color: Palette.text;
+                                        font-size: Palette.font-xs;
+                                        font-family: Palette.mono-font;
+                                        wrap: word-wrap;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 1px;
+                                    Text {
+                                        text: Texts.s141;
+                                        color: Palette.text-faint;
+                                        font-size: 10px;
+                                    }
+                                    Text {
+                                        text: row.theirs == "" ? Texts.s139 : row.theirs;
+                                        color: Palette.text;
+                                        font-size: Palette.font-xs;
+                                        font-family: Palette.mono-font;
+                                        wrap: word-wrap;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: root.cfl-manual-visible ? 96px : 0px;
+                visible: root.cfl-manual-visible;
+                background: Palette.bg;
+                border-color: Palette.border;
+                border-width: 1px;
+
+                TextInput {
+                    x: 6px;
+                    y: 4px;
+                    width: parent.width - 120px;
+                    height: parent.height - 8px;
+                    text <=> root.cfl-manual;
+                    single-line: false;
+                    wrap: word-wrap;
+                    color: Palette.text;
+                    font-size: Palette.font-xs;
+                    font-family: Palette.mono-font;
+                    edited => { root.manual-edited(root.cfl-manual); }
+                }
+
+                FlatButton {
+                    x: parent.width - 106px;
+                    y: 6px;
+                    text: Texts.s142;
+                    variant: "primary";
+                    enabled: !root.read-only && root.cfl-block >= 0;
+                    clicked => { root.apply-manual(); }
+                }
+            }
+        }
+    }
+}
+
+// ================================================================ 比较 / 快照浏览（FR-LOG-08）
+
+export component CompareDialog inherits DialogShell {
+    in property <[CompareRow]> compare-rows: [];
+    in property <bool> compare-browse: false;
+
+    callback select(int);
+    callback close();
+
+    dialog-max-width: 760px;
+    dialog-max-height: 520px;
+    title: root.compare-title;
+    in property <string> compare-title: "";
+
+    Text {
+        text: root.compare-browse
+            ? Texts.s143
+            : Texts.s144;
+        color: root.compare-browse ? Palette.amber : Palette.text-faint;
+        font-size: Palette.font-xs;
+    }
+
+    ListView {
+        vertical-stretch: 1;
+        for row[index] in root.compare-rows: Rectangle {
+            height: 24px;
+            background: row.selected ? Palette.hover : transparent;
+
+            TouchArea {
+                clicked => { root.select(index); }
+            }
+
+            Text {
+                x: 6px;
+                width: 24px;
+                text: row.code;
+                color: Palette.amber;
+                font-size: Palette.font-xs;
+                font-family: Palette.mono-font;
+                vertical-alignment: center;
+            }
+
+            Text {
+                x: 34px;
+                width: parent.width - 120px;
+                text: row.path;
+                color: Palette.text;
+                font-size: Palette.font-sm;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            Text {
+                x: parent.width - 80px;
+                width: 74px;
+                text: row.status;
+                color: Palette.text-faint;
+                font-size: Palette.font-xs;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+            }
+        }
+    }
+
+    HorizontalLayout {
+        alignment: end;
+        DlgButton {
+            text: Texts.s13;
+            clicked => { root.close(); }
+        }
+    }
+}
+
+
+export component FileHistoryDialog inherits DialogShell {
+    in property <[HistRow]> history-rows: [];
+    in property <string> history-title: "";
+    in property <bool> history-truncated: false;
+    in-out property <int> history-filter: 0;
+
+    callback select(int);
+    callback set-filter(int);
+    callback close();
+
+    max-width: 760px;
+    max-height: 560px;
+    title: root.history-title;
+
+    HorizontalLayout {
+        spacing: 6px;
+
+        OptionToggle {
+            text: Texts.s138;
+            checked: root.history-filter == 0;
+            toggled => { root.set-filter(0); }
+        }
+        OptionToggle {
+            text: Texts.s145;
+            checked: root.history-filter == 1;
+            toggled => { root.set-filter(1); }
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+
+        Text {
+            text: root.history-truncated ? Texts.s146 : "";
+            color: Palette.amber;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+        }
+    }
+
+    ListView {
+        vertical-stretch: 1;
+        for row[index] in root.history-rows: Rectangle {
+            height: 26px;
+            background: row.is-selected ? Palette.selection : (touch.has-hover ? Palette.hover : transparent);
+
+            HorizontalLayout {
+                padding-left: 6px;
+                padding-right: 6px;
+                spacing: 8px;
+
+                Text {
+                    width: 64px;
+                    text: row.short-id;
+                    color: Palette.green;
+                    font-size: Palette.font-xs;
+                    font-family: Palette.mono-font;
+                    vertical-alignment: center;
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: row.subject;
+                    color: Palette.text;
+                    font-size: Palette.font-sm;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Text {
+                    width: 110px;
+                    text: row.author;
+                    color: Palette.text-dim;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Text {
+                    width: 70px;
+                    text: row.when;
+                    color: Palette.text-faint;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                }
+            }
+
+            touch := TouchArea {
+                clicked => { root.select(index); }
+            }
+        }
+    }
+
+    Text {
+        text: Texts.s147;
+        color: Palette.text-faint;
+        font-size: Palette.font-xs;
+    }
+
+    HorizontalLayout {
+        alignment: end;
+        DlgButton {
+            text: Texts.s13;
+            clicked => { root.close(); }
+        }
+    }
+}

@@ -812,3 +812,180 @@ fn fixture_is_openable_by_the_builtin_engine() {
     assert!(!repo.location().is_bare);
     assert!(repo.status().expect("计算状态").is_clean());
 }
+
+// ---------------------------------------------------------------- Blame（FR-BLM，M5）
+
+/// 提交当前全部变更。
+fn commit_all(fixture: &Fixture, message: &str) {
+    fixture.git(&["add", "-A"]);
+    fixture.git(&["commit", "-q", "-m", message]);
+}
+
+/// 解析 `git blame -l` 的 `<sha> (<…> <lineno>) <code>`，返回 (sha, 最终行号)。
+fn parse_blame_l(text: &str) -> Vec<(String, usize)> {
+    text.lines()
+        .filter_map(|line| {
+            let (sha, rest) = line.split_once(' ')?;
+            // 边界提交（初始提交）在 -l 输出里带 `^` 前缀；porcelain 无此前缀。
+            let sha = sha.trim_start_matches('^');
+            let open = rest.find('(')?;
+            let close = rest[open..].find(')')?;
+            let lineno: usize = rest[open + 1..open + close]
+                .split_whitespace()
+                .last()?
+                .parse()
+                .ok()?;
+            Some((sha.to_owned(), lineno))
+        })
+        .collect()
+}
+
+/// FR-BLM-02 验收：解析结果与 `git blame -l` 逐行一致（含重命名跟随）。
+#[test]
+fn blame_matches_git_blame_l_including_rename() {
+    let Some(cli) = GitCli::detect() else {
+        return;
+    };
+    let fixture = Fixture::make("blame-consistency").expect("创建夹具");
+
+    fixture.write("code.txt", "alpha\nbeta\ngamma\n");
+    commit_all(&fixture, "第一版");
+    fixture.write("code.txt", "alpha\ndelta\ngamma\nepsilon\n");
+    commit_all(&fixture, "第二版");
+    // 重命名：blame 必须跟随到第一版。
+    fixture.git(&["mv", "code.txt", "renamed.txt"]);
+    commit_all(&fixture, "重命名");
+
+    let location = fixture.open().location().clone();
+    let rows = gt_backend::blame::blame(
+        &cli,
+        &location,
+        &NoopObserver,
+        None,
+        "renamed.txt",
+        None,
+    )
+    .expect("blame 成功");
+
+    let reference = parse_blame_l(&fixture.git(&["blame", "-l", "--", "renamed.txt"]));
+    assert_eq!(reference.len(), 4, "git blame 参照行数");
+
+    let ours: Vec<(String, usize)> = rows
+        .iter()
+        .map(|row| (row.commit.clone(), row.final_line))
+        .collect();
+
+    // 边界提交在 -l 输出中被截短一位以容纳 `^` 前缀：规范化为前 39 位再比对。
+    let norm = |sha: &str| sha.trim_start_matches('^').chars().take(39).collect::<String>();
+    let ours_norm: Vec<(String, usize)> =
+        ours.iter().map(|(s, n)| (norm(s), *n)).collect();
+    let ref_norm: Vec<(String, usize)> =
+        reference.iter().map(|(s, n)| (norm(s), *n)).collect();
+    assert_eq!(ours_norm, ref_norm, "blame 输出应与 git blame -l 逐行一致");
+
+    // 字段抽查：第一行来自第一版，第四行来自第二版。
+    assert_eq!(rows[0].summary, "第一版", "首行归因到第一版");
+    assert_eq!(rows[3].summary, "第二版");
+    assert_eq!(rows[0].author, "Knotwork Consistency");
+    assert!(rows[0].author_time > 0, "作者时间应为 Unix 秒");
+    // 全部行的提交都能在 git log 里找到（40 位十六进制已由解析保证）。
+    for row in &rows {
+        assert_eq!(row.commit.len(), 40);
+    }
+}
+
+/// FR-BLM-03 验收：链式导航命中的 (commit, 行号) 与手工上溯一致。
+#[test]
+fn chain_navigation_maps_line_and_hits_expected_commit() {
+    let Some(cli) = GitCli::detect() else {
+        return;
+    };
+    let fixture = Fixture::make("blame-chain").expect("创建夹具");
+
+    // 第一版：10 行；第二版在头部插入 3 行 → 新侧第 10 行来自旧侧第 7 行。
+    let base: String = (1..=10).fold(String::new(), |acc, i| format!("{acc}line-{i}\n"));
+    fixture.write("f.txt", &base);
+    commit_all(&fixture, "第一版");
+    let head: String = "h1\nh2\nh3\n".to_owned() + &base;
+    fixture.write("f.txt", &head);
+    commit_all(&fixture, "第二版（头部插 3 行）");
+
+    let location = fixture.open().location().clone();
+    let first = fixture.git(&["rev-parse", "HEAD~1"]);
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+
+    let mapped = gt_backend::blame::map_line_to_older(
+        &cli,
+        &location,
+        &NoopObserver,
+        &first,
+        Some(&head),
+        &["f.txt"],
+        10,
+    )
+    .expect("映射成功")
+    .expect("第 10 行应能映射到旧侧");
+    assert_eq!(mapped, 7, "头部插 3 行后第 10 行应来自旧侧第 7 行");
+
+    // 上溯后 blame 旧侧：第 7 行应命中"第一版"提交（与手工 `git blame HEAD~` 一致）。
+    let rows = gt_backend::blame::blame(&cli, &location, &NoopObserver, Some(&first), "f.txt", None)
+        .expect("旧侧 blame 成功");
+    assert_eq!(rows[6].commit, first, "上溯后第 7 行应归因到第一版提交");
+    assert_eq!(rows[6].summary, "第一版");
+}
+
+/// 工作区 blame（spec = None）覆盖未提交的修改行（boundary / 归因到当前）。
+#[test]
+fn worktree_blame_covers_uncommitted_lines() {
+    let Some(cli) = GitCli::detect() else {
+        return;
+    };
+    let fixture = Fixture::make("blame-worktree").expect("创建夹具");
+    fixture.write("f.txt", "committed\n");
+    commit_all(&fixture, "已提交版");
+    fixture.write("f.txt", "committed\nstaged-later\n");
+
+    let location = fixture.open().location().clone();
+    let rows =
+        gt_backend::blame::blame(&cli, &location, &NoopObserver, None, "f.txt", None)
+            .expect("工作区 blame 成功");
+    assert_eq!(rows.len(), 2);
+    // 未提交的行归因到"未提交"（git 输出为全零提交）。
+    assert!(
+        rows[1].commit.bytes().all(|b| b == b'0'),
+        "未提交行应归因到零提交，实际 {}",
+        rows[1].commit
+    );
+}
+
+/// 文件历史：`--follow` 列出重命名前后的全部提交（FR-BLM-01）。
+#[test]
+fn file_history_follows_renames() {
+    let Some(cli) = GitCli::detect() else {
+        return;
+    };
+    let fixture = Fixture::make("file-history").expect("创建夹具");
+    fixture.write("old.txt", "one\n");
+    commit_all(&fixture, "第一次");
+    fixture.write("old.txt", "one\ntwo\n");
+    commit_all(&fixture, "第二次");
+    fixture.git(&["mv", "old.txt", "new.txt"]);
+    commit_all(&fixture, "重命名");
+
+    let location = fixture.open().location().clone();
+    let rows = gt_backend::blame::file_history(
+        &cli,
+        &location,
+        &NoopObserver,
+        false,
+        "new.txt",
+        None,
+    )
+    .expect("文件历史成功");
+    let summaries: Vec<&str> = rows.iter().map(|r| r.summary.as_str()).collect();
+    assert_eq!(summaries, vec!["重命名", "第二次", "第一次"], "--follow 应覆盖重命名前");
+    for row in &rows {
+        assert_eq!(row.commit.len(), 40);
+        assert_eq!(row.short.len(), 7, "%h 短哈希");
+    }
+}

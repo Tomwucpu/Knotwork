@@ -1,629 +1,25 @@
-// Knotwork 主窗口（M2：本地写入）。
-//
-// 结构自上而下：标题栏 → 横幅（进行中 / 只读 / git 缺失）→ 主体（左：引用+分支操作；右：Log + Diff）
-//               → 底部面板（本地更改 + 提交 / Console）→ 状态栏；另有两个遮罩层（确认 / 设置）。
-//
-// 三条渲染纪律（架构规划第 5 节）：
-//   1. 列表全虚拟化 —— 用 ListView，只创建视口内的行；
-//   2. 泳道图按行自绘 —— Rust 侧把布局算成"每列一个格子"，界面只负责画；
-//   3. 词级高亮按"分段文本"传入 —— 界面不做文本测量，避免每帧重排。
-//
-// 主题：所有颜色都取自 Palette。Palette.dark 由窗口在 init 与属性变更时写入，
-// 因此主题切换是"改一个布尔值"，没有任何重建逻辑。Slint 的 global 是进程级单例，
-// 多窗口共享同一主题 —— 这正是我们想要的语义（一个应用一套主题）。
 
-import { CheckBox, ListView } from "std-widgets.slint";
-
-// ---------------------------------------------------------------- 主题
-
-global Palette {
-    // 由窗口写入（init / 主题切换时），不作为绑定源，避免多窗口绑定冲突。
-    in-out property <bool> dark: true;
-
-    out property <color> bg: dark ? #1e1f22 : #f7f8fa;
-    out property <color> panel: dark ? #26272b : #eef0f4;
-    out property <color> bar: dark ? #2b2d30 : #e4e7ec;
-    out property <color> line: dark ? #3c3f41 : #d7dbe1;
-    out property <color> text: dark ? #e8eaed : #1f2328;
-    out property <color> text-dim: dark ? #bdc1c6 : #3d4450;
-    out property <color> text-faint: dark ? #8b9198 : #6a7280;
-    out property <color> accent: dark ? #35507a : #d3e3ff;
-    out property <color> accent-text: dark ? #ffffff : #12325e;
-    out property <color> green: dark ? #6ee7b7 : #0d7350;
-    out property <color> amber: dark ? #f0b429 : #8a5a00;
-    out property <color> red: dark ? #f2a6ab : #a01b26;
-    out property <color> add-bg: dark ? #1f3a24 : #e6ffed;
-    out property <color> del-bg: dark ? #3a1f22 : #ffeef0;
-    out property <color> hover: dark ? #2f3136 : #e9ecf1;
-    out property <color> border: dark ? #4a4d50 : #c7ccd4;
-    out property <color> danger-bg: dark ? #5a2a2a : #ffe1e1;
-    out property <color> danger-text: dark ? #ffd4d4 : #8b1111;
-    out property <color> warn-bg: dark ? #6b5100 : #fff2cc;
-    out property <color> warn-text: dark ? #ffe9a8 : #6b4b00;
-    out property <color> seg-changed: dark ? #ffd166 : #a15c00;
-    out property <string> mono-font: "Consolas";
-    out property <length> mono-size: 11px;
-    out property <length> body-size: 12px;
+import { CheckBox, ListView, Slider } from "std-widgets.slint";
+import { Palette, Metrics } from "theme.slint";
+import { Texts } from "texts.slint";
+import {
+    RefEntry, GraphCell, LogRow, ChangeRow, DiffRow, ConsoleRow, PushRow,
+    RemoteRow, RecentRow, StashRow, ConflictFileRow, ConflictRow,
+    RebaseStepRow, CompareRow, BlameRow, HistRow,
+} from "model.slint";
+// 数据结构对 Rust 侧的再导出：include_modules! 据此生成类型，
+// view_model.rs / session.rs / app/windows.rs 都在引用。
+export {
+    RefEntry, GraphCell, LogRow, ChangeRow, DiffRow, ConsoleRow, PushRow,
+    RemoteRow, RecentRow, StashRow, ConflictFileRow, ConflictRow,
+    RebaseStepRow, CompareRow, BlameRow, HistRow,
 }
-
-// 尺寸常量。
-global Metrics {
-    out property <length> lane-width: 12px;
-    out property <length> log-row-height: 24px;
-}
-
-// ---------------------------------------------------------------- 数据结构
-
-// 引用列表 / 分支面板的一行。
-export struct RefEntry {
-    name: string,
-    kind: string,
-    is-head: bool,
-    sync: string,
-    selected: bool,
-    // 0 = 本地分支，1 = 远程分支，2 = 标签
-    kind-id: int,
-}
-
-// 泳道图的一列：0 = 空，1 = 竖向连线，2 = 本行节点。
-export struct GraphCell {
-    kind: int,
-    color: color,
-}
-
-// 日志列表的一行。
-export struct LogRow {
-    short-id: string,
-    subject: string,
-    author: string,
-    when: string,
-    refs-text: string,
-    is-selected: bool,
-    // FR-LOG-06：我的提交加粗、合并提交置灰。
-    is-mine: bool,
-    is-merge: bool,
-    graph: [GraphCell],
-}
-
-// 本地更改列表的一行。
-export struct ChangeRow {
-    path: string,
-    code: string,
-    bucket: string,
-    note: string,
-    is-selected: bool,
-    is-conflict: bool,
-    is-untracked: bool,
-}
-
-// Diff 的一行。
-//
-// `hunk-index` / `line-index` 是"这一行对应哪一块、哪一行"，-1 表示不可选
-// （hunk 头、占位行）。Rust 侧据它把点击换算成补丁选择，界面不需要懂 diff 结构。
-export struct DiffRow {
-    kind: int,
-    old-no: string,
-    new-no: string,
-    segments: [string],
-    changed: [bool],
-    is-hunk-header: bool,
-    hunk-index: int,
-    line-index: int,
-    selectable: bool,
-    selected: bool,
-}
-
-// Console 的一行。
-export struct ConsoleRow {
-    route: string,
-    summary: string,
-    detail: string,
-    ok: bool,
-}
-
-// 推送预览的一行（将被推送的提交）。
-export struct PushRow {
-    short-id: string,
-    subject: string,
-    author: string,
-    when: string,
-}
-
-// 远端列表的一行。
-export struct RemoteRow {
-    name: string,
-    url: string,
-    detail: string,
-    selected: bool,
-}
-
-// 最近仓库的一项。
-export struct RecentRow {
-    name: string,
-    path: string,
-}
-
-// 贮藏列表的一行（FR-STH）。
-export struct StashRow {
-    index: int,
-    selector: string,
-    summary: string,
-    branch: string,
-}
-
-// 三路编辑器左侧的冲突文件行（FR-CFL-02）。
-export struct ConflictFileRow {
-    row-index: int,
-    path: string,
-    code: string,
-    hunks: int,
-    selected: bool,
-}
-
-// 三路编辑器的一行：kind=0 是上下文（只有 result），kind=1 是三栏冲突块。
-export struct ConflictRow {
-    kind: int,
-    block: int,
-    label: string,
-    ours: string,
-    theirs: string,
-    result: string,
-    decided: bool,
-}
-
-// 交互式变基步骤的一行（FR-MRG-03）。
-export struct RebaseStepRow {
-    row-index: int,
-    short-id: string,
-    subject: string,
-    action: int,
-    selected: bool,
-    has-message: bool,
-}
-
-// 两提交比较 / 快照浏览的文件行（FR-LOG-08）。
-export struct CompareRow {
-    path: string,
-    code: string,
-    status: string,
-    selected: bool,
-}
-
-// ---------------------------------------------------------------- 子组件
-
-component FlatButton inherits Rectangle {
-    in property <string> text;
-    in property <bool> enabled: true;
-    in property <bool> danger: false;
-    callback clicked();
-
-    width: max(48px, label.preferred-width + 16px);
-    height: 22px;
-    background: !root.enabled
-        ? (Palette.dark ? #33353a : #e6e8ec)
-        : (touch.pressed
-            ? (Palette.dark ? #3d3f42 : #d0d4da)
-            : (touch.has-hover ? (Palette.dark ? #35373a : #dfe3e9) : Palette.bar));
-    border-radius: 3px;
-    border-width: 1px;
-    border-color: root.danger ? Palette.red : Palette.border;
-
-    label := Text {
-        text: root.text;
-        color: !root.enabled
-            ? Palette.text-faint
-            : (root.danger ? Palette.red : Palette.text);
-        font-size: 11px;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-
-    touch := TouchArea {
-        enabled: root.enabled;
-        clicked => { root.clicked(); }
-    }
-}
-
-component TabButton inherits Rectangle {
-    in property <string> text;
-    in property <bool> active;
-    callback clicked();
-
-    width: max(120px, label.preferred-width + 20px);
-    height: 28px;
-    background: root.active ? Palette.panel : transparent;
-
-    label := Text {
-        text: root.text;
-        color: root.active ? Palette.text : Palette.text-faint;
-        font-size: 12px;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-
-    Rectangle {
-        width: 100%;
-        height: 2px;
-        y: 26px;
-        background: Palette.green;
-        visible: root.active;
-    }
-
-    touch := TouchArea {
-        clicked => { root.clicked(); }
-    }
-}
-
-component Field inherits Rectangle {
-    in-out property <string> text;
-    in property <string> placeholder: "";
-    in property <bool> monospace: false;
-    callback edited(string);
-
-    height: 26px;
-    background: Palette.bg;
-    border-color: Palette.border;
-    border-width: 1px;
-    border-radius: 3px;
-
-    input := TextInput {
-        x: 6px;
-        width: parent.width - 12px;
-        height: parent.height;
-        text <=> root.text;
-        single-line: true;
-        color: Palette.text;
-        font-size: 11px;
-        font-family: root.monospace ? Palette.mono-font : "";
-        vertical-alignment: center;
-        edited => { root.edited(root.text); }
-    }
-}
-
-component OptionToggle inherits Rectangle {
-    in property <string> text;
-    in property <bool> checked;
-    callback toggled();
-
-    width: max(72px, label.preferred-width + 22px);
-    height: 22px;
-    background: root.checked ? Palette.accent : transparent;
-    border-radius: 3px;
-    border-width: 1px;
-    border-color: root.checked ? Palette.accent : Palette.line;
-
-    label := Text {
-        text: (root.checked ? "✓ " : "") + root.text;
-        color: root.checked ? Palette.accent-text : Palette.text-faint;
-        font-size: 11px;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-
-    touch := TouchArea {
-        clicked => { root.toggled(); }
-    }
-}
-
-// 日志行：左侧泳道图 + 提交信息。
-// 上下文菜单的一行：左对齐文字 + 悬停高亮。
-component CtxMenuItem inherits Rectangle {
-    in property <string> text;
-    in property <bool> enabled: true;
-    callback clicked();
-
-    height: 26px;
-    background: touch.has-hover && root.enabled ? Palette.hover : transparent;
-    border-radius: 3px;
-
-    Text {
-        x: 8px;
-        width: parent.width - 16px;
-        text: root.text;
-        color: !root.enabled ? Palette.text-faint : Palette.text;
-        font-size: 12px;
-        vertical-alignment: center;
-        overflow: elide;
-    }
-
-    touch := TouchArea {
-        enabled: root.enabled;
-        clicked => { root.clicked(); }
-    }
-}
-
-component LogRowView inherits Rectangle {
-    in property <string> short-id;
-    in property <string> subject;
-    in property <string> author;
-    in property <string> when;
-    in property <string> refs-text;
-    in property <[GraphCell]> graph;
-    in property <bool> is-selected;
-    in property <bool> is-mine;
-    in property <bool> is-merge;
-    callback clicked();
-    // 右键：提交上下文菜单（FR-LOG-07/08）。带上光标坐标，菜单出现在鼠标处。
-    callback context-clicked(length, length);
-
-    background: root.is-selected
-        ? (Palette.dark ? #35507a : #cfe0ff)
-        : (touch.has-hover ? Palette.hover : transparent);
-
-    HorizontalLayout {
-        spacing: 0px;
-
-        // 泳道图：每列一个格子，格子内部自绘连线与节点。
-        Rectangle {
-            width: root.graph.length * Metrics.lane-width;
-            height: 100%;
-
-            HorizontalLayout {
-                spacing: 0px;
-
-                for cell in root.graph: Rectangle {
-                    width: Metrics.lane-width;
-
-                    Rectangle {
-                        x: 5px;
-                        width: 2px;
-                        height: 100%;
-                        background: cell.color;
-                        visible: cell.kind == 1 || cell.kind == 2;
-                    }
-
-                    Rectangle {
-                        x: 1px;
-                        y: 7px;
-                        width: 9px;
-                        height: 9px;
-                        border-radius: 5px;
-                        background: cell.color;
-                        visible: cell.kind == 2;
-                    }
-                }
-            }
-        }
-
-        Text {
-            width: 62px;
-            text: root.short-id;
-            color: Palette.text-faint;
-            font-size: 11px;
-            vertical-alignment: center;
-            font-family: Palette.mono-font;
-        }
-
-        Text {
-            width: 150px;
-            text: root.refs-text;
-            color: Palette.amber;
-            font-size: 11px;
-            vertical-alignment: center;
-            overflow: elide;
-        }
-
-        Text {
-            horizontal-stretch: 1;
-            text: root.subject;
-            // FR-LOG-06：合并提交置灰；我的提交加粗。
-            color: root.is-merge ? Palette.text-faint : Palette.text;
-            font-size: Palette.body-size;
-            font-weight: root.is-mine ? 700 : 400;
-            vertical-alignment: center;
-            overflow: elide;
-        }
-
-        Text {
-            width: 120px;
-            text: root.author;
-            color: Palette.text-faint;
-            font-size: 11px;
-            vertical-alignment: center;
-            overflow: elide;
-        }
-
-        Text {
-            width: 130px;
-            text: root.when;
-            color: Palette.text-faint;
-            font-size: 11px;
-            vertical-alignment: center;
-            horizontal-alignment: right;
-        }
-    }
-
-    touch := TouchArea {
-        clicked => { root.clicked(); }
-        pointer-event(event) => {
-            if (event.button == PointerEventButton.right) {
-                // 菜单贴在该行的左边缘展开：`PointerEvent` 不提供光标坐标，
-                // 而"点击哪一行就在哪一行旁边弹出"本来就是上下文菜单的语义。
-                root.context-clicked(
-                    touch.absolute-position.x + 48px,
-                    touch.absolute-position.y);
-            }
-        }
-    }
-}
-
-// Diff 行：行号槽 + 分段文本 + 选择高亮。
-component DiffRowView inherits Rectangle {
-    in property <int> kind;
-    in property <string> old-no;
-    in property <string> new-no;
-    in property <[string]> segments;
-    in property <[bool]> changed;
-    in property <bool> is-hunk-header;
-    in property <bool> selectable;
-    in property <bool> selected;
-    callback clicked();
-
-    // kind: 0 上下文、1 新增、2 删除、3 元信息
-    background: root.is-hunk-header
-        ? Palette.bar
-        : (root.kind == 1 ? Palette.add-bg : (root.kind == 2 ? Palette.del-bg : transparent));
-
-    // 选中态用左侧色条 + 底色叠加表示，避免盖掉增删行的底色语义。
-    Rectangle {
-        width: 3px;
-        height: 100%;
-        background: Palette.amber;
-        visible: root.selected;
-    }
-
-    HorizontalLayout {
-        spacing: 0px;
-
-        Text {
-            width: 46px;
-            text: root.old-no;
-            color: Palette.text-faint;
-            font-size: 11px;
-            vertical-alignment: center;
-            horizontal-alignment: right;
-            font-family: Palette.mono-font;
-        }
-
-        Text {
-            width: 46px;
-            text: root.new-no;
-            color: Palette.text-faint;
-            font-size: 11px;
-            vertical-alignment: center;
-            horizontal-alignment: right;
-            font-family: Palette.mono-font;
-        }
-
-        Rectangle { width: 12px; }
-
-        HorizontalLayout {
-            horizontal-stretch: 1;
-            spacing: 0px;
-
-            for segment[i] in root.segments: Text {
-                text: segment;
-                color: root.changed[i]
-                    ? Palette.seg-changed
-                    : (root.kind == 2 ? Palette.red : (root.kind == 1 ? Palette.green : Palette.text-dim));
-                font-size: Palette.body-size;
-                vertical-alignment: center;
-                font-family: Palette.mono-font;
-            }
-        }
-    }
-
-    touch := TouchArea {
-        enabled: root.selectable;
-        clicked => { root.clicked(); }
-    }
-}
-
-// 本地更改行。
-component ChangeRowView inherits Rectangle {
-    in property <string> path;
-    in property <string> code;
-    in property <string> bucket;
-    in property <string> note;
-    in property <bool> is-selected;
-    in property <bool> is-conflict;
-    callback clicked();
-
-    background: root.is-selected
-        ? (Palette.dark ? #35507a : #cfe0ff)
-        : (touch.has-hover ? Palette.hover : transparent);
-
-    HorizontalLayout {
-        padding-left: 8px;
-        padding-right: 8px;
-        spacing: 8px;
-
-        Text {
-            width: 120px;
-            text: root.bucket;
-            color: root.is-conflict ? Palette.red : Palette.text-faint;
-            font-size: 11px;
-            vertical-alignment: center;
-            overflow: elide;
-        }
-
-        Text {
-            width: 26px;
-            text: root.code;
-            color: Palette.amber;
-            font-size: 11px;
-            vertical-alignment: center;
-            font-family: Palette.mono-font;
-        }
-
-        Text {
-            horizontal-stretch: 1;
-            text: root.path;
-            color: Palette.text;
-            font-size: Palette.body-size;
-            vertical-alignment: center;
-            overflow: elide;
-        }
-
-        Text {
-            width: 150px;
-            text: root.note;
-            color: Palette.text-faint;
-            font-size: 11px;
-            vertical-alignment: center;
-            overflow: elide;
-        }
-    }
-
-    touch := TouchArea {
-        clicked => { root.clicked(); }
-    }
-}
-
-// Console 行。
-component ConsoleRowView inherits Rectangle {
-    in property <string> route;
-    in property <string> summary;
-    in property <string> detail;
-    in property <bool> ok;
-
-    background: transparent;
-
-    HorizontalLayout {
-        padding-left: 8px;
-        padding-right: 8px;
-        spacing: 8px;
-
-        Text {
-            width: 92px;
-            text: root.route;
-            color: root.ok ? Palette.green : Palette.red;
-            font-size: 11px;
-            vertical-alignment: center;
-        }
-
-        Text {
-            horizontal-stretch: 1;
-            text: root.summary;
-            color: Palette.text-dim;
-            font-size: 11px;
-            vertical-alignment: center;
-            overflow: elide;
-            font-family: Palette.mono-font;
-        }
-
-        Text {
-            width: 240px;
-            text: root.detail;
-            color: Palette.text-faint;
-            font-size: 11px;
-            vertical-alignment: center;
-            overflow: elide;
-        }
-    }
-}
-
-// ---------------------------------------------------------------- 主窗口
+import { FlatButton, TabButton, Field, OptionToggle, Divider, VDivider, SectionLabel } from "widgets.slint";
+import { LogRowView, DiffRowView, ChangeRowView, ConsoleRowView, BlameRowView } from "rows.slint";
+import {
+    ConfirmDialog, SettingsDialog, PushDialog, RemotesDialog, CommitCtxMenu,
+    OpDialog, IplanDialog, CflDialog, CompareDialog, FileHistoryDialog,
+} from "dialogs.slint";
 
 export component MainWindow inherits Window {
     // ---- 仓库与状态 ----
@@ -638,6 +34,11 @@ export component MainWindow inherits Window {
     // ---- 主题（FR-SET-02 外观组）----
     in-out property <bool> dark-theme: true;
 
+    // ---- 界面语言（NFR-L10N-01）：英文为真时 Texts 全量切换 ----
+    in-out property <bool> english-ui: false;
+    // 设置对话框里的语言选择（保存并应用后写入 english-ui）。
+    in-out property <bool> set-language-en: false;
+
     // ---- 只读模式（FR-MR-04）----
     in-out property <bool> read-only: false;
     in-out property <string> read-only-reason: "";
@@ -650,7 +51,7 @@ export component MainWindow inherits Window {
     // ---- 空状态（未打开仓库）----
     in-out property <bool> has-repo: false;
     in-out property <string> open-path: "";
-    in-out property <string> empty-message: "输入仓库路径后打开，或从下方最近仓库中选择。";
+    in-out property <string> empty-message: Texts.s0;
     in-out property <[RecentRow]> recent: [];
 
     // ---- 日志面板 ----
@@ -668,7 +69,7 @@ export component MainWindow inherits Window {
 
     // ---- Diff 面板 ----
     in-out property <[DiffRow]> diff-rows: [];
-    in-out property <string> diff-title: "差异";
+    in-out property <string> diff-title: Texts.s1;
     in-out property <string> diff-stats: "";
     in-out property <bool> diff-loading: false;
     in-out property <string> diff-hint: "";
@@ -729,7 +130,7 @@ export component MainWindow inherits Window {
     in-out property <bool> push-creates-branch: false;
     in-out property <bool> push-protected: false;
 
-    // ---- 底部面板标签：0 = 本地更改，1 = Console ----
+    // ---- 底部面板标签：0 = 本地更改，1 = Console，2 = Stash ----
     in-out property <int> bottom-tab: 0;
 
     // ---- 能力提示（FR-STA-04）----
@@ -741,7 +142,7 @@ export component MainWindow inherits Window {
 
     // ---- 二次确认遮罩（FR-LC-02 / D4）----
     in-out property <bool> confirm-visible: false;
-    in-out property <string> confirm-title: "确认操作";
+    in-out property <string> confirm-title: Texts.s2;
     in-out property <string> confirm-detail: "";
     in-out property <bool> confirm-danger: true;
 
@@ -815,6 +216,32 @@ export component MainWindow inherits Window {
     in-out property <string> advanced-label: "";
     in-out property <bool> resume-visible: false;
     in-out property <bool> resume-can-skip: false;
+
+    in-out property <bool> blame-visible: false;
+    in-out property <[BlameRow]> blame-rows: [];
+    in-out property <string> blame-title: "";
+    in-out property <string> blame-spec-label: "";
+    in-out property <int> blame-selected: -1;
+    in-out property <int> blame-anchor: -1;
+    in-out property <bool> blame-can-chain: false;
+    in-out property <string> blame-truncated: "";
+
+    in-out property <bool> diff-image-visible: false;
+    in property <image> diff-img-old;
+    in property <image> diff-img-new;
+    in-out property <bool> diff-img-old-present: false;
+    in-out property <bool> diff-img-new-present: false;
+    in-out property <string> diff-img-meta-old: "";
+    in-out property <string> diff-img-meta-new: "";
+    in-out property <bool> diff-img-equal: false;
+    in-out property <int> img-mode: 0;
+    in-out property <float> img-blend: 0.5;
+
+    in-out property <bool> history-visible: false;
+    in-out property <[HistRow]> history-rows: [];
+    in-out property <string> history-title: "";
+    in-out property <bool> history-truncated: false;
+    in-out property <int> history-filter: 0;
 
     callback poll();
     callback refresh();
@@ -938,13 +365,34 @@ export component MainWindow inherits Window {
     callback resume-skip();
     callback resume-abort();
 
-    title: repo-title + (read-only ? "（只读）" : "");
+    callback request-blame-selected();
+    callback request-file-history-selected();
+    callback blame-select(int);
+    callback blame-close();
+    callback blame-chain();
+    callback blame-open-history();
+    callback history-select(int);
+    callback history-set-filter(int);
+    callback history-close();
+
+    title: repo-title + (read-only ? Texts.s3 : "");
     width: 1280px;
     height: 860px;
     background: Palette.bg;
 
-    init => { Palette.dark = root.dark-theme; }
+    init => {
+        Palette.dark = root.dark-theme;
+        Texts.en = root.english-ui;
+    }
     changed dark-theme => { Palette.dark = root.dark-theme; }
+    changed english-ui => { Texts.en = root.english-ui; }
+
+    changed blame-anchor => {
+        if (root.blame-anchor >= 0) {
+            blame-list.content-y = min(0px, -(root.blame-anchor * Metrics.blame-row-height));
+            root.blame-anchor = -1;
+        }
+    }
 
     // 每 100ms 向 Rust 侧要一次异步结果（UI 线程只做搬运，不做 I/O）。
     Timer {
@@ -958,8 +406,10 @@ export component MainWindow inherits Window {
         spacing: 0px;
 
         // ---------------------------------------------------- 标题栏
+        // S4：按钮改 ghost 形态并按"取 / 更新 / 推送 / 管理"分组加分隔线，
+        // 分支名做成 IDEA 式分支标签。
         Rectangle {
-            height: 44px;
+            height: Metrics.title-bar-height;
             background: Palette.bar;
 
             HorizontalLayout {
@@ -974,42 +424,60 @@ export component MainWindow inherits Window {
                     Text {
                         text: root.repo-title;
                         color: Palette.text;
-                        font-size: 15px;
+                        font-size: Palette.font-title;
                         font-weight: 600;
                     }
 
                     Text {
                         text: root.repo-path;
                         color: Palette.text-faint;
-                        font-size: 11px;
+                        font-size: Palette.font-xs;
                         overflow: elide;
                     }
                 }
 
                 Rectangle { horizontal-stretch: 1; }
 
-                Text {
-                    text: root.branch-text;
-                    color: Palette.green;
-                    font-size: 13px;
-                    vertical-alignment: center;
+                // 分支 widget：IDEA 式当前分支标签。
+                Rectangle {
+                    height: 24px;
+                    border-radius: Palette.radius-sm;
+                    border-width: 1px;
+                    border-color: Palette.line;
+                    visible: root.has-repo;
+
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        alignment: center;
+
+                        Text {
+                            text: root.branch-text;
+                            color: Palette.green;
+                            font-size: Palette.font-md;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
                 }
 
                 Text {
                     text: root.head-text;
                     color: Palette.text-faint;
-                    font-size: 11px;
+                    font-size: Palette.font-xs;
                     vertical-alignment: center;
                 }
 
-                // ---- 远端操作（FR-RMT-01/02/03）----
                 Text {
                     text: root.remote-current;
                     color: Palette.text-faint;
-                    font-size: 11px;
+                    font-size: Palette.font-xs;
                     vertical-alignment: center;
                 }
 
+                VDivider { }
+
+                // ---- 远端操作（FR-RMT-01/02/03）----
                 FlatButton {
                     text: "Fetch";
                     enabled: root.has-repo && !root.cli-missing && !root.network-busy;
@@ -1017,10 +485,12 @@ export component MainWindow inherits Window {
                 }
 
                 FlatButton {
-                    text: "全部";
+                    text: Texts.s4;
                     enabled: root.has-repo && !root.cli-missing && !root.network-busy;
                     clicked => { root.fetch-all(); }
                 }
+
+                VDivider { }
 
                 FlatButton {
                     text: "Update";
@@ -1036,19 +506,21 @@ export component MainWindow inherits Window {
                     clicked => { root.push-request(); }
                 }
 
+                VDivider { }
+
                 FlatButton {
-                    text: "远端";
+                    text: Texts.s5;
                     enabled: root.has-repo && !root.cli-missing;
                     clicked => { root.open-remotes(); }
                 }
 
                 FlatButton {
-                    text: "设置";
+                    text: Texts.s6;
                     clicked => { root.open-settings(); }
                 }
 
                 FlatButton {
-                    text: "刷新";
+                    text: Texts.s7;
                     clicked => { root.refresh(); }
                 }
             }
@@ -1069,33 +541,33 @@ export component MainWindow inherits Window {
                     horizontal-stretch: 1;
                     text: root.state-text;
                     color: Palette.warn-text;
-                    font-size: 12px;
+                    font-size: Palette.font-sm;
                     vertical-alignment: center;
                     overflow: elide;
                 }
 
                 FlatButton {
-                    text: "继续";
+                    text: Texts.s8;
                     visible: root.resume-visible;
                     clicked => { root.resume-continue(); }
                 }
 
                 FlatButton {
-                    text: "跳过";
+                    text: Texts.s9;
                     visible: root.resume-visible && root.resume-can-skip;
                     danger: true;
                     clicked => { root.resume-skip(); }
                 }
 
                 FlatButton {
-                    text: "中止";
+                    text: Texts.s10;
                     visible: root.resume-visible;
                     danger: true;
                     clicked => { root.resume-abort(); }
                 }
 
                 FlatButton {
-                    text: "查看命令";
+                    text: Texts.s11;
                     clicked => { root.bottom-tab = 1; }
                 }
             }
@@ -1111,7 +583,7 @@ export component MainWindow inherits Window {
                 x: 14px;
                 text: root.read-only-reason;
                 color: Palette.danger-text;
-                font-size: 12px;
+                font-size: Palette.font-sm;
                 vertical-alignment: center;
             }
         }
@@ -1128,7 +600,7 @@ export component MainWindow inherits Window {
                 width: parent.width - 28px;
                 text: root.cli-missing-reason;
                 color: Palette.danger-text;
-                font-size: 12px;
+                font-size: Palette.font-sm;
                 vertical-alignment: center;
                 wrap: word-wrap;
             }
@@ -1148,7 +620,7 @@ export component MainWindow inherits Window {
                 Text {
                     text: root.network-label + "…";
                     color: Palette.text;
-                    font-size: 11px;
+                    font-size: Palette.font-xs;
                     vertical-alignment: center;
                 }
 
@@ -1156,14 +628,14 @@ export component MainWindow inherits Window {
                     horizontal-stretch: 1;
                     text: root.network-progress;
                     color: Palette.text-faint;
-                    font-size: 11px;
+                    font-size: Palette.font-xs;
                     font-family: Palette.mono-font;
                     vertical-alignment: center;
                     overflow: elide;
                 }
 
                 FlatButton {
-                    text: "取消";
+                    text: Texts.s12;
                     danger: true;
                     clicked => { root.cancel-network(); }
                 }
@@ -1185,13 +657,13 @@ export component MainWindow inherits Window {
                     horizontal-stretch: 1;
                     text: root.network-error;
                     color: Palette.danger-text;
-                    font-size: 11px;
+                    font-size: Palette.font-xs;
                     wrap: word-wrap;
                     overflow: elide;
                 }
 
                 FlatButton {
-                    text: "关闭";
+                    text: Texts.s13;
                     clicked => { root.dismiss-network-error(); }
                 }
             }
@@ -1209,17 +681,12 @@ export component MainWindow inherits Window {
                 visible: root.has-repo;
 
                 VerticalLayout {
-                    padding: 8px;
+                    padding: Metrics.space-2;
                     spacing: 6px;
 
-                    Text {
-                        text: "分支与标签";
-                        color: Palette.text-dim;
-                        font-size: 12px;
-                        font-weight: 600;
-                    }
+                    SectionLabel { text: Texts.s14; }
 
-                    Rectangle { height: 1px; background: Palette.line; }
+                    Divider { }
 
                     ListView {
                         vertical-stretch: 1;
@@ -1234,7 +701,7 @@ export component MainWindow inherits Window {
                                 width: parent.width - 60px;
                                 text: entry.name;
                                 color: entry.is-head ? Palette.accent-text : Palette.text-dim;
-                                font-size: 12px;
+                                font-size: Palette.font-sm;
                                 vertical-alignment: center;
                                 overflow: elide;
                             }
@@ -1255,67 +722,67 @@ export component MainWindow inherits Window {
                         }
                     }
 
-                    Rectangle { height: 1px; background: Palette.line; }
+                    Divider { }
 
                     Field {
                         // 双向绑定：Rust 侧选中分支时会回填名称，用户输入也要能写回属性。
                         text <=> root.branch-input;
-                        placeholder: "新分支名 / 新名称";
+                        placeholder: Texts.s15;
                         edited(v) => { root.set-branch-input(v); }
                     }
 
                     HorizontalLayout {
-                        spacing: 4px;
+                        spacing: Metrics.space-1;
 
                         FlatButton {
-                            text: "新建";
+                            text: Texts.s16;
                             enabled: !root.read-only;
                             clicked => { root.branch-create(true); }
                         }
                         FlatButton {
-                            text: "仅建";
+                            text: Texts.s17;
                             enabled: !root.read-only;
                             clicked => { root.branch-create(false); }
                         }
                         FlatButton {
-                            text: "检出";
+                            text: Texts.s18;
                             enabled: !root.read-only;
                             clicked => { root.branch-checkout(); }
                         }
                     }
 
                     HorizontalLayout {
-                        spacing: 4px;
+                        spacing: Metrics.space-1;
 
                         FlatButton {
-                            text: "重命名";
+                            text: Texts.s19;
                             enabled: !root.read-only;
                             clicked => { root.branch-rename(); }
                         }
                         FlatButton {
-                            text: "删除";
+                            text: Texts.s20;
                             enabled: !root.read-only;
                             danger: true;
                             clicked => { root.branch-delete(false); }
                         }
                         FlatButton {
-                            text: "设上游";
+                            text: Texts.s21;
                             enabled: !root.read-only;
                             clicked => { root.branch-upstream(); }
                         }
                     }
 
                     HorizontalLayout {
-                        spacing: 4px;
+                        spacing: Metrics.space-1;
 
                         FlatButton {
-                            text: "检出所选提交（分离）";
+                            text: Texts.s22;
                             enabled: !root.read-only;
                             clicked => { root.checkout-selected-commit(); }
                         }
 
                         FlatButton {
-                            text: "删标签";
+                            text: Texts.s23;
                             danger: true;
                             enabled: !root.read-only;
                             clicked => { root.delete-tag(); }
@@ -1335,7 +802,7 @@ export component MainWindow inherits Window {
                     spacing: 0px;
 
                     Rectangle {
-                        height: 30px;
+                        height: Metrics.panel-bar-height;
                         background: Palette.bar;
 
                         HorizontalLayout {
@@ -1343,18 +810,12 @@ export component MainWindow inherits Window {
                             padding-right: 10px;
                             spacing: 6px;
 
-                            Text {
-                                text: "提交历史";
-                                color: Palette.text;
-                                font-size: 12px;
-                                font-weight: 600;
-                                vertical-alignment: center;
-                            }
+                            SectionLabel { text: Texts.s24; }
 
                             Text {
                                 text: root.log-summary;
                                 color: Palette.text-faint;
-                                font-size: 11px;
+                                font-size: Palette.font-xs;
                                 vertical-alignment: center;
                             }
 
@@ -1363,24 +824,24 @@ export component MainWindow inherits Window {
                             Field {
                                 width: 200px;
                                 text <=> root.search-query;
-                                placeholder: "搜索提交消息 / 哈希";
+                                placeholder: Texts.s25;
                                 monospace: true;
                                 edited(v) => { root.set-search(v); }
                             }
 
                             OptionToggle {
-                                text: "正则";
+                                text: Texts.s26;
                                 checked: root.search-regex;
                                 toggled => { root.toggle-search-regex(!root.search-regex); }
                             }
 
                             FlatButton {
-                                text: "搜索";
+                                text: Texts.s27;
                                 clicked => { root.run-search(); }
                             }
 
                             FlatButton {
-                                text: "清除";
+                                text: Texts.s28;
                                 enabled: root.search-active;
                                 clicked => { root.clear-search(); }
                             }
@@ -1397,29 +858,29 @@ export component MainWindow inherits Window {
                             spacing: 6px;
 
                             Text {
-                                text: "图选项";
+                                text: Texts.s29;
                                 color: Palette.text-faint;
-                                font-size: 11px;
+                                font-size: Palette.font-xs;
                                 vertical-alignment: center;
                             }
 
                             OptionToggle {
-                                text: "拓扑排序";
+                                text: Texts.s30;
                                 checked: root.opt-topo;
                                 toggled => { root.toggle-option(0); }
                             }
                             OptionToggle {
-                                text: "仅第一父";
+                                text: Texts.s31;
                                 checked: root.opt-first-parent;
                                 toggled => { root.toggle-option(1); }
                             }
                             OptionToggle {
-                                text: "隐藏合并";
+                                text: Texts.s32;
                                 checked: root.opt-hide-merges;
                                 toggled => { root.toggle-option(2); }
                             }
                             OptionToggle {
-                                text: "折叠线性";
+                                text: Texts.s33;
                                 checked: root.opt-collapse;
                                 toggled => { root.toggle-option(3); }
                             }
@@ -1427,15 +888,15 @@ export component MainWindow inherits Window {
                             Rectangle { horizontal-stretch: 1; }
 
                             Text {
-                                text: root.log-loading ? "加载中…" : "";
+                                text: root.log-loading ? Texts.s34 : "";
                                 color: Palette.amber;
-                                font-size: 11px;
+                                font-size: Palette.font-xs;
                                 vertical-alignment: center;
                             }
                         }
                     }
 
-                    Rectangle { height: 1px; background: Palette.line; }
+                    Divider { }
 
                     ListView {
                         vertical-stretch: 1;
@@ -1459,15 +920,20 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                Rectangle { height: 1px; background: Palette.line; }
+                Divider { }
+
+                Rectangle {
+                    vertical-stretch: 2;
+
+                    Rectangle {
+                        visible: !root.blame-visible;
 
                 // Diff 面板
                 VerticalLayout {
-                    vertical-stretch: 2;
                     spacing: 0px;
 
                     Rectangle {
-                        height: 30px;
+                        height: Metrics.panel-bar-height;
                         background: Palette.bar;
 
                         HorizontalLayout {
@@ -1479,7 +945,7 @@ export component MainWindow inherits Window {
                                 width: 210px;
                                 text: root.diff-title;
                                 color: Palette.text;
-                                font-size: 12px;
+                                font-size: Palette.font-sm;
                                 font-weight: 600;
                                 vertical-alignment: center;
                                 overflow: elide;
@@ -1488,7 +954,7 @@ export component MainWindow inherits Window {
                             Text {
                                 text: root.diff-stats;
                                 color: Palette.text-faint;
-                                font-size: 11px;
+                                font-size: Palette.font-xs;
                                 vertical-alignment: center;
                             }
 
@@ -1497,23 +963,23 @@ export component MainWindow inherits Window {
                             Text {
                                 text: root.diff-hint;
                                 color: Palette.text-faint;
-                                font-size: 11px;
+                                font-size: Palette.font-xs;
                                 vertical-alignment: center;
                             }
 
                             FlatButton {
-                                text: "暂存所选";
+                                text: Texts.s35;
                                 enabled: !root.read-only && root.diff-selectable
                                     && !root.diff-staged-view && root.staging-mode;
                                 clicked => { root.stage-hunks(); }
                             }
                             FlatButton {
-                                text: "反暂存所选";
+                                text: Texts.s36;
                                 enabled: !root.read-only && root.diff-selectable && root.diff-staged-view;
                                 clicked => { root.unstage-hunks(); }
                             }
                             FlatButton {
-                                text: "丢弃所选";
+                                text: Texts.s37;
                                 enabled: !root.read-only && root.diff-selectable && !root.diff-staged-view;
                                 danger: true;
                                 clicked => { root.discard-hunks(); }
@@ -1521,12 +987,17 @@ export component MainWindow inherits Window {
                         }
                     }
 
-                    Rectangle { height: 1px; background: Palette.line; }
+                    Divider { }
+
+                            Rectangle {
+                                vertical-stretch: 1;
 
                     ListView {
-                        vertical-stretch: 1;
+                                    width: 100%;
+                                    height: 100%;
+                                    visible: !root.diff-image-visible;
                         for row[index] in root.diff-rows: DiffRowView {
-                            height: 18px;
+                            height: Metrics.diff-row-height;
                             kind: row.kind;
                             old-no: row.old-no;
                             new-no: row.new-no;
@@ -1536,6 +1007,233 @@ export component MainWindow inherits Window {
                             selectable: row.selectable;
                             selected: row.selected;
                             clicked => { root.toggle-diff-row(index); }
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 100%;
+                                    height: 100%;
+                                    visible: root.diff-image-visible;
+
+                                    VerticalLayout {
+                                        spacing: 0px;
+
+                                        Rectangle {
+                                            height: 26px;
+                                            background: Palette.panel;
+
+                                            HorizontalLayout {
+                                                padding-left: 6px;
+                                                spacing: 6px;
+
+                                                OptionToggle {
+                                                    text: Texts.s38;
+                                                    checked: root.img-mode == 0;
+                                                    toggled => { root.img-mode = 0; }
+                                                }
+                                                OptionToggle {
+                                                    text: Texts.s39;
+                                                    checked: root.img-mode == 1;
+                                                    toggled => { root.img-mode = 1; }
+                                                }
+
+                                                Text {
+                                                    text: root.diff-img-equal ? Texts.s40 : "";
+                                                    color: Palette.green;
+                                                    font-size: Palette.font-xs;
+                                                    vertical-alignment: center;
+                                                }
+
+                                                Rectangle { horizontal-stretch: 1; }
+
+                                                Slider {
+                                                    width: 160px;
+                                                    visible: root.img-mode == 1;
+                                                    minimum: 0;
+                                                    maximum: 1;
+                                                    value <=> root.img-blend;
+                                                }
+                                            }
+                                        }
+
+                                        Rectangle {
+                                            vertical-stretch: 1;
+
+                                            if root.img-mode == 0: HorizontalLayout {
+                                                spacing: 1px;
+
+                                                VerticalLayout {
+                                                    horizontal-stretch: 1;
+                                                    spacing: 2px;
+
+                                                    Rectangle {
+                                                        vertical-stretch: 1;
+                                                        clip: true;
+                                                        background: Palette.bg;
+                                                        Image {
+                                                            width: 100%;
+                                                            height: 100%;
+                                                            source: root.diff-img-old;
+                                                            image-fit: contain;
+                                                        }
+                                                        Text {
+                                                            width: 100%;
+                                                            vertical-alignment: center;
+                                                            horizontal-alignment: center;
+                                                            visible: !root.diff-img-old-present;
+                                                            text: root.diff-img-meta-old;
+                                                            color: Palette.text-faint;
+                                                            font-size: Palette.font-sm;
+                                                        }
+                                                    }
+
+                                                    Text {
+                                                        height: 18px;
+                                                        text: root.diff-img-meta-old;
+                                                        color: Palette.text-faint;
+                                                        font-size: Palette.font-xs;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+
+                                                VerticalLayout {
+                                                    horizontal-stretch: 1;
+                                                    spacing: 2px;
+
+                                                    Rectangle {
+                                                        vertical-stretch: 1;
+                                                        clip: true;
+                                                        background: Palette.bg;
+                                                        Image {
+                                                            width: 100%;
+                                                            height: 100%;
+                                                            source: root.diff-img-new;
+                                                            image-fit: contain;
+                                                        }
+                                                        Text {
+                                                            width: 100%;
+                                                            vertical-alignment: center;
+                                                            horizontal-alignment: center;
+                                                            visible: !root.diff-img-new-present;
+                                                            text: root.diff-img-meta-new;
+                                                            color: Palette.text-faint;
+                                                            font-size: Palette.font-sm;
+                                                        }
+                                                    }
+
+                                                    Text {
+                                                        height: 18px;
+                                                        text: root.diff-img-meta-new;
+                                                        color: Palette.text-faint;
+                                                        font-size: Palette.font-xs;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                            }
+
+                                            if root.img-mode == 1: Rectangle {
+                                                background: Palette.bg;
+                                                clip: true;
+
+                                                Image {
+                                                    width: 100%;
+                                                    height: 100%;
+                                                    source: root.diff-img-old;
+                                                    image-fit: contain;
+                                                    visible: root.diff-img-old-present;
+                                                }
+
+                                                Image {
+                                                    width: 100%;
+                                                    height: 100%;
+                                                    source: root.diff-img-new;
+                                                    image-fit: contain;
+                                                    visible: root.diff-img-new-present;
+                                                    opacity: root.img-blend;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        visible: root.blame-visible;
+
+                        VerticalLayout {
+                            spacing: 0px;
+
+                            Rectangle {
+                                height: Metrics.panel-bar-height;
+                                background: Palette.bar;
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 6px;
+
+                                    FlatButton {
+                                        text: Texts.s41;
+                                        clicked => { root.blame-close(); }
+                                    }
+
+                                    FlatButton {
+                                        text: Texts.s42;
+                                        clicked => { root.blame-open-history(); }
+                                    }
+
+                                    Text {
+                                        width: 220px;
+                                        text: root.blame-title;
+                                        color: Palette.text;
+                                        font-size: Palette.font-sm;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+
+                                    Text {
+                                        text: root.blame-spec-label;
+                                        color: Palette.amber;
+                                        font-size: Palette.font-xs;
+                                        vertical-alignment: center;
+                                    }
+
+                                    Rectangle { horizontal-stretch: 1; }
+
+                                    Text {
+                                        text: root.blame-truncated;
+                                        color: Palette.amber;
+                                        font-size: Palette.font-xs;
+                                        vertical-alignment: center;
+                                    }
+
+                                    FlatButton {
+                                        text: Texts.s43;
+                                        enabled: root.blame-can-chain && !root.read-only;
+                                        clicked => { root.blame-chain(); }
+                                    }
+                                }
+                            }
+
+                            Divider { }
+
+                            blame-list := ListView {
+                                vertical-stretch: 1;
+                                for row[index] in root.blame-rows: BlameRowView {
+                                    height: Metrics.blame-row-height;
+                                    line-no: row.line-no;
+                                    commit: row.commit;
+                                    author: row.author;
+                                    when: row.when;
+                                    summary: row.summary;
+                                    is-selected: row.is-selected;
+                                    is-boundary: row.is-boundary;
+                                    clicked => { root.blame-select(index); }
+                                }
+                            }
                         }
                     }
                 }
@@ -1550,13 +1248,13 @@ export component MainWindow inherits Window {
 
             VerticalLayout {
                 padding: 28px;
-                spacing: 12px;
+                spacing: Metrics.space-3;
                 alignment: center;
 
                 Text {
-                    text: "未打开仓库";
+                    text: Texts.s44;
                     color: Palette.text;
-                    font-size: 18px;
+                    font-size: Palette.font-h1;
                     font-weight: 600;
                     horizontal-alignment: center;
                 }
@@ -1564,46 +1262,30 @@ export component MainWindow inherits Window {
                 Text {
                     text: root.empty-message;
                     color: Palette.text-faint;
-                    font-size: 12px;
+                    font-size: Palette.font-sm;
                     horizontal-alignment: center;
                     wrap: word-wrap;
                 }
 
                 HorizontalLayout {
-                    spacing: 8px;
+                    spacing: Metrics.space-2;
                     alignment: center;
 
-                    Rectangle {
+                    Field {
                         width: 460px;
                         height: 30px;
-                        background: Palette.panel;
-                        border-color: Palette.border;
-                        border-width: 1px;
-                        border-radius: 3px;
-
-                        TextInput {
-                            x: 8px;
-                            width: parent.width - 16px;
-                            height: parent.height;
-                            text <=> root.open-path;
-                            single-line: true;
-                            color: Palette.text;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
+                        text <=> root.open-path;
+                        placeholder: Texts.s45;
                     }
 
                     FlatButton {
-                        text: "打开";
+                        text: Texts.s46;
                         clicked => { root.open-repo(root.open-path); }
                     }
                 }
 
-                Text {
-                    text: "最近仓库";
-                    color: Palette.text-dim;
-                    font-size: 12px;
-                    font-weight: 600;
+                SectionLabel {
+                    text: Texts.s47;
                     horizontal-alignment: center;
                 }
 
@@ -1627,7 +1309,7 @@ export component MainWindow inherits Window {
                                 Text {
                                     text: entry.name;
                                     color: Palette.text;
-                                    font-size: 12px;
+                                    font-size: Palette.font-sm;
                                     vertical-alignment: center;
                                 }
 
@@ -1635,7 +1317,7 @@ export component MainWindow inherits Window {
                                     horizontal-stretch: 1;
                                     text: entry.path;
                                     color: Palette.text-faint;
-                                    font-size: 11px;
+                                    font-size: Palette.font-xs;
                                     vertical-alignment: center;
                                     overflow: elide;
                                 }
@@ -1650,7 +1332,7 @@ export component MainWindow inherits Window {
             }
         }
 
-        Rectangle { height: 1px; background: Palette.line; }
+        Divider { }
 
         // ---------------------------------------------------- 底部面板
         Rectangle {
@@ -1668,10 +1350,10 @@ export component MainWindow inherits Window {
 
                     HorizontalLayout {
                         padding-left: 8px;
-                        spacing: 4px;
+                        spacing: Metrics.space-1;
 
                         TabButton {
-                            text: "本地更改 " + root.change-summary;
+                            text: Texts.s48 + root.change-summary;
                             active: root.bottom-tab == 0;
                             clicked => { root.bottom-tab = 0; }
                         }
@@ -1694,13 +1376,13 @@ export component MainWindow inherits Window {
                         Rectangle { horizontal-stretch: 1; }
 
                         FlatButton {
-                            text: "导出日志";
+                            text: Texts.s49;
                             visible: root.bottom-tab == 1;
                             clicked => { root.export-console(); }
                         }
 
                         FlatButton {
-                            text: "清空";
+                            text: Texts.s50;
                             visible: root.bottom-tab == 1;
                             clicked => { root.clear-console(); }
                         }
@@ -1724,39 +1406,48 @@ export component MainWindow inherits Window {
 
                             HorizontalLayout {
                                 padding-left: 6px;
-                                spacing: 4px;
+                                spacing: Metrics.space-1;
 
                                 FlatButton {
-                                    text: "暂存";
+                                    text: Texts.s51;
                                     enabled: !root.read-only;
                                     clicked => { root.stage-selected(); }
                                 }
                                 FlatButton {
-                                    text: "反暂存";
+                                    text: Texts.s52;
                                     enabled: !root.read-only;
                                     clicked => { root.unstage-selected(); }
                                 }
                                 FlatButton {
-                                    text: "丢弃";
+                                    text: Texts.s53;
                                     enabled: !root.read-only;
                                     danger: true;
                                     clicked => { root.discard-selected(); }
                                 }
                                 FlatButton {
-                                    text: "删除未跟踪";
+                                    text: Texts.s54;
                                     enabled: !root.read-only && root.selection-is-untracked;
                                     danger: true;
                                     clicked => { root.delete-selected(); }
                                 }
                                 FlatButton {
-                                    text: "加入 .gitignore";
+                                    text: Texts.s55;
                                     enabled: !root.read-only && root.selection-is-untracked;
                                     clicked => { root.ignore-selected(0); }
                                 }
                                 FlatButton {
-                                    text: "加入 exclude";
+                                    text: Texts.s56;
                                     enabled: !root.read-only && root.selection-is-untracked;
                                     clicked => { root.ignore-selected(1); }
+                                }
+
+                                FlatButton {
+                                    text: "Blame";
+                                    clicked => { root.request-blame-selected(); }
+                                }
+                                FlatButton {
+                                    text: Texts.s42;
+                                    clicked => { root.request-file-history-selected(); }
                                 }
 
                                 Rectangle { horizontal-stretch: 1; }
@@ -1766,7 +1457,7 @@ export component MainWindow inherits Window {
                         ListView {
                             vertical-stretch: 1;
                             for row[index] in root.change-rows: ChangeRowView {
-                                height: 22px;
+                                height: Metrics.list-row-height;
                                 path: row.path;
                                 code: row.code;
                                 bucket: row.bucket;
@@ -1778,18 +1469,18 @@ export component MainWindow inherits Window {
                         }
                     }
 
-                    Rectangle { width: 1px; background: Palette.line; }
+                    VDivider { }
 
                     // 右：提交面板
                     VerticalLayout {
                         width: 330px;
-                        padding: 8px;
+                        padding: Metrics.space-2;
                         spacing: 6px;
 
                         Text {
-                            text: "提交消息";
+                            text: Texts.s57;
                             color: Palette.text-dim;
-                            font-size: 11px;
+                            font-size: Palette.font-xs;
                         }
 
                         Rectangle {
@@ -1797,7 +1488,7 @@ export component MainWindow inherits Window {
                             background: Palette.bg;
                             border-color: Palette.border;
                             border-width: 1px;
-                            border-radius: 3px;
+                            border-radius: Palette.radius-sm;
 
                             TextInput {
                                 x: 6px;
@@ -1808,7 +1499,7 @@ export component MainWindow inherits Window {
                                 single-line: false;
                                 wrap: word-wrap;
                                 color: Palette.text;
-                                font-size: 12px;
+                                font-size: Palette.font-sm;
                                 font-family: Palette.mono-font;
                             }
                         }
@@ -1817,13 +1508,13 @@ export component MainWindow inherits Window {
                             spacing: 10px;
 
                             CheckBox {
-                                text: "修订上次提交";
+                                text: Texts.s58;
                                 checked: root.commit-amend;
                                 toggled => { root.toggle-amend(!root.commit-amend); }
                             }
 
                             CheckBox {
-                                text: "重置作者";
+                                text: Texts.s59;
                                 checked: root.commit-reset-author;
                                 enabled: root.commit-amend;
                                 toggled => { root.toggle-reset-author(!root.commit-reset-author); }
@@ -1833,12 +1524,12 @@ export component MainWindow inherits Window {
                         Text {
                             text: root.commit-hint;
                             color: Palette.text-faint;
-                            font-size: 11px;
+                            font-size: Palette.font-xs;
                             wrap: word-wrap;
                         }
 
                         FlatButton {
-                            text: root.commit-amend ? "修订提交" : "提交";
+                            text: root.commit-amend ? Texts.s60 : Texts.s61;
                             enabled: !root.read-only && root.commit-enabled && root.cli-missing == false;
                             clicked => { root.commit(); }
                         }
@@ -1866,35 +1557,35 @@ export component MainWindow inherits Window {
 
                     VerticalLayout {
                         width: 310px;
-                        padding: 8px;
+                        padding: Metrics.space-2;
                         spacing: 6px;
 
                         Text {
-                            text: "新建贮藏";
+                            text: Texts.s62;
                             color: Palette.text-dim;
-                            font-size: 11px;
+                            font-size: Palette.font-xs;
                         }
 
                         Field {
                             text <=> root.stash-message;
-                            placeholder: "消息（可留空）";
+                            placeholder: Texts.s63;
                             edited(v) => { root.set-stash-message(v); }
                         }
 
                         CheckBox {
-                            text: "包含未跟踪文件（-u）";
+                            text: Texts.s64;
                             checked: root.stash-untracked;
                             toggled => { root.toggle-stash-untracked(!root.stash-untracked); }
                         }
 
                         FlatButton {
-                            text: "创建贮藏";
+                            text: Texts.s65;
                             enabled: !root.read-only;
                             clicked => { root.stash-create(); }
                         }
 
                         Text {
-                            text: "贮藏会清空工作区；应用后仍需自行提交。\n从贮藏创建分支可把改动固定到一个新分支上。";
+                            text: Texts.s66;
                             color: Palette.text-faint;
                             font-size: 10px;
                             wrap: word-wrap;
@@ -1903,57 +1594,57 @@ export component MainWindow inherits Window {
                         Rectangle { vertical-stretch: 1; }
                     }
 
-                    Rectangle { width: 1px; background: Palette.line; }
+                    VDivider { }
 
+                    // S4：行内布局从"绝对定位 + parent.width 算术"改为弹性布局，
+                    // 窄窗口下按钮不再与摘要文字重叠。
                     ListView {
                         horizontal-stretch: 1;
                         for row in root.stash-rows: Rectangle {
                             height: 30px;
                             background: transparent;
 
-                            Text {
-                                x: 8px;
-                                width: 86px;
-                                text: row.selector;
-                                color: Palette.text-faint;
-                                font-size: 11px;
-                                font-family: Palette.mono-font;
-                                vertical-alignment: center;
-                            }
-
-                            Text {
-                                x: 98px;
-                                width: parent.width - 380px;
-                                text: row.branch == "" ? row.summary : row.summary + "   ·   " + row.branch;
-                                color: Palette.text;
-                                font-size: 12px;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
-
                             HorizontalLayout {
-                                x: parent.width - 276px;
-                                width: 270px;
-                                spacing: 4px;
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                spacing: 8px;
+
+                                Text {
+                                    width: 86px;
+                                    text: row.selector;
+                                    color: Palette.text-faint;
+                                    font-size: Palette.font-xs;
+                                    font-family: Palette.mono-font;
+                                    vertical-alignment: center;
+                                }
+
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: row.branch == "" ? row.summary : row.summary + "   ·   " + row.branch;
+                                    color: Palette.text;
+                                    font-size: Palette.font-sm;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
 
                                 FlatButton {
-                                    text: "应用";
+                                    text: Texts.s67;
                                     enabled: !root.read-only;
                                     clicked => { root.stash-apply(row.index); }
                                 }
                                 FlatButton {
-                                    text: "弹出";
+                                    text: Texts.s68;
                                     enabled: !root.read-only;
                                     clicked => { root.stash-pop(row.index); }
                                 }
                                 FlatButton {
-                                    text: "删除";
+                                    text: Texts.s20;
                                     danger: true;
                                     enabled: !root.read-only;
                                     clicked => { root.stash-drop(row.index); }
                                 }
                                 FlatButton {
-                                    text: "建分支";
+                                    text: Texts.s69;
                                     enabled: !root.read-only && root.branch-input != "";
                                     clicked => { root.stash-branch(row.index); }
                                 }
@@ -1974,7 +1665,7 @@ export component MainWindow inherits Window {
                 x: 12px;
                 text: root.toast;
                 color: Palette.warn-text;
-                font-size: 11px;
+                font-size: Palette.font-xs;
                 vertical-alignment: center;
                 overflow: elide;
             }
@@ -1988,1303 +1679,188 @@ export component MainWindow inherits Window {
             HorizontalLayout {
                 padding-left: 10px;
                 padding-right: 10px;
-                spacing: 12px;
+                spacing: Metrics.space-3;
 
                 Text {
                     text: root.git-text;
                     color: Palette.text-faint;
-                    font-size: 11px;
+                    font-size: Palette.font-xs;
                     vertical-alignment: center;
                 }
 
                 Rectangle { horizontal-stretch: 1; }
 
                 Text {
-                    text: root.advanced-label == "" ? "" : "⏳ " + root.advanced-label + " 进行中";
+                    text: root.advanced-label == "" ? "" : "⏳ " + root.advanced-label + Texts.s70;
                     color: Palette.amber;
-                    font-size: 11px;
+                    font-size: Palette.font-xs;
                     vertical-alignment: center;
                 }
 
                 Text {
                     text: root.has-repo ? root.branch-text : "";
                     color: Palette.text-faint;
-                    font-size: 11px;
+                    font-size: Palette.font-xs;
                     vertical-alignment: center;
                 }
             }
         }
     }
 
-    // ---------------------------------------------------- 二次确认遮罩
-    Rectangle {
+    // ---------------------------------------------------- 浮层（组件见 dialogs.slint）
+    // 声明顺序即 z 序：后声明者在上。保持与重构前一致：
+    // 确认 / 设置 / 推送 / 远端 / 上下文菜单 / 操作 / 变基 / 冲突 / 比较。
+
+    ConfirmDialog {
         visible: root.confirm-visible;
-        background: #00000099;
-
-        // 吃掉遮罩层的点击，避免点穿到底下的列表上。
-        TouchArea {}
-
-        Rectangle {
-            width: min(parent.width - 80px, 520px);
-            height: min(parent.height - 80px, 240px);
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            background: Palette.panel;
-            border-color: root.confirm-danger ? Palette.red : Palette.border;
-            border-width: 1px;
-            border-radius: 6px;
-
-            VerticalLayout {
-                padding: 18px;
-                spacing: 12px;
-
-                Text {
-                    text: root.confirm-title;
-                    color: root.confirm-danger ? Palette.red : Palette.text;
-                    font-size: 15px;
-                    font-weight: 600;
-                    wrap: word-wrap;
-                }
-
-                Rectangle { height: 1px; background: Palette.line; }
-
-                Text {
-                    vertical-stretch: 1;
-                    text: root.confirm-detail;
-                    color: Palette.text-dim;
-                    font-size: 12px;
-                    wrap: word-wrap;
-                }
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: end;
-
-                    FlatButton {
-                        text: "取消";
-                        clicked => { root.confirm-no(); }
-                    }
-                    FlatButton {
-                        text: "确认执行";
-                        danger: root.confirm-danger;
-                        clicked => { root.confirm-yes(); }
-                    }
-                }
-            }
-        }
+        confirm-title: root.confirm-title;
+        confirm-detail: root.confirm-detail;
+        confirm-danger: root.confirm-danger;
+        yes => { root.confirm-yes(); }
+        no => { root.confirm-no(); }
     }
 
-    // ---------------------------------------------------- 设置遮罩（FR-SET）
-    Rectangle {
+    SettingsDialog {
         visible: root.settings-visible;
-        background: #00000099;
-
-        TouchArea {}
-
-        Rectangle {
-            width: min(parent.width - 80px, 620px);
-            height: min(parent.height - 60px, 540px);
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            background: Palette.panel;
-            border-color: Palette.border;
-            border-width: 1px;
-            border-radius: 6px;
-
-            VerticalLayout {
-                padding: 18px;
-                spacing: 10px;
-
-                Text {
-                    text: "设置";
-                    color: Palette.text;
-                    font-size: 15px;
-                    font-weight: 600;
-                }
-
-                Rectangle { height: 1px; background: Palette.line; }
-
-                // 外观
-                Text { text: "外观"; color: Palette.text-dim; font-size: 12px; font-weight: 600; }
-                HorizontalLayout {
-                    spacing: 8px;
-
-                    CheckBox {
-                        text: "深色主题（即时生效）";
-                        checked: root.dark-theme;
-                        toggled => { root.toggle-theme(!root.dark-theme); }
-                    }
-                }
-
-                // Git 行为
-                Text { text: "Git 行为"; color: Palette.text-dim; font-size: 12px; font-weight: 600; }
-                HorizontalLayout {
-                    spacing: 8px;
-
-                    CheckBox {
-                        text: "staging 模式（hunk 级暂存）";
-                        checked: root.staging-mode;
-                        toggled => { root.staging-mode = !root.staging-mode; }
-                    }
-                    CheckBox {
-                        text: "分离头指针提交告警";
-                        checked: root.set-warn-detached;
-                        toggled => { root.set-warn-detached = !root.set-warn-detached; }
-                    }
-                    CheckBox {
-                        text: "CRLF 告警";
-                        checked: root.set-warn-crlf;
-                        toggled => { root.set-warn-crlf = !root.set-warn-crlf; }
-                    }
-                }
-
-                HorizontalLayout {
-                    spacing: 8px;
-
-                    Text {
-                        text: "更新策略";
-                        color: Palette.text-faint;
-                        font-size: 11px;
-                        vertical-alignment: center;
-                    }
-                    OptionToggle {
-                        text: "merge";
-                        checked: root.set-update-strategy == 0;
-                        toggled => { root.set-update-strategy = 0; }
-                    }
-                    OptionToggle {
-                        text: "rebase";
-                        checked: root.set-update-strategy == 1;
-                        toggled => { root.set-update-strategy = 1; }
-                    }
-                    OptionToggle {
-                        text: "仅快进";
-                        checked: root.set-update-strategy == 2;
-                        toggled => { root.set-update-strategy = 2; }
-                    }
-                }
-
-                // 受保护分支 / 缓存
-                Text { text: "受保护分支（正则，逗号分隔）"; color: Palette.text-dim; font-size: 12px; font-weight: 600; }
-                Field {
-                    text <=> root.set-protected;
-                    placeholder: "^main$,^release/";
-                    monospace: true;
-                }
-
-                HorizontalLayout {
-                    spacing: 8px;
-
-                    Text {
-                        text: "缓存预算 (MiB)";
-                        color: Palette.text-faint;
-                        font-size: 11px;
-                        vertical-alignment: center;
-                    }
-
-                    OptionToggle {
-                        text: "8";
-                        checked: root.set-cache-mib == 8;
-                        toggled => { root.set-cache-mib = 8; }
-                    }
-                    OptionToggle {
-                        text: "16";
-                        checked: root.set-cache-mib == 16;
-                        toggled => { root.set-cache-mib = 16; }
-                    }
-                    OptionToggle {
-                        text: "32";
-                        checked: root.set-cache-mib == 32;
-                        toggled => { root.set-cache-mib = 32; }
-                    }
-                    OptionToggle {
-                        text: "64";
-                        checked: root.set-cache-mib == 64;
-                        toggled => { root.set-cache-mib = 64; }
-                    }
-
-                    Text {
-                        text: "日志级别";
-                        color: Palette.text-faint;
-                        font-size: 11px;
-                        vertical-alignment: center;
-                    }
-                    OptionToggle {
-                        text: "info";
-                        checked: root.set-log-level == 2;
-                        toggled => { root.set-log-level = 2; }
-                    }
-                    OptionToggle {
-                        text: "debug";
-                        checked: root.set-log-level == 3;
-                        toggled => { root.set-log-level = 3; }
-                    }
-                }
-
-                // 外部工具
-                Text { text: "外部工具（留空则用内置视图）"; color: Palette.text-dim; font-size: 12px; font-weight: 600; }
-                Field {
-                    text <=> root.set-diff-tool;
-                    placeholder: "外部 diff 命令";
-                    monospace: true;
-                }
-                Field {
-                    text <=> root.set-merge-tool;
-                    placeholder: "外部 merge 命令";
-                    monospace: true;
-                }
-
-                Text {
-                    text: root.set-status;
-                    color: Palette.text-faint;
-                    font-size: 11px;
-                    wrap: word-wrap;
-                }
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: end;
-
-                    FlatButton {
-                        text: "取消";
-                        clicked => { root.close-settings(); }
-                    }
-                    FlatButton {
-                        text: "保存并应用";
-                        clicked => { root.apply-settings(); }
-                    }
-                }
-            }
-        }
+        dark-theme <=> root.dark-theme;
+        set-language-en <=> root.set-language-en;
+        staging-mode <=> root.staging-mode;
+        set-warn-detached <=> root.set-warn-detached;
+        set-warn-crlf <=> root.set-warn-crlf;
+        set-update-strategy <=> root.set-update-strategy;
+        set-cache-mib <=> root.set-cache-mib;
+        set-protected <=> root.set-protected;
+        set-diff-tool <=> root.set-diff-tool;
+        set-merge-tool <=> root.set-merge-tool;
+        set-log-level <=> root.set-log-level;
+        set-status: root.set-status;
+        toggle-theme(dark) => { root.toggle-theme(dark); }
+        apply => { root.apply-settings(); }
+        cancel => { root.close-settings(); }
     }
 
-    // ---------------------------------------------------- 推送预览遮罩（FR-RMT-03）
-    Rectangle {
+    PushDialog {
         visible: root.push-visible;
-        background: #00000099;
-
-        TouchArea {}
-
-        Rectangle {
-            width: min(parent.width - 80px, 720px);
-            height: min(parent.height - 60px, 520px);
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            background: Palette.panel;
-            border-color: Palette.border;
-            border-width: 1px;
-            border-radius: 6px;
-
-            VerticalLayout {
-                padding: 18px;
-                spacing: 10px;
-
-                Text {
-                    text: "推送预览";
-                    color: Palette.text;
-                    font-size: 15px;
-                    font-weight: 600;
-                }
-
-                Text {
-                    text: root.push-summary;
-                    color: Palette.text-dim;
-                    font-size: 12px;
-                    wrap: word-wrap;
-                }
-
-                Rectangle { height: 1px; background: Palette.line; }
-
-                ListView {
-                    vertical-stretch: 1;
-                    for row in root.push-rows: Rectangle {
-                        height: 22px;
-
-                        HorizontalLayout {
-                            padding-left: 4px;
-                            spacing: 8px;
-
-                            Text {
-                                width: 70px;
-                                text: row.short-id;
-                                color: Palette.text-faint;
-                                font-size: 11px;
-                                font-family: Palette.mono-font;
-                                vertical-alignment: center;
-                            }
-                            Text {
-                                horizontal-stretch: 1;
-                                text: row.subject;
-                                color: Palette.text;
-                                font-size: 12px;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
-                            Text {
-                                width: 90px;
-                                text: row.author;
-                                color: Palette.text-faint;
-                                font-size: 11px;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
-                            Text {
-                                width: 80px;
-                                text: row.when;
-                                color: Palette.text-faint;
-                                font-size: 11px;
-                                vertical-alignment: center;
-                                horizontal-alignment: right;
-                            }
-                        }
-                    }
-                }
-
-                HorizontalLayout {
-                    spacing: 14px;
-
-                    CheckBox {
-                        text: "强制（force-with-lease）";
-                        checked: root.push-force;
-                        toggled => { root.toggle-push-force(!root.push-force); }
-                    }
-                    CheckBox {
-                        text: "设置上游（-u）";
-                        checked: root.push-set-upstream;
-                        toggled => { root.toggle-push-upstream(!root.push-set-upstream); }
-                    }
-                }
-
-                Text {
-                    text: root.push-hint;
-                    color: root.push-protected ? Palette.amber : Palette.text-faint;
-                    font-size: 11px;
-                    wrap: word-wrap;
-                }
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: end;
-
-                    FlatButton {
-                        text: "取消";
-                        clicked => { root.push-cancel(); }
-                    }
-                    FlatButton {
-                        text: "推送";
-                        enabled: root.push-rows.length > 0 || root.push-creates-branch;
-                        clicked => { root.push-confirm(); }
-                    }
-                }
-            }
-        }
+        push-rows: root.push-rows;
+        push-summary: root.push-summary;
+        push-hint: root.push-hint;
+        push-protected: root.push-protected;
+        push-creates-branch: root.push-creates-branch;
+        push-force <=> root.push-force;
+        push-set-upstream <=> root.push-set-upstream;
+        confirm => { root.push-confirm(); }
+        cancel => { root.push-cancel(); }
+        toggle-force(on) => { root.toggle-push-force(on); }
+        toggle-upstream(on) => { root.toggle-push-upstream(on); }
     }
 
-    // ---------------------------------------------------- 远端管理遮罩（FR-RMT-01/04）
-    Rectangle {
+    RemotesDialog {
         visible: root.remotes-visible;
-        background: #00000099;
-
-        TouchArea {}
-
-        Rectangle {
-            width: min(parent.width - 80px, 700px);
-            height: min(parent.height - 60px, 540px);
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            background: Palette.panel;
-            border-color: Palette.border;
-            border-width: 1px;
-            border-radius: 6px;
-
-            VerticalLayout {
-                padding: 18px;
-                spacing: 10px;
-
-                Text {
-                    text: "远端管理";
-                    color: Palette.text;
-                    font-size: 15px;
-                    font-weight: 600;
-                }
-
-                Rectangle { height: 1px; background: Palette.line; }
-
-                ListView {
-                    vertical-stretch: 1;
-                    for entry[index] in root.remote-rows: Rectangle {
-                        height: 26px;
-                        background: entry.selected ? Palette.hover : transparent;
-
-                        HorizontalLayout {
-                            padding-left: 6px;
-                            spacing: 8px;
-
-                            Text {
-                                width: 110px;
-                                text: entry.name;
-                                color: Palette.text;
-                                font-size: 12px;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
-                            Text {
-                                horizontal-stretch: 1;
-                                text: entry.url;
-                                color: Palette.text-dim;
-                                font-size: 11px;
-                                font-family: Palette.mono-font;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
-                            Text {
-                                width: 150px;
-                                text: entry.detail;
-                                color: Palette.text-faint;
-                                font-size: 11px;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
-                        }
-
-                        TouchArea {
-                            clicked => { root.select-remote(index); }
-                        }
-                    }
-                }
-
-                HorizontalLayout {
-                    spacing: 6px;
-
-                    Field {
-                        width: 140px;
-                        text <=> root.remote-name-input;
-                        placeholder: "名称（origin）";
-                        edited(v) => { root.set-remote-name(v); }
-                    }
-                    Field {
-                        horizontal-stretch: 1;
-                        text <=> root.remote-url-input;
-                        placeholder: "地址（https://… 或 git@host:owner/repo）";
-                        monospace: true;
-                        edited(v) => { root.set-remote-url(v); }
-                    }
-                }
-
-                HorizontalLayout {
-                    spacing: 6px;
-
-                    FlatButton {
-                        text: "添加";
-                        enabled: !root.read-only;
-                        clicked => { root.remote-add(); }
-                    }
-                    FlatButton {
-                        text: "改地址";
-                        enabled: !root.read-only && root.remote-selected >= 0;
-                        clicked => { root.remote-set-url(); }
-                    }
-                    FlatButton {
-                        text: "删除";
-                        danger: true;
-                        enabled: !root.read-only && root.remote-selected >= 0;
-                        clicked => { root.remote-remove(); }
-                    }
-
-                    Rectangle { horizontal-stretch: 1; }
-
-                    FlatButton {
-                        text: "关闭";
-                        clicked => { root.close-remotes(); }
-                    }
-                }
-
-                Rectangle { height: 1px; background: Palette.line; }
-
-                Text {
-                    text: "更新策略（记忆用户选择，FR-RMT-02）";
-                    color: Palette.text-dim;
-                    font-size: 12px;
-                    font-weight: 600;
-                }
-
-                HorizontalLayout {
-                    spacing: 6px;
-
-                    OptionToggle {
-                        text: "合并";
-                        checked: root.pull-strategy == 0;
-                        toggled => { root.set-pull-strategy(0); }
-                    }
-                    OptionToggle {
-                        text: "变基";
-                        checked: root.pull-strategy == 1;
-                        toggled => { root.set-pull-strategy(1); }
-                    }
-                    OptionToggle {
-                        text: "仅快进";
-                        checked: root.pull-strategy == 2;
-                        toggled => { root.set-pull-strategy(2); }
-                    }
-                }
-
-                Text {
-                    text: root.remote-help;
-                    color: Palette.text-faint;
-                    font-size: 11px;
-                    wrap: word-wrap;
-                }
-
-                Text {
-                    text: "HTTPS token（存入系统密钥链；明文不落盘）· 目标主机："
-                        + (root.token-host == "" ? "（非 HTTPS 远端）" : root.token-host);
-                    color: Palette.text-dim;
-                    font-size: 11px;
-                    wrap: word-wrap;
-                }
-
-                HorizontalLayout {
-                    spacing: 6px;
-
-                    Field {
-                        horizontal-stretch: 1;
-                        text <=> root.token-input;
-                        placeholder: "访问 token";
-                        monospace: true;
-                        edited(v) => { root.set-token-input(v); }
-                    }
-                    FlatButton {
-                        text: "保存 token";
-                        enabled: root.keyring-available && root.token-host != ""
-                            && root.token-input != "";
-                        clicked => { root.save-token(); }
-                    }
-                    FlatButton {
-                        text: "删除 token";
-                        enabled: root.keyring-available && root.token-host != "";
-                        clicked => { root.forget-token(); }
-                    }
-                }
-            }
-        }
+        remote-rows: root.remote-rows;
+        remote-selected: root.remote-selected;
+        remote-help: root.remote-help;
+        token-host: root.token-host;
+        keyring-available: root.keyring-available;
+        read-only: root.read-only;
+        remote-name-input <=> root.remote-name-input;
+        remote-url-input <=> root.remote-url-input;
+        token-input <=> root.token-input;
+        pull-strategy <=> root.pull-strategy;
+        select-remote(index) => { root.select-remote(index); }
+        name-edited(v) => { root.set-remote-name(v); }
+        url-edited(v) => { root.set-remote-url(v); }
+        add => { root.remote-add(); }
+        set-url => { root.remote-set-url(); }
+        remove => { root.remote-remove(); }
+        close => { root.close-remotes(); }
+        token-edited(v) => { root.set-token-input(v); }
+        save-token => { root.save-token(); }
+        forget-token => { root.forget-token(); }
+        set-strategy(index) => { root.set-pull-strategy(index); }
     }
 
-    // ------------------------------------------------ 提交上下文菜单（FR-LOG-07/08）
-    Rectangle {
+    CommitCtxMenu {
         visible: root.ctx-visible;
-        background: transparent;
-
-        // 点空白处关闭；这层必须在菜单面板**之前**声明，否则会盖住菜单。
-        TouchArea {
-            clicked => { root.close-commit-menu(); }
-        }
-
-        Rectangle {
-            width: 236px;
-            height: menu.preferred-height + 8px;
-            x: min(root.ctx-x, root.width - 248px);
-            y: min(root.ctx-y, root.height - self.height - 16px);
-            background: Palette.panel;
-            border-color: Palette.border;
-            border-width: 1px;
-            border-radius: 4px;
-
-            menu := VerticalLayout {
-                x: 4px;
-                y: 4px;
-                width: parent.width - 8px;
-                spacing: 1px;
-
-                CtxMenuItem {
-                    text: "合并到当前分支…";
-                    enabled: !root.read-only;
-                    clicked => { root.commit-action("merge"); }
-                }
-                CtxMenuItem {
-                    text: "变基到此处";
-                    enabled: !root.read-only;
-                    clicked => { root.commit-action("rebase"); }
-                }
-                CtxMenuItem {
-                    text: "从此处交互式变基…";
-                    enabled: !root.read-only;
-                    clicked => { root.commit-action("iplan"); }
-                }
-                CtxMenuItem {
-                    text: "拣选此提交";
-                    enabled: !root.read-only;
-                    clicked => { root.commit-action("cherry-pick"); }
-                }
-                CtxMenuItem {
-                    text: "回滚此提交";
-                    enabled: !root.read-only;
-                    clicked => { root.commit-action("revert"); }
-                }
-                CtxMenuItem {
-                    text: "重置当前分支到此…";
-                    enabled: !root.read-only;
-                    clicked => { root.commit-action("reset"); }
-                }
-                CtxMenuItem {
-                    text: "撤销此提交（软重置）";
-                    enabled: !root.read-only && root.ctx-is-head;
-                    clicked => { root.commit-action("undo"); }
-                }
-
-                Rectangle { height: 1px; background: Palette.line; }
-
-                CtxMenuItem {
-                    text: "生成补丁…";
-                    clicked => { root.commit-action("patch"); }
-                }
-                CtxMenuItem {
-                    text: "新建标签…";
-                    enabled: !root.read-only;
-                    clicked => { root.commit-action("tag"); }
-                }
-                CtxMenuItem {
-                    text: "应用补丁…";
-                    enabled: !root.read-only;
-                    clicked => { root.commit-action("apply-patch"); }
-                }
-                CtxMenuItem {
-                    text: "与当前工作区比较";
-                    clicked => { root.commit-action("compare"); }
-                }
-                CtxMenuItem {
-                    text: "浏览此版本（只读）";
-                    clicked => { root.commit-action("browse"); }
-                }
-
-                Rectangle { height: 1px; background: Palette.line; }
-
-                CtxMenuItem {
-                    text: "复制哈希";
-                    clicked => { root.commit-action("copy"); }
-                }
-                CtxMenuItem {
-                    text: "检出（分离头指针）";
-                    enabled: !root.read-only;
-                    clicked => { root.commit-action("checkout"); }
-                }
-            }
-        }
+        ctx-x: root.ctx-x;
+        ctx-y: root.ctx-y;
+        ctx-is-head: root.ctx-is-head;
+        read-only: root.read-only;
+        action(label) => { root.commit-action(label); }
+        close => { root.close-commit-menu(); }
     }
 
-    // ------------------------------------------------ 通用操作对话框
-    Rectangle {
+    OpDialog {
         visible: root.op-visible;
-        background: #00000099;
-
-        TouchArea {}
-
-        Rectangle {
-            width: min(parent.width - 80px, 520px);
-            height: min(parent.height - 80px, 320px);
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            background: Palette.panel;
-            border-color: root.op-danger ? Palette.red : Palette.border;
-            border-width: 1px;
-            border-radius: 6px;
-
-            VerticalLayout {
-                padding: 18px;
-                spacing: 10px;
-
-                Text {
-                    text: root.op-title;
-                    color: Palette.text;
-                    font-size: 15px;
-                    font-weight: 600;
-                    wrap: word-wrap;
-                }
-
-                Text {
-                    text: root.op-hint;
-                    color: Palette.text-faint;
-                    font-size: 11px;
-                    wrap: word-wrap;
-                }
-
-                Rectangle { height: 1px; background: Palette.line; }
-
-                HorizontalLayout {
-                    spacing: 6px;
-                    visible: root.op-modes.length > 0;
-
-                    for mode-label[index] in root.op-modes: TabButton {
-                        // 显式给宽：TabButton 默认最小 120px，四个模式会撑破对话框。
-                        width: 108px;
-                        text: mode-label;
-                        active: root.op-mode == index;
-                        clicked => { root.set-op-mode(index); }
-                    }
-                }
-
-                Field {
-                    text <=> root.op-input;
-                    placeholder: root.op-placeholder;
-                    monospace: true;
-                    edited(v) => { root.set-op-input(v); }
-                }
-
-                Field {
-                    visible: root.op-show-input2;
-                    text <=> root.op-input2;
-                    placeholder: root.op-placeholder2;
-                    edited(v) => { root.set-op-input2(v); }
-                }
-
-                Rectangle { vertical-stretch: 1; }
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: end;
-
-                    FlatButton {
-                        text: "取消";
-                        clicked => { root.op-cancel(); }
-                    }
-                    FlatButton {
-                        text: "执行";
-                        danger: root.op-danger;
-                        clicked => { root.op-confirm(); }
-                    }
-                }
-            }
-        }
+        op-title: root.op-title;
+        op-hint: root.op-hint;
+        op-placeholder: root.op-placeholder;
+        op-placeholder2: root.op-placeholder2;
+        op-show-input2: root.op-show-input2;
+        op-modes: root.op-modes;
+        op-danger: root.op-danger;
+        op-input <=> root.op-input;
+        op-input2 <=> root.op-input2;
+        op-mode <=> root.op-mode;
+        mode-changed(index) => { root.set-op-mode(index); }
+        input-edited(v) => { root.set-op-input(v); }
+        input2-edited(v) => { root.set-op-input2(v); }
+        confirm => { root.op-confirm(); }
+        cancel => { root.op-cancel(); }
     }
 
-    // ------------------------------------------------ 交互式变基编辑器（FR-MRG-03）
-    Rectangle {
+    IplanDialog {
         visible: root.iplan-visible;
-        background: #00000099;
-
-        TouchArea {}
-
-        Rectangle {
-            width: min(parent.width - 60px, 980px);
-            height: min(parent.height - 60px, 620px);
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            background: Palette.panel;
-            border-color: Palette.border;
-            border-width: 1px;
-            border-radius: 6px;
-
-            VerticalLayout {
-                padding: 16px;
-                spacing: 8px;
-
-                Text {
-                    text: root.iplan-title;
-                    color: Palette.text;
-                    font-size: 15px;
-                    font-weight: 600;
-                }
-
-                Text {
-                    text: root.iplan-summary;
-                    color: Palette.text-faint;
-                    font-size: 11px;
-                    wrap: word-wrap;
-                }
-
-                Rectangle { height: 1px; background: Palette.line; }
-
-                ListView {
-                    vertical-stretch: 1;
-                    for row in root.iplan-rows: Rectangle {
-                        height: 30px;
-                        background: row.selected ? Palette.hover : transparent;
-
-                        TouchArea {
-                            clicked => { root.iplan-select(row.row-index); }
-                        }
-
-                        Text {
-                            x: 6px;
-                            width: 64px;
-                            text: row.short-id;
-                            color: Palette.text-faint;
-                            font-size: 11px;
-                            font-family: Palette.mono-font;
-                            vertical-alignment: center;
-                        }
-
-                        Text {
-                            x: 74px;
-                            width: parent.width - 420px;
-                            text: row.subject + (row.action == 1 && !row.has-message ? "   （需填写新消息）" : "");
-                            color: Palette.text;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-
-                        HorizontalLayout {
-                            x: parent.width - 340px;
-                            width: 336px;
-                            spacing: 3px;
-
-                            for action-label[action-index] in ["保留", "改写", "压缩", "吞并", "丢弃"]: TabButton {
-                                width: 62px;
-                                text: action-label;
-                                active: row.action == action-index;
-                                clicked => { root.iplan-action(row.row-index, action-index); }
-                            }
-                        }
-                    }
-                }
-
-                Rectangle { height: 1px; background: Palette.line; }
-
-                Text {
-                    text: root.iplan-message-visible
-                        ? "所选提交的新消息（「改写」需要填写）"
-                        : "选中一行后可「改写」其消息；「压缩/吞并」会并入上一行提交";
-                    color: Palette.text-dim;
-                    font-size: 11px;
-                }
-
-                Rectangle {
-                    height: root.iplan-message-visible ? 54px : 0px;
-                    visible: root.iplan-message-visible;
-                    background: Palette.bg;
-                    border-color: Palette.border;
-                    border-width: 1px;
-                    border-radius: 3px;
-
-                    TextInput {
-                        x: 6px;
-                        y: 4px;
-                        width: parent.width - 12px;
-                        height: parent.height - 8px;
-                        text <=> root.iplan-message;
-                        single-line: false;
-                        wrap: word-wrap;
-                        color: Palette.text;
-                        font-size: 12px;
-                        font-family: Palette.mono-font;
-                        edited => { root.iplan-set-message(root.iplan-message); }
-                    }
-                }
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: end;
-
-                    FlatButton {
-                        text: "取消";
-                        clicked => { root.iplan-cancel(); }
-                    }
-                    FlatButton {
-                        text: "开始变基";
-                        danger: true;
-                        clicked => { root.iplan-confirm(); }
-                    }
-                }
-            }
-        }
+        iplan-rows: root.iplan-rows;
+        iplan-title: root.iplan-title;
+        iplan-summary: root.iplan-summary;
+        iplan-message-visible: root.iplan-message-visible;
+        iplan-message <=> root.iplan-message;
+        read-only: root.read-only;
+        select(index) => { root.iplan-select(index); }
+        action(row, act) => { root.iplan-action(row, act); }
+        message-edited(v) => { root.iplan-set-message(v); }
+        confirm => { root.iplan-confirm(); }
+        cancel => { root.iplan-cancel(); }
     }
 
-    // ------------------------------------------------ 三路冲突编辑器（FR-CFL）
-    Rectangle {
+    CflDialog {
         visible: root.cfl-visible;
-        background: #00000099;
-
-        TouchArea {}
-
-        Rectangle {
-            width: min(parent.width - 40px, 1180px);
-            height: min(parent.height - 40px, 720px);
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            background: Palette.panel;
-            border-color: Palette.border;
-            border-width: 1px;
-            border-radius: 6px;
-
-            VerticalLayout {
-                padding: 14px;
-                spacing: 8px;
-
-                HorizontalLayout {
-                    spacing: 8px;
-
-                    Text {
-                        horizontal-stretch: 1;
-                        text: root.cfl-title;
-                        color: Palette.text;
-                        font-size: 14px;
-                        font-weight: 600;
-                        vertical-alignment: center;
-                    }
-
-                    Text {
-                        text: root.cfl-summary;
-                        color: Palette.text-faint;
-                        font-size: 11px;
-                        vertical-alignment: center;
-                    }
-                }
-
-                HorizontalLayout {
-                    spacing: 6px;
-
-                    FlatButton {
-                        text: "全部取当前分支";
-                        enabled: !root.read-only;
-                        clicked => { root.cfl-resolve-all(0); }
-                    }
-                    FlatButton {
-                        text: "全部取合入分支";
-                        enabled: !root.read-only;
-                        clicked => { root.cfl-resolve-all(1); }
-                    }
-                    FlatButton {
-                        text: "全部取双方";
-                        enabled: !root.read-only;
-                        clicked => { root.cfl-resolve-all(2); }
-                    }
-                    FlatButton {
-                        text: "整文件取当前分支";
-                        enabled: !root.read-only;
-                        clicked => { root.cfl-take-side(2); }
-                    }
-                    FlatButton {
-                        text: "整文件取合入分支";
-                        enabled: !root.read-only;
-                        clicked => { root.cfl-take-side(3); }
-                    }
-                    FlatButton {
-                        text: "标记为已解决";
-                        enabled: !root.read-only;
-                        clicked => { root.cfl-mark-resolved(); }
-                    }
-
-                    Rectangle { horizontal-stretch: 1; }
-
-                    FlatButton {
-                        text: "关闭";
-                        clicked => { root.cfl-close(); }
-                    }
-                }
-
-                Rectangle { height: 1px; background: Palette.line; }
-
-                HorizontalLayout {
-                    vertical-stretch: 1;
-                    spacing: 0px;
-
-                    ListView {
-                        width: 250px;
-                        for file-row in root.cfl-files: Rectangle {
-                            height: 26px;
-                            background: file-row.selected ? Palette.hover : transparent;
-
-                            TouchArea {
-                                clicked => { root.cfl-select(file-row.row-index); }
-                            }
-
-                            Text {
-                                x: 6px;
-                                width: 26px;
-                                text: file-row.code;
-                                color: Palette.amber;
-                                font-size: 11px;
-                                font-family: Palette.mono-font;
-                                vertical-alignment: center;
-                            }
-
-                            Text {
-                                x: 34px;
-                                width: parent.width - 74px;
-                                text: file-row.path;
-                                color: Palette.text;
-                                font-size: 11px;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
-
-                            Text {
-                                x: parent.width - 38px;
-                                width: 32px;
-                                text: file-row.hunks > 0 ? "×" + file-row.hunks : "✓";
-                                color: file-row.hunks > 0 ? Palette.amber : Palette.green;
-                                font-size: 11px;
-                                vertical-alignment: center;
-                                horizontal-alignment: right;
-                            }
-                        }
-                    }
-
-                    Rectangle { width: 1px; background: Palette.line; }
-
-                    VerticalLayout {
-                        horizontal-stretch: 1;
-                        spacing: 0px;
-
-                        Flickable {
-                            vertical-stretch: 1;
-                            content-height: conflict-content.preferred-height;
-                            content-width: self.width;
-
-                            conflict-content := VerticalLayout {
-                                width: parent.width;
-                                spacing: 2px;
-
-                                for row in root.cfl-rows: Rectangle {
-                                    // 上下文行紧凑，冲突卡片按内容撑开。
-                                    height: row.kind == 0
-                                        ? max(18px, context-text.preferred-height)
-                                        : card.preferred-height + 8px;
-                                    background: row.kind == 0 ? transparent : Palette.bg;
-                                    border-color: row.kind == 0 ? transparent : (row.decided ? Palette.line : Palette.amber);
-                                    border-width: 1px;
-                                    border-radius: 4px;
-
-                                    context-text := Text {
-                                        x: 8px;
-                                        width: parent.width - 16px;
-                                        visible: row.kind == 0;
-                                        text: row.result;
-                                        color: Palette.text-dim;
-                                        font-size: 11px;
-                                        font-family: Palette.mono-font;
-                                        wrap: word-wrap;
-                                    }
-
-                                    card := VerticalLayout {
-                                        x: 6px;
-                                        y: 4px;
-                                        width: parent.width - 12px;
-                                        visible: row.kind == 1;
-                                        spacing: 4px;
-
-                                        HorizontalLayout {
-                                            spacing: 6px;
-
-                                            Text {
-                                                horizontal-stretch: 1;
-                                                text: row.label;
-                                                color: row.decided ? Palette.green : Palette.amber;
-                                                font-size: 11px;
-                                                vertical-alignment: center;
-                                            }
-
-                                            FlatButton {
-                                                text: "取当前分支";
-                                                enabled: !root.read-only;
-                                                clicked => { root.cfl-resolve(row.block, 0); }
-                                            }
-                                            FlatButton {
-                                                text: "取合入分支";
-                                                enabled: !root.read-only;
-                                                clicked => { root.cfl-resolve(row.block, 1); }
-                                            }
-                                            FlatButton {
-                                                text: "取双方";
-                                                enabled: !root.read-only;
-                                                clicked => { root.cfl-resolve(row.block, 2); }
-                                            }
-                                            FlatButton {
-                                                text: "取共同祖先";
-                                                enabled: !root.read-only;
-                                                clicked => { root.cfl-resolve(row.block, 3); }
-                                            }
-                                            FlatButton {
-                                                text: "手动编辑";
-                                                enabled: !root.read-only;
-                                                clicked => { root.cfl-pick-block(row.block); }
-                                            }
-                                        }
-
-                                        HorizontalLayout {
-                                            spacing: 6px;
-
-                                            VerticalLayout {
-                                                horizontal-stretch: 1;
-                                                spacing: 1px;
-                                                Text {
-                                                    text: "当前分支";
-                                                    color: Palette.text-faint;
-                                                    font-size: 10px;
-                                                }
-                                                Text {
-                                                    text: row.ours == "" ? "（空）" : row.ours;
-                                                    color: Palette.text;
-                                                    font-size: 11px;
-                                                    font-family: Palette.mono-font;
-                                                    wrap: word-wrap;
-                                                }
-                                            }
-
-                                            VerticalLayout {
-                                                horizontal-stretch: 1;
-                                                spacing: 1px;
-                                                Text {
-                                                    text: "结果";
-                                                    color: Palette.green;
-                                                    font-size: 10px;
-                                                }
-                                                Text {
-                                                    text: row.result;
-                                                    color: Palette.text;
-                                                    font-size: 11px;
-                                                    font-family: Palette.mono-font;
-                                                    wrap: word-wrap;
-                                                }
-                                            }
-
-                                            VerticalLayout {
-                                                horizontal-stretch: 1;
-                                                spacing: 1px;
-                                                Text {
-                                                    text: "合入分支";
-                                                    color: Palette.text-faint;
-                                                    font-size: 10px;
-                                                }
-                                                Text {
-                                                    text: row.theirs == "" ? "（空）" : row.theirs;
-                                                    color: Palette.text;
-                                                    font-size: 11px;
-                                                    font-family: Palette.mono-font;
-                                                    wrap: word-wrap;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        Rectangle {
-                            height: root.cfl-manual-visible ? 96px : 0px;
-                            visible: root.cfl-manual-visible;
-                            background: Palette.bg;
-                            border-color: Palette.border;
-                            border-width: 1px;
-
-                            TextInput {
-                                x: 6px;
-                                y: 4px;
-                                width: parent.width - 120px;
-                                height: parent.height - 8px;
-                                text <=> root.cfl-manual;
-                                single-line: false;
-                                wrap: word-wrap;
-                                color: Palette.text;
-                                font-size: 11px;
-                                font-family: Palette.mono-font;
-                                edited => { root.cfl-set-manual(root.cfl-manual); }
-                            }
-
-                            FlatButton {
-                                x: parent.width - 106px;
-                                y: 6px;
-                                text: "应用到该块";
-                                enabled: !root.read-only && root.cfl-block >= 0;
-                                clicked => { root.cfl-apply-manual(); }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        cfl-files: root.cfl-files;
+        cfl-rows: root.cfl-rows;
+        cfl-title: root.cfl-title;
+        cfl-summary: root.cfl-summary;
+        cfl-manual-visible: root.cfl-manual-visible;
+        cfl-block: root.cfl-block;
+        cfl-manual <=> root.cfl-manual;
+        read-only: root.read-only;
+        resolve-all(code) => { root.cfl-resolve-all(code); }
+        take-side(code) => { root.cfl-take-side(code); }
+        mark-resolved => { root.cfl-mark-resolved(); }
+        close => { root.cfl-close(); }
+        select(index) => { root.cfl-select(index); }
+        resolve(block, code) => { root.cfl-resolve(block, code); }
+        pick-block(block) => { root.cfl-pick-block(block); }
+        manual-edited(v) => { root.cfl-set-manual(v); }
+        apply-manual => { root.cfl-apply-manual(); }
     }
 
-    // ------------------------------------------------ 比较 / 快照浏览（FR-LOG-08）
-    Rectangle {
+    CompareDialog {
         visible: root.compare-visible;
-        background: #00000099;
-
-        TouchArea {}
-
-        Rectangle {
-            width: min(parent.width - 120px, 760px);
-            height: min(parent.height - 120px, 520px);
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            background: Palette.panel;
-            border-color: Palette.border;
-            border-width: 1px;
-            border-radius: 6px;
-
-            VerticalLayout {
-                padding: 14px;
-                spacing: 8px;
-
-                Text {
-                    text: root.compare-title;
-                    color: Palette.text;
-                    font-size: 14px;
-                    font-weight: 600;
-                    wrap: word-wrap;
-                }
-
-                Text {
-                    text: root.compare-browse
-                        ? "只读浏览：此视图不修改工作区，双击文件可在下方查看差异"
-                        : "两提交比较：双击文件可在下方查看差异";
-                    color: root.compare-browse ? Palette.amber : Palette.text-faint;
-                    font-size: 11px;
-                }
-
-                Rectangle { height: 1px; background: Palette.line; }
-
-                ListView {
-                    vertical-stretch: 1;
-                    for row[index] in root.compare-rows: Rectangle {
-                        height: 24px;
-                        background: row.selected ? Palette.hover : transparent;
-
-                        TouchArea {
-                            clicked => { root.compare-select(index); }
-                        }
-
-                        Text {
-                            x: 6px;
-                            width: 24px;
-                            text: row.code;
-                            color: Palette.amber;
-                            font-size: 11px;
-                            font-family: Palette.mono-font;
-                            vertical-alignment: center;
-                        }
-
-                        Text {
-                            x: 34px;
-                            width: parent.width - 120px;
-                            text: row.path;
-                            color: Palette.text;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-
-                        Text {
-                            x: parent.width - 80px;
-                            width: 74px;
-                            text: row.status;
-                            color: Palette.text-faint;
-                            font-size: 11px;
-                            vertical-alignment: center;
-                            horizontal-alignment: right;
-                        }
-                    }
-                }
-
-                HorizontalLayout {
-                    alignment: end;
-                    FlatButton {
-                        text: "关闭";
-                        clicked => { root.compare-close(); }
-                    }
-                }
-            }
-        }
+        compare-rows: root.compare-rows;
+        compare-title: root.compare-title;
+        compare-browse: root.compare-browse;
+        select(index) => { root.compare-select(index); }
+        close => { root.compare-close(); }
     }
 
+    FileHistoryDialog {
+        visible: root.history-visible;
+        history-rows: root.history-rows;
+        history-title: root.history-title;
+        history-truncated: root.history-truncated;
+        history-filter <=> root.history-filter;
+        select(index) => { root.history-select(index); }
+        set-filter(index) => { root.history-set-filter(index); }
+        close => { root.history-close(); }
+}
 }

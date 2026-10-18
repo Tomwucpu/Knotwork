@@ -1,0 +1,247 @@
+// Knotwork 基础组件库（M4.5 UI 专项 S2）。
+//
+// 形态对齐 IDEA Git 工具窗的观感约定：
+//   - 工具栏 / 行内按钮一律 ghost 形态（透明底、hover 才起底色、无边框）；
+//   - 对话框动作按钮 outline / primary 形态；
+//   - chip 选中态用 accent 底 + 反白字；
+//   - 菜单带 hover 高亮与危险项红字。
+//
+// 兼容约定：每个新控件都保留一个同名子类作为历史别名
+// （FlatButton / TabButton / Field / OptionToggle / CtxMenuItem），
+// 旧调用点零改动即可获得新观感；新代码请直接用 Idea* 名字。
+//
+// 纪律：本文件（以及一切 .slint）不得出现裸色值，一律取自 Palette / Metrics。
+
+import { Palette, Metrics } from "theme.slint";
+
+
+export component IdeaButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <bool> danger: false;
+    in property <string> variant: "ghost";
+    callback clicked();
+
+    width: max(48px, label.preferred-width + 16px);
+    height: 22px;
+    border-radius: Palette.radius-sm;
+    border-width: root.variant == "outline" ? 1px : 0px;
+    border-color: root.danger ? Palette.red : Palette.border;
+    background: !root.enabled
+        ? Palette.btn-disabled
+        : (touch.pressed
+            ? Palette.btn-pressed
+            : (touch.has-hover
+                ? (root.danger && root.variant == "ghost" ? Palette.danger-bg : Palette.btn-hover)
+                : (root.variant == "outline" ? Palette.btn-bg : (root.variant == "primary" ? Palette.accent-strong : transparent))));
+
+    label := Text {
+        text: root.text;
+        color: !root.enabled
+            ? Palette.text-faint
+            : (root.variant == "primary"
+                ? Palette.on-accent
+                : (root.danger ? Palette.red : Palette.text));
+        font-size: Palette.font-xs;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component FlatButton inherits IdeaButton { }
+
+
+export component IdeaTab inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked();
+
+    width: max(80px, label.preferred-width + 20px);
+    height: 28px;
+    background: touch.has-hover && !root.active ? Palette.hover : transparent;
+
+    label := Text {
+        text: root.text;
+        color: root.active ? Palette.text : Palette.text-faint;
+        font-size: Palette.font-sm;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    Rectangle {
+        width: 100%;
+        height: 2px;
+        y: 26px;
+        background: Palette.accent-strong;
+        visible: root.active;
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+export component TabButton inherits IdeaTab { }
+
+
+export component IdeaInput inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder: "";
+    in property <bool> monospace: false;
+    callback edited(string);
+
+    height: 26px;
+    background: Palette.bg;
+    border-radius: Palette.radius-sm;
+    border-width: 1px;
+    // 聚焦描边：对齐 IDEA 的输入焦点反馈。
+    border-color: input.has-focus ? Palette.accent-strong : Palette.border;
+
+    input := TextInput {
+        x: 6px;
+        width: parent.width - 12px;
+        height: parent.height;
+        text <=> root.text;
+        single-line: true;
+        color: Palette.text;
+        font-size: Palette.font-xs;
+        font-family: root.monospace ? Palette.mono-font : "";
+        vertical-alignment: center;
+        edited => { root.edited(root.text); }
+    }
+
+    // 占位符：TextInput 无内置占位符属性，空文本时覆盖显示一层淡色文字。
+    Text {
+        x: 6px;
+        width: parent.width - 12px;
+        text: root.placeholder;
+        color: Palette.text-faint;
+        font-size: Palette.font-xs;
+        font-family: root.monospace ? Palette.mono-font : "";
+        vertical-alignment: center;
+        overflow: elide;
+        visible: root.text == "";
+    }
+}
+
+export component Field inherits IdeaInput { }
+
+
+export component IdeaChip inherits Rectangle {
+    in property <string> text;
+    in property <bool> checked;
+    callback toggled();
+
+    width: max(56px, label.preferred-width + 18px);
+    height: 22px;
+    border-radius: Palette.radius-sm;
+    background: root.checked ? Palette.accent : (touch.has-hover ? Palette.hover : transparent);
+    border-width: 1px;
+    border-color: root.checked ? Palette.accent-strong : Palette.line;
+
+    label := Text {
+        text: (root.checked ? "✓ " : "") + root.text;
+        color: root.checked ? Palette.accent-text : Palette.text-faint;
+        font-size: Palette.font-xs;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        clicked => { root.toggled(); }
+    }
+}
+
+export component OptionToggle inherits IdeaChip { }
+
+
+export component MenuItem inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <bool> danger: false;
+    callback clicked();
+
+    height: 26px;
+    border-radius: Palette.radius-sm;
+    background: touch.has-hover && root.enabled ? Palette.hover : transparent;
+
+    Text {
+        x: 8px;
+        width: parent.width - 16px;
+        text: root.text;
+        color: !root.enabled ? Palette.text-faint : (root.danger ? Palette.red : Palette.text);
+        font-size: Palette.font-sm;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component CtxMenuItem inherits MenuItem { }
+
+
+export component Divider inherits Rectangle {
+    height: 1px;
+    background: Palette.line;
+}
+
+export component VDivider inherits Rectangle {
+    width: 1px;
+    background: Palette.line;
+}
+
+export component SectionLabel inherits Text {
+    color: Palette.text-dim;
+    font-size: Palette.font-sm;
+    font-weight: 600;
+    vertical-alignment: center;
+}
+
+export component DialogShell inherits Rectangle {
+    in property <string> title;
+    in property <bool> danger: false;
+    in property <length> dialog-max-width: 520px;
+    in property <length> dialog-max-height: 320px;
+
+    background: Palette.scrim;
+
+    // 吃掉遮罩层的点击，避免点穿到底下的列表上。
+    TouchArea { }
+
+    Rectangle {
+        width: min(parent.width - 80px, root.dialog-max-width);
+        height: min(parent.height - 80px, root.dialog-max-height);
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: Palette.panel;
+        border-color: root.danger ? Palette.red : Palette.border;
+        border-width: 1px;
+        border-radius: Palette.radius-lg;
+
+        VerticalLayout {
+            padding: 18px;
+            spacing: 10px;
+
+            Text {
+                text: root.title;
+                color: root.danger ? Palette.red : Palette.text;
+                font-size: Palette.font-title;
+                font-weight: 600;
+                wrap: word-wrap;
+            }
+
+            Divider { }
+
+            @children
+        }
+    }
+}

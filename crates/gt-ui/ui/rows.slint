@@ -1,0 +1,363 @@
+// Knotwork 列表行组件（M4.5 UI 专项 S3 迁出 + S4 弹性化）。
+//
+// 从 main-window.slint 迁出的四个行组件：Log / Diff / 本地更改 / Console。
+// 三条渲染纪律不变：行内不做文本测量（diff 词级高亮仍按"分段文本"传入），
+// 行高仍取自 Metrics（虚拟化列表的布局基准）。
+
+import { Palette, Metrics } from "theme.slint";
+import { BlameRow, GraphCell } from "model.slint";
+
+
+export component LogRowView inherits Rectangle {
+    in property <string> short-id;
+    in property <string> subject;
+    in property <string> author;
+    in property <string> when;
+    in property <string> refs-text;
+    in property <[GraphCell]> graph;
+    in property <bool> is-selected;
+    in property <bool> is-mine;
+    in property <bool> is-merge;
+    callback clicked();
+    // 右键：提交上下文菜单（FR-LOG-07/08）。带上光标坐标，菜单出现在鼠标处。
+    callback context-clicked(length, length);
+
+    background: root.is-selected
+        ? Palette.selection
+        : (touch.has-hover ? Palette.hover : transparent);
+
+    HorizontalLayout {
+        spacing: 0px;
+
+        // 泳道图：每列一个格子，格子内部自绘连线与节点。
+        Rectangle {
+            width: root.graph.length * Metrics.lane-width;
+            height: 100%;
+
+            HorizontalLayout {
+                spacing: 0px;
+
+                for cell in root.graph: Rectangle {
+                    width: Metrics.lane-width;
+
+                    Rectangle {
+                        x: 5px;
+                        width: 2px;
+                        height: 100%;
+                        background: cell.color;
+                        visible: cell.kind == 1 || cell.kind == 2;
+                    }
+
+                    Rectangle {
+                        x: 1px;
+                        y: 7px;
+                        width: 9px;
+                        height: 9px;
+                        border-radius: 5px;
+                        background: cell.color;
+                        visible: cell.kind == 2;
+                    }
+                }
+            }
+        }
+
+        Text {
+            width: 58px;
+            text: root.short-id;
+            color: Palette.text-faint;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+            font-family: Palette.mono-font;
+        }
+
+        Text {
+            width: 140px;
+            text: root.refs-text;
+            color: Palette.amber;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            horizontal-stretch: 1;
+            text: root.subject;
+            // FR-LOG-06：合并提交置灰；我的提交加粗。
+            color: root.is-merge ? Palette.text-faint : Palette.text;
+            font-size: Palette.body-size;
+            font-weight: root.is-mine ? 700 : 400;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            width: 180px;
+            text: root.author == "" ? root.when : root.author + "  ·  " + root.when;
+            color: Palette.text-faint;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            overflow: elide;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.right) {
+                // 菜单贴在该行的左边缘展开：`PointerEvent` 不提供光标坐标，
+                // 而"点击哪一行就在哪一行旁边弹出"本来就是上下文菜单的语义。
+                root.context-clicked(
+                    touch.absolute-position.x + 48px,
+                    touch.absolute-position.y);
+            }
+        }
+    }
+}
+
+
+export component DiffRowView inherits Rectangle {
+    in property <int> kind;
+    in property <string> old-no;
+    in property <string> new-no;
+    in property <[string]> segments;
+    in property <[bool]> changed;
+    in property <bool> is-hunk-header;
+    in property <bool> selectable;
+    in property <bool> selected;
+    callback clicked();
+
+    // kind: 0 上下文、1 新增、2 删除、3 元信息
+    background: root.is-hunk-header
+        ? Palette.bar
+        : (root.kind == 1 ? Palette.add-bg : (root.kind == 2 ? Palette.del-bg : transparent));
+
+    // 选中态用左侧色条 + 底色叠加表示，避免盖掉增删行的底色语义。
+    Rectangle {
+        width: 3px;
+        height: 100%;
+        background: Palette.amber;
+        visible: root.selected;
+    }
+
+    HorizontalLayout {
+        spacing: 0px;
+
+        Text {
+            width: 46px;
+            text: root.old-no;
+            color: Palette.text-faint;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            font-family: Palette.mono-font;
+        }
+
+        Text {
+            width: 46px;
+            text: root.new-no;
+            color: Palette.text-faint;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            font-family: Palette.mono-font;
+        }
+
+        Rectangle { width: 12px; }
+
+        HorizontalLayout {
+            horizontal-stretch: 1;
+            spacing: 0px;
+
+            for segment[i] in root.segments: Text {
+                text: segment;
+                color: root.changed[i]
+                    ? Palette.seg-changed
+                    : (root.kind == 2 ? Palette.red : (root.kind == 1 ? Palette.green : Palette.text-dim));
+                font-size: Palette.body-size;
+                vertical-alignment: center;
+                font-family: Palette.mono-font;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.selectable;
+        clicked => { root.clicked(); }
+    }
+}
+
+
+export component ChangeRowView inherits Rectangle {
+    in property <string> path;
+    in property <string> code;
+    in property <string> bucket;
+    in property <string> note;
+    in property <bool> is-selected;
+    in property <bool> is-conflict;
+    callback clicked();
+
+    background: root.is-selected
+        ? Palette.selection
+        : (touch.has-hover ? Palette.hover : transparent);
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 8px;
+
+        Text {
+            width: 110px;
+            text: root.bucket;
+            color: root.is-conflict ? Palette.red : Palette.text-faint;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            width: 24px;
+            text: root.code;
+            color: Palette.amber;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+            font-family: Palette.mono-font;
+        }
+
+        Text {
+            horizontal-stretch: 1;
+            text: root.path;
+            color: Palette.text;
+            font-size: Palette.body-size;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            width: 150px;
+            text: root.note;
+            color: Palette.text-faint;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+
+export component ConsoleRowView inherits Rectangle {
+    in property <string> route;
+    in property <string> summary;
+    in property <string> detail;
+    in property <bool> ok;
+
+    background: transparent;
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 8px;
+
+        Text {
+            width: 92px;
+            text: root.route;
+            color: root.ok ? Palette.green : Palette.red;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+        }
+
+        Text {
+            horizontal-stretch: 1;
+            text: root.summary;
+            color: Palette.text-dim;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+            overflow: elide;
+            font-family: Palette.mono-font;
+        }
+
+        Text {
+            width: 240px;
+            text: root.detail;
+            color: Palette.text-faint;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+
+export component BlameRowView inherits Rectangle {
+    in property <int> line-no;
+    in property <string> commit;
+    in property <string> author;
+    in property <string> when;
+    in property <string> summary;
+    in property <bool> is-selected;
+    in property <bool> is-boundary;
+    callback clicked();
+
+    background: root.is-selected
+        ? Palette.selection
+        : (touch.has-hover ? Palette.hover : transparent);
+
+    HorizontalLayout {
+        spacing: 0px;
+
+        Text {
+            width: 44px;
+            text: root.line-no;
+            color: Palette.text-faint;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            font-family: Palette.mono-font;
+        }
+
+        Rectangle { width: Metrics.space-2; }
+
+        Text {
+            width: 64px;
+            text: root.commit;
+            color: root.is-boundary ? Palette.amber : Palette.green;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+            font-family: Palette.mono-font;
+        }
+
+        Text {
+            width: 110px;
+            text: root.author;
+            color: Palette.text-dim;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            width: 70px;
+            text: root.when;
+            color: Palette.text-faint;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+        }
+
+        Text {
+            horizontal-stretch: 1;
+            text: root.summary;
+            color: Palette.text;
+            font-size: Palette.font-xs;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}

@@ -8,11 +8,11 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use gt_backend::{
-    BranchOp, CherryPickRequest, CommitRequest, CredentialKind, FetchRequest, IgnoreTarget,
-    MergeRequest, NetworkResult, PatchApplyRequest, PatchSource, PullRequest, PushPreview,
-    PushRequest, RebaseControl, RebasePlan, RebaseProgress, RebaseRequest, RemoteEdit, RemoteInfo,
-    RemoteListing, RepoLocation, ResetRequest, RevertRequest, StashEntry, StashOp, TagOp,
-    WriteOutcome,
+    BranchOp, BlameLine, CherryPickRequest, CommitRequest, CredentialKind, FetchRequest,
+    FileHistoryEntry, IgnoreTarget, MergeRequest, NetworkResult, PatchApplyRequest, PatchSource,
+    PullRequest, PushPreview, PushRequest, RebaseControl, RebasePlan, RebaseProgress,
+    RebaseRequest, RemoteEdit, RemoteInfo, RemoteListing, RepoLocation, ResetRequest,
+    RevertRequest, StashEntry, StashOp, TagOp, WriteOutcome,
 };
 use gt_core::{ChangeSet, FileChange, HeadInfo, LogNodePage, LogPageRequest, RefInfo, RepoState};
 use gt_diff::HunkSelection;
@@ -483,6 +483,67 @@ impl Default for SearchRequest {
     }
 }
 
+/// Blame 结果（FR-BLM-02）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlameResult {
+    /// 被归因的文件。
+    pub path: String,
+    /// 被 blame 的修订；[`None`] = 工作区。
+    pub spec: Option<String>,
+    /// 逐行归因。
+    pub rows: Vec<BlameLine>,
+    /// 是否因行数上限被截断。
+    pub truncated: bool,
+    /// 链式导航的滚动锚点（行下标，0 起）；普通 blame 为 [`None`]。
+    pub anchor: Option<usize>,
+}
+
+/// 文件历史结果（FR-BLM-01）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileHistoryResult {
+    /// 文件。
+    pub path: String,
+    /// 是否扫了全部引用。
+    pub all_refs: bool,
+    /// 提交列表（新 → 旧）。
+    pub rows: Vec<FileHistoryEntry>,
+    /// 是否因条数上限被截断。
+    pub truncated: bool,
+}
+
+/// 图片差异的**单侧**载荷（FR-DIF-04）。
+///
+/// `rgba` 为空表示"解码受限，只展示元信息"（源图超大）；
+/// `None` 表示该侧不存在（新增 / 删除）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageSide {
+    /// 是否成功解码为图片；`false` 时只有文件大小可展示（真二进制）。
+    pub decodable: bool,
+    /// 像素宽。
+    pub width: u32,
+    /// 像素高。
+    pub height: u32,
+    /// 文件字节数。
+    pub file_bytes: usize,
+    /// RGBA8 像素（`width * height * 4`；解码受限时为空）。
+    pub rgba: Vec<u8>,
+    /// 解码是否因超像素上限被限制（仅提供尺寸元信息）。
+    pub limited: bool,
+}
+
+/// 图片差异结果（FR-DIF-04）：并排与叠加透明度对比的数据源。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageDiffResult {
+    /// 仓库相对路径。
+    pub path: String,
+    /// 旧侧（[`None`] = 新增文件）。
+    pub old: Option<ImageSide>,
+    /// 新侧（[`None`] = 删除文件）。
+    pub new: Option<ImageSide>,
+    /// 两侧字节是否完全相同。
+    pub equal: bool,
+}
+
 /// 一次读取请求的类别。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestKind {
@@ -529,6 +590,45 @@ pub enum RequestKind {
     },
     /// 贮藏列表（FR-STH）。
     StashList,
+    /// 逐行归因（FR-BLM-02）。`spec` 为 [`None`] 表示 blame 工作区内容。
+    Blame {
+        /// 被 blame 的修订；[`None`] = 工作区。
+        spec: Option<String>,
+        /// 仓库相对路径。
+        path: String,
+    },
+    /// 文件历史列表（FR-BLM-01，`--follow` 跟随重命名）。
+    FileHistory {
+        /// 是否扫全部引用（`--all`）；否则只看当前分支。
+        all_refs: bool,
+        /// 仓库相对路径。
+        path: String,
+    },
+    /// Blame 行点击后的"提交详情"（FR-BLM-02）：解析父提交并给出该文件
+    /// 在该提交上的差异。复用 [`Outcome::FileDiff`] 送达，界面无需新分支。
+    BlameDetail {
+        /// 归属提交（完整哈希）。
+        commit: String,
+        /// 仓库相对路径。
+        path: String,
+    },
+    /// 链式导航（FR-BLM-03）：在归属提交的父侧重新 blame，并把当前行号
+    /// 映射到旧侧行号。映射与新 blame 都在服务线程完成，一次投递同时
+    /// 带回行数据与滚动锚点（[`BlameResult::anchor`]）。
+    BlameChain {
+        /// 当前行归属的提交（完整哈希）。
+        commit: String,
+        /// 重命名前的提交（porcelain `previous` 头；无重命名为 [`None`]）。
+        prev_commit: Option<String>,
+        /// 重命名前的路径。
+        prev_path: Option<String>,
+        /// 当前被 blame 的路径。
+        path: String,
+        /// 当前 blame 的修订（[`None`] = 工作区，映射时新侧取工作区）。
+        from_spec: Option<String>,
+        /// 当前选中的行号（1 起，工作区/修订内容中的行号）。
+        line: usize,
+    },
     /// 写操作（不经代次闸门）。
     Write(Box<WriteRequest>),
     /// 网络操作（FR-RMT，不经代次闸门，但可取消）。
@@ -608,7 +708,14 @@ impl RequestKind {
             Self::Overview => RequestLane::Overview,
             Self::Status => RequestLane::Status,
             Self::LogPage(_) | Self::Search(_) => RequestLane::Log,
-            Self::TreeChanges { .. } | Self::FileDiff { .. } => RequestLane::Diff,
+            // 差异族（含 Blame / 文件历史）共用一条视图通道：它们都在"看
+            // 某个文件的内容"，新请求作废旧请求是正确的语义。
+            Self::TreeChanges { .. }
+            | Self::FileDiff { .. }
+            | Self::Blame { .. }
+            | Self::FileHistory { .. }
+            | Self::BlameDetail { .. }
+            | Self::BlameChain { .. } => RequestLane::Diff,
             Self::Conflicts
             | Self::ConflictFile { .. }
             | Self::RebasePlan { .. }
@@ -632,6 +739,10 @@ impl RequestKind {
             Self::ConflictFile { .. } => "冲突文件",
             Self::RebasePlan { .. } => "变基计划",
             Self::StashList => "贮藏列表",
+            Self::Blame { .. } => "Blame",
+            Self::FileHistory { .. } => "文件历史",
+            Self::BlameDetail { .. } => "提交详情（Blame）",
+            Self::BlameChain { .. } => "Blame 上溯",
             Self::Write(write) => write.label(),
             Self::Network(network) => network.label(),
         }
@@ -777,6 +888,12 @@ pub enum Outcome {
     RebasePlan(Box<RebasePlan>),
     /// 贮藏列表。
     StashList(Vec<StashEntry>),
+    /// Blame 逐行归因（FR-BLM-02）。
+    Blame(Box<BlameResult>),
+    /// 文件历史（FR-BLM-01）。
+    FileHistory(Box<FileHistoryResult>),
+    /// 图片差异（FR-DIF-04）：并排 / 叠加对比的数据源。
+    ImageDiff(Box<ImageDiffResult>),
     /// 失败：错误文本已经过"面向用户"的转换，可直接展示。
     Failed(String),
 }

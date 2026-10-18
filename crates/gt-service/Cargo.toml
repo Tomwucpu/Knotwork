@@ -14,6 +14,7 @@ workspace = true
 gt-core.workspace = true
 gt-backend.workspace = true
 gt-diff.workspace = true
+image.workspace = true
 crossbeam-channel.workspace = true
 notify.workspace = true
 notify-debouncer-full.workspace = true

@@ -41,6 +41,7 @@
 //! ```
 
 pub mod session;
+pub mod text;
 pub mod view_model;
 
 /// Slint 根据 `ui/main-window.slint` 生成的界面绑定代码。

@@ -40,9 +40,10 @@ use crate::cancel::CancellationToken;
 use crate::generation::{Generation, RequestGate};
 use crate::pool::WorkerPool;
 use crate::task::{
-    AdvancedResult, ConflictedEntry, CredentialOutcome, Delivery, DiffSide, LogPageResult,
-    NetworkFailure, NetworkOutcome, NetworkRequest, Outcome, RepoOverview, RequestError,
-    RequestKind, RequestLane, SearchResult, SelectionMode, WriteRequest,
+    AdvancedResult, BlameResult, ConflictedEntry, CredentialOutcome, Delivery, DiffSide,
+    FileHistoryResult, ImageDiffResult, ImageSide, LogPageResult, NetworkFailure, NetworkOutcome,
+    NetworkRequest, Outcome, RepoOverview, RequestError, RequestKind, RequestLane, SearchResult,
+    SelectionMode, WriteRequest,
 };
 use crate::watch::{ChangeBatch, ChangeSink, RepoPaths, RepoWatcher, DEFAULT_DEBOUNCE};
 
@@ -961,41 +962,7 @@ fn execute(
             Ok(Outcome::Status(Box::new(changes)))
         }
         RequestKind::LogPage(request) => {
-            let scope = request.filter.scope;
-            let (ids, from_cache, note) = {
-                let mut index = handle.lock_log_index();
-                let (ids, from_cache, note) = index
-                    .ensure(repo, scope, request.graph, token)
-                    .map_err(user_message)?;
-                (ids.to_vec(), from_cache, note)
-            };
-            token.check().map_err(user_message)?;
-
-            let total = ids.len();
-            // 下界取 1：分页大小由调用方决定（首次加载与滚动预取可能不同），
-            // 只对"异常大的一页"设上界，避免一次物化过多提交元数据。
-            let limit = request.limit.clamp(1, gt_core::MAX_PAGE_SIZE);
-            let end = request.offset.saturating_add(limit).min(total);
-            let slice: Vec<Oid> = if request.offset < total {
-                ids[request.offset..end].to_vec()
-            } else {
-                Vec::new()
-            };
-            token.check().map_err(user_message)?;
-
-            let nodes = repo.commit_metas(&slice, request).map_err(user_message)?;
-            let exhausted = end >= total;
-
-            Ok(Outcome::LogPage(Box::new(LogPageResult {
-                page: gt_core::LogNodePage {
-                    nodes,
-                    offset: request.offset,
-                    exhausted,
-                },
-                total,
-                from_cache,
-                note,
-            })))
+            execute_log_page(repo, handle, request, token)
         }
         RequestKind::TreeChanges { old, new } => {
             let changes = repo
@@ -1004,6 +971,9 @@ fn execute(
             Ok(Outcome::TreeChanges(changes))
         }
         RequestKind::FileDiff { left, right, path } => {
+            if is_image_path(path) {
+                return execute_image_diff(repo, left, right, path);
+            }
             let diff = compute_file_diff(repo, left, right, path)?;
             Ok(Outcome::FileDiff(Box::new(diff)))
         }
@@ -1033,9 +1003,204 @@ fn execute(
             let ops = advanced_ops(repo, handle)?;
             Ok(Outcome::StashList(ops.stash_list().map_err(user_message)?))
         }
+        RequestKind::Blame { .. }
+        | RequestKind::FileHistory { .. }
+        | RequestKind::BlameDetail { .. }
+        | RequestKind::BlameChain { .. } => execute_blame(repo, handle, kind, token),
         RequestKind::Write(_) => Err("写请求不应进入读取路径".to_owned()),
         RequestKind::Network(_) => Err("网络请求不应进入读取路径".to_owned()),
     }
+}
+
+
+
+/// 日志页（FR-LOG-01/03）：从索引取 id 切片，再物化提交元数据。
+fn execute_log_page(
+    repo: &GitRepo,
+    handle: &RepoHandle,
+    request: &LogPageRequest,
+    token: &CancellationToken,
+) -> Result<Outcome, String> {
+    let scope = request.filter.scope;
+    let (ids, from_cache, note) = {
+        let mut index = handle.lock_log_index();
+        let (ids, from_cache, note) = index
+            .ensure(repo, scope, request.graph, token)
+            .map_err(user_message)?;
+        (ids.to_vec(), from_cache, note)
+    };
+    token.check().map_err(user_message)?;
+
+    let total = ids.len();
+    // 下界取 1：分页大小由调用方决定（首次加载与滚动预取可能不同），
+    // 只对"异常大的一页"设上界，避免一次物化过多提交元数据。
+    let limit = request.limit.clamp(1, gt_core::MAX_PAGE_SIZE);
+    let end = request.offset.saturating_add(limit).min(total);
+    let slice: Vec<Oid> = if request.offset < total {
+        ids[request.offset..end].to_vec()
+    } else {
+        Vec::new()
+    };
+    token.check().map_err(user_message)?;
+
+    let nodes = repo.commit_metas(&slice, request).map_err(user_message)?;
+    let exhausted = end >= total;
+
+    Ok(Outcome::LogPage(Box::new(LogPageResult {
+        page: gt_core::LogNodePage {
+            nodes,
+            offset: request.offset,
+            exhausted,
+        },
+        total,
+        from_cache,
+        note,
+    })))
+}
+
+/// Blame 与文件历史的执行族（FR-BLM，M5）。
+///
+/// 独立于 `execute`：这组请求都走 git CLI，且链式导航要把"行号映射 +
+/// 上溯 blame"合成一次投递，逻辑自成一块。
+fn execute_blame(
+    repo: &GitRepo,
+    handle: &RepoHandle,
+    kind: &RequestKind,
+    token: &CancellationToken,
+) -> Result<Outcome, String> {
+    match kind {
+        RequestKind::Blame { spec, path } => {
+            let Some(cli) = handle.cli.as_ref() else {
+                return Err(cli_missing_for_blame());
+            };
+            token.check().map_err(user_message)?;
+            let rows = gt_backend::blame::blame(
+                cli,
+                repo.location(),
+                repo.observer().as_ref(),
+                spec.as_deref(),
+                path,
+                None,
+            )
+            .map_err(user_message)?;
+            let truncated = rows.len() >= gt_backend::MAX_BLAME_LINES;
+            Ok(Outcome::Blame(Box::new(BlameResult {
+                path: path.clone(),
+                spec: spec.clone(),
+                rows,
+                truncated,
+                anchor: None,
+            })))
+        }
+        RequestKind::BlameChain { .. } => execute_blame_chain(repo, handle, kind),
+        RequestKind::FileHistory { all_refs, path } => {
+            let Some(cli) = handle.cli.as_ref() else {
+                return Err(cli_missing_for_blame());
+            };
+            token.check().map_err(user_message)?;
+            let rows = gt_backend::blame::file_history(
+                cli,
+                repo.location(),
+                repo.observer().as_ref(),
+                *all_refs,
+                path,
+                None,
+            )
+            .map_err(user_message)?;
+            let truncated = rows.len() >= gt_backend::blame::MAX_HISTORY_ENTRIES;
+            Ok(Outcome::FileHistory(Box::new(FileHistoryResult {
+                path: path.clone(),
+                all_refs: *all_refs,
+                rows,
+                truncated,
+            })))
+        }
+        RequestKind::BlameDetail { commit, path } => {
+            // FR-BLM-02：点击 blame 行跳转"该提交详情"——父提交为旧侧、
+            // 该提交为新侧的文件差异。根提交以空树为旧侧。
+            let Some(cli) = handle.cli.as_ref() else {
+                return Err(cli_missing_for_blame());
+            };
+            token.check().map_err(user_message)?;
+            let parents = gt_backend::blame::commit_parents(
+                cli,
+                repo.location(),
+                repo.observer().as_ref(),
+                commit,
+            )
+            .map_err(user_message)?;
+            let left = parents
+                .first()
+                .map_or(DiffSide::Empty, |p| DiffSide::Rev(p.clone()));
+            let diff = compute_file_diff(repo, &left, &DiffSide::Rev(commit.clone()), path)?;
+            Ok(Outcome::FileDiff(Box::new(diff)))
+        }
+        _ => Err("非 Blame 族请求不应进入此路径".to_owned()),
+    }
+}
+
+
+/// 链式导航（FR-BLM-03）：在归属提交的父侧（或重命名前位置）重新 blame，
+/// 并把当前行号映射过去。两步都在服务线程完成，一次投递带回行数据与锚点。
+fn execute_blame_chain(
+    repo: &GitRepo,
+    handle: &RepoHandle,
+    kind: &RequestKind,
+) -> Result<Outcome, String> {
+    let RequestKind::BlameChain {
+        commit,
+        prev_commit,
+        prev_path,
+        path,
+        from_spec,
+        line,
+    } = kind
+    else {
+        return Err("非 BlameChain 请求不应进入此路径".to_owned());
+    };
+    let Some(cli) = handle.cli.as_ref() else {
+        return Err(cli_missing_for_blame());
+    };
+    let next_spec = prev_commit.clone().unwrap_or_else(|| format!("{commit}^"));
+    let next_path = prev_path.clone().unwrap_or_else(|| path.clone());
+    let mut paths: Vec<&str> = vec![next_path.as_str()];
+    if next_path.as_str() != path.as_str() {
+        paths.push(path);
+    }
+    let mapped = gt_backend::blame::map_line_to_older(
+        cli,
+        repo.location(),
+        repo.observer().as_ref(),
+        &next_spec,
+        from_spec.as_deref(),
+        &paths,
+        *line,
+    )
+    .map_err(user_message)?
+    .unwrap_or(*line);
+    let rows = gt_backend::blame::blame(
+        cli,
+        repo.location(),
+        repo.observer().as_ref(),
+        Some(&next_spec),
+        &next_path,
+        None,
+    )
+    .map_err(user_message)?;
+    let truncated = rows.len() >= gt_backend::MAX_BLAME_LINES;
+    Ok(Outcome::Blame(Box::new(BlameResult {
+        path: next_path,
+        spec: Some(next_spec),
+        rows,
+        truncated,
+        anchor: Some(mapped.saturating_sub(1)),
+    })))
+}
+
+/// git 缺失时 Blame / 文件历史的降级说明（与高级操作一致的话术）。
+fn cli_missing_for_blame() -> String {
+    "Blame 与文件历史依赖 git 可执行文件（当前未检测到 git）；             可通过环境变量 KNOTWORK_GIT 指定 git 路径。"
+        .to_owned()
 }
 
 /// 构造高级操作执行器；git 缺失时给出与其它写操作一致的降级说明。
@@ -1587,6 +1752,66 @@ fn compute_file_diff(
         new_bytes.as_deref(),
         &options,
     ))
+}
+
+/// 解码受限的像素上限：4096×4096 ≈ 64MB RGBA，超出只展示尺寸元信息。
+const MAX_IMAGE_PIXELS: usize = 16 * 1024 * 1024;
+
+/// 路径是否为常见位图（FR-DIF-04：PNG/JPG 及其它常见格式）。
+fn is_image_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    matches!(
+        lower.rsplit('.').next(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico")
+    ) && lower.contains('.')
+}
+
+/// 把一侧字节解码成图片载荷；`None` 表示该侧不存在。
+///
+/// 解码失败（真二进制）时仍返回元信息载荷（只有文件大小），
+/// 让界面能给出"不是图片"的说明而不是空白。
+fn decode_image_side(bytes: Option<Vec<u8>>) -> Option<ImageSide> {
+    let bytes = bytes?;
+    let file_bytes = bytes.len();
+    let (decodable, width, height, rgba, limited) = match image::load_from_memory(&bytes) {
+        Ok(img) => {
+            let (width, height) = (img.width(), img.height());
+            let limited = (width as usize).saturating_mul(height as usize) > MAX_IMAGE_PIXELS;
+            let rgba = if limited {
+                Vec::new()
+            } else {
+                img.to_rgba8().into_raw()
+            };
+            (true, width, height, rgba, limited)
+        }
+        Err(_) => (false, 0, 0, Vec::new(), false),
+    };
+    Some(ImageSide {
+        decodable,
+        width,
+        height,
+        file_bytes,
+        rgba,
+        limited,
+    })
+}
+
+/// 图片差异（FR-DIF-04）：两侧各自解码，`equal` 由字节级比较给出。
+fn execute_image_diff(
+    repo: &GitRepo,
+    left: &DiffSide,
+    right: &DiffSide,
+    path: &str,
+) -> Result<Outcome, String> {
+    let old_bytes = read_side(repo, left, path)?;
+    let new_bytes = read_side(repo, right, path)?;
+    let equal = old_bytes == new_bytes;
+    Ok(Outcome::ImageDiff(Box::new(ImageDiffResult {
+        path: path.to_owned(),
+        old: decode_image_side(old_bytes),
+        new: decode_image_side(new_bytes),
+        equal,
+    })))
 }
 
 /// 读取差异某一侧的内容。

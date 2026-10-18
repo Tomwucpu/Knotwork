@@ -50,10 +50,10 @@ pub use service::{
     MAX_BLOB_BYTES,
 };
 pub use task::{
-    AdvancedResult, ConflictedEntry, CredentialOutcome, Delivery, DiffSide, LogPageResult,
-    NetworkFailure, NetworkOutcome, NetworkRequest, Outcome, PushPreviewRequest, RemoteEntry,
-    RepoOverview, RequestError, RequestKind, RequestLane, SearchRequest, SearchResult,
-    SelectionMode, WriteRequest,
+    AdvancedResult, BlameResult, ConflictedEntry, CredentialOutcome, Delivery, DiffSide,
+    FileHistoryResult, ImageDiffResult, ImageSide, LogPageResult, NetworkFailure, NetworkOutcome,
+    NetworkRequest, Outcome, PushPreviewRequest, RemoteEntry, RepoOverview, RequestError,
+    RequestKind, RequestLane, SearchRequest, SearchResult, SelectionMode, WriteRequest,
 };
 pub use watch::{
     merge_events, ChangeBatch, ChangeSink, Relevance, RepoPaths, RepoWatcher, WatchError,

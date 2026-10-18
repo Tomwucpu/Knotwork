@@ -14,18 +14,20 @@
 //! 因此可以脱离 Slint 运行时直接单测。
 
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 
-use gt_backend::{CommandRecord, PushPreview, RemoteInfo, RemoteListing};
+use gt_backend::{
+    BlameLine, CommandRecord, FileHistoryEntry, PushPreview, RemoteInfo, RemoteListing,
+};
 use gt_core::{ChangeSet, CommitMeta, HeadKind, RefInfo, RefKind, RepoState};
 use gt_diff::{DiffLine, DiffPayload, FileDiff, LineKind};
 use gt_graph::RowLayout;
 use gt_service::NetworkFailure;
 use slint::{Color, ModelRc, SharedString, VecModel};
 
+use crate::text;
 use crate::generated::{
-    ChangeRow, CompareRow, ConflictFileRow, ConflictRow, ConsoleRow, DiffRow, GraphCell, LogRow,
-    PushRow, RebaseStepRow, RecentRow, RefEntry, RemoteRow, StashRow,
+    BlameRow, ChangeRow, CompareRow, ConflictFileRow, ConflictRow, ConsoleRow, DiffRow, GraphCell,
+    HistRow, LogRow, PushRow, RebaseStepRow, RecentRow, RefEntry, RemoteRow, StashRow,
 };
 
 /// 泳道配色（8 色循环）。取自可访问性对比度足够的暗色系。
@@ -104,12 +106,12 @@ pub fn relative_time(timestamp: i64, now: i64) -> String {
         return format_absolute(timestamp);
     }
     match delta {
-        0..=59 => "刚刚".to_owned(),
-        60..=3599 => format!("{} 分钟前", delta / 60),
-        3600..=86_399 => format!("{} 小时前", delta / 3600),
-        86_400..=2_591_999 => format!("{} 天前", delta / 86_400),
-        2_592_000..=31_535_999 => format!("{} 个月前", delta / 2_592_000),
-        _ => format!("{} 年前", delta / 31_536_000),
+        0..=59 => text::tr("刚刚").to_owned(),
+        60..=3599 => text::trf(text::tr("{} 分钟前"), &[&(delta / 60).to_string()]),
+        3600..=86_399 => text::trf(text::tr("{} 小时前"), &[&(delta / 3600).to_string()]),
+        86_400..=2_591_999 => text::trf(text::tr("{} 天前"), &[&(delta / 86_400).to_string()]),
+        2_592_000..=31_535_999 => text::trf(text::tr("{} 个月前"), &[&(delta / 2_592_000).to_string()]),
+        _ => text::trf(text::tr("{} 年前"), &[&(delta / 31_536_000).to_string()]),
     }
 }
 
@@ -213,14 +215,12 @@ pub fn build_diff_rows(diff: &FileDiff, selected: &BTreeSet<usize>) -> Vec<DiffR
                 }
             }
         }
-        DiffPayload::Binary => rows.push(placeholder_row("（二进制文件，不显示内容差异）")),
+        DiffPayload::Binary => rows.push(placeholder_row(text::tr("（二进制文件，不显示内容差异）"))),
         DiffPayload::TooLarge {
             old_bytes,
             new_bytes,
-        } => rows.push(placeholder_row(&format!(
-            "（文件过大，已跳过差异计算：旧 {old_bytes} 字节 / 新 {new_bytes} 字节）"
-        ))),
-        DiffPayload::Empty => rows.push(placeholder_row("（两侧内容相同或为空）")),
+        } => rows.push(placeholder_row(&text::trf(text::tr("（文件过大，已跳过差异计算：旧 {} 字节 / 新 {} 字节）"), &[&old_bytes.to_string(), &new_bytes.to_string()]))),
+        DiffPayload::Empty => rows.push(placeholder_row(text::tr("（两侧内容相同或为空）"))),
     }
 
     for (index, row) in rows.iter_mut().enumerate() {
@@ -309,7 +309,7 @@ pub fn build_change_rows(changes: &ChangeSet, selected: Option<usize>) -> Vec<Ch
                     None => entry
                         .old_path
                         .as_ref()
-                        .map_or_else(String::new, |old| format!("原路径 {old}")),
+                        .map_or_else(String::new, |old| text::trf("原路径 {}", &[old])),
                 }),
                 is_selected: selected == Some(index),
                 is_conflict: entry.is_conflicted(),
@@ -410,14 +410,15 @@ pub fn state_banner(state: RepoState) -> Option<String> {
         return None;
     }
     let actions = state.resumable_actions();
-    let mut text = format!("当前处于「{}」进行中", state.label());
+    let mut text = text::trf(text::tr("当前处于「{}」进行中"), &[state.label()]);
     if !actions.is_empty() {
-        let _ = write!(
-            text,
-            "；可执行：{} / {} / {}",
-            actions.continue_command.unwrap_or("—"),
-            actions.skip_command.unwrap_or("—"),
-            actions.abort_command.unwrap_or("—")
+        text += &text::trf(
+            text::tr("；可执行：{} / {} / {}"),
+            &[
+                actions.continue_command.unwrap_or("—"),
+                actions.skip_command.unwrap_or("—"),
+                actions.abort_command.unwrap_or("—"),
+            ],
         );
     }
     Some(text)
@@ -438,8 +439,8 @@ pub fn branch_text(head: &gt_core::HeadInfo) -> String {
 pub fn head_text(head: &gt_core::HeadInfo) -> String {
     match head.kind {
         HeadKind::Branch => "HEAD".to_owned(),
-        HeadKind::Detached => "分离头指针".to_owned(),
-        HeadKind::Unborn => "尚无提交".to_owned(),
+        HeadKind::Detached => text::tr("分离头指针").to_owned(),
+        HeadKind::Unborn => text::tr("尚无提交").to_owned(),
     }
 }
 
@@ -453,16 +454,16 @@ pub const fn ref_kind_label(kind: RefKind) -> &'static str {
 #[must_use]
 pub fn diff_selection_hint(selected: usize, selectable: bool, staged_view: bool) -> String {
     if !selectable {
-        return "该差异不支持逐块选择".to_owned();
+        return text::tr("该差异不支持逐块选择").to_owned();
     }
     if selected == 0 {
         return if staged_view {
-            "点击 hunk 头或增删行以选择，然后反暂存".to_owned()
+            text::tr("点击 hunk 头或增删行以选择，然后反暂存").to_owned()
         } else {
-            "点击 hunk 头或增删行以选择，然后暂存 / 丢弃".to_owned()
+            text::tr("点击 hunk 头或增删行以选择，然后暂存 / 丢弃").to_owned()
         };
     }
-    format!("已选 {selected} 行")
+    text::trf(text::tr("已选 {} 行"), &[&selected.to_string()])
 }
 
 /// 危险操作确认的正文（FR-LC-02 / D4：默认强确认）。
@@ -473,14 +474,14 @@ pub fn diff_selection_hint(selected: usize, selectable: bool, staged_view: bool)
 pub fn discard_confirmation(paths: &[String], untracked: bool) -> (String, String) {
     let listed = paths.iter().take(8).cloned().collect::<Vec<_>>().join("\n");
     let more = if paths.len() > 8 {
-        format!("\n…以及另外 {} 个路径", paths.len() - 8)
+        text::trf(text::tr("\n…以及另外 {} 个路径"), &[&(paths.len() - 8).to_string()])
     } else {
         String::new()
     };
 
     if untracked {
         (
-            format!("永久删除 {} 个未跟踪路径？", paths.len()),
+            text::trf(text::tr("永久删除 {} 个未跟踪路径？"), &[&paths.len().to_string()]),
             format!(
                 "这些路径从未被 Git 跟踪，删除后无法通过 Git 恢复：\n\n{listed}{more}\n\n\
                  替代做法：若只是不想看到它们，用「加入 .gitignore」。"
@@ -488,7 +489,7 @@ pub fn discard_confirmation(paths: &[String], untracked: bool) -> (String, Strin
         )
     } else {
         (
-            format!("丢弃 {} 个文件的未提交修改？", paths.len()),
+            text::trf(text::tr("丢弃 {} 个文件的未提交修改？"), &[&paths.len().to_string()]),
             format!(
                 "工作区中的这些修改将被还原为索引中的内容，此操作不可撤销：\n\n{listed}{more}\n\n\
                  替代做法：先「暂存」再提交，或先复制文件备份。"
@@ -501,7 +502,7 @@ pub fn discard_confirmation(paths: &[String], untracked: bool) -> (String, Strin
 #[must_use]
 pub fn discard_selection_confirmation(path: &str, lines: usize) -> (String, String) {
     (
-        "丢弃所选变更？".to_owned(),
+        text::tr("丢弃所选变更？").to_owned(),
         format!(
             "将从工作区文件 {path} 中撤销所选 {lines} 行改动，此操作不可撤销。\n\n\
              替代做法：先暂存所选内容再提交，这样改动会留在历史里。"
@@ -538,9 +539,9 @@ pub fn build_remote_rows(remotes: &[RemoteInfo], selected: Option<usize>) -> Vec
             name: SharedString::from(remote.name.as_str()),
             url: SharedString::from(remote.display_url()),
             detail: SharedString::from(if remote.has_embedded_credentials {
-                "URL 内嵌凭据（建议改用 helper）"
+                text::tr("URL 内嵌凭据（建议改用 helper）")
             } else if remote.push_url.is_some() {
-                "push URL 与 fetch 不同"
+                text::tr("push URL 与 fetch 不同")
             } else {
                 ""
             }),
@@ -554,7 +555,7 @@ pub fn build_remote_rows(remotes: &[RemoteInfo], selected: Option<usize>) -> Vec
 pub fn push_preview_text(preview: &PushPreview) -> String {
     let mut text = preview.summary();
     if preview.truncated {
-        let _ = write!(text, "（仅列出前 {} 条）", preview.commits.len());
+        text += &text::trf(text::tr("（仅列出前 {} 条）"), &[&preview.commits.len().to_string()]);
     }
     text
 }
@@ -564,14 +565,12 @@ pub fn push_preview_text(preview: &PushPreview) -> String {
 pub fn push_hints(preview: &PushPreview, force: bool) -> String {
     let mut lines: Vec<String> = Vec::new();
     if let Some(pattern) = preview.protection.as_deref() {
-        lines.push(format!(
-            "该分支命中受保护规则「{pattern}」：禁止强制推送（普通推送不受影响）。"
-        ));
+        lines.push(text::trf("该分支命中受保护规则「{}」：禁止强制推送（普通推送不受影响）。", &[pattern]));
     }
     if preview.needs_update_first() {
-        lines.push(format!(
-            "远端另有 {} 个提交：普通推送会被拒绝，请先 Update。",
-            preview.behind
+        lines.push(text::trf(
+            text::tr("远端另有 {} 个提交：普通推送会被拒绝，请先 Update。"),
+            &[&preview.behind.to_string()],
         ));
     }
     if force {
@@ -582,7 +581,7 @@ pub fn push_hints(preview: &PushPreview, force: bool) -> String {
         );
     }
     if preview.creates_branch {
-        lines.push("远端尚无该分支，推送会在远端新建它。".to_owned());
+        lines.push(text::tr("远端尚无该分支，推送会在远端新建它。").to_owned());
     }
     lines.join(" ")
 }
@@ -601,21 +600,21 @@ pub fn network_error_text(failure: &NetworkFailure) -> String {
 pub fn credential_help(listing: &RemoteListing, stored_hosts: &[String]) -> String {
     let mut parts: Vec<String> = Vec::new();
     if listing.helpers.is_empty() {
-        parts.push("未检测到 credential helper".to_owned());
+        parts.push(text::tr("未检测到 credential helper").to_owned());
     } else {
         parts.push(format!("credential helper：{}", listing.helpers.join("、")));
     }
     parts.push(if listing.ssh_agent {
-        "SSH agent 可用".to_owned()
+        text::tr("SSH agent 可用").to_owned()
     } else {
-        "SSH agent 未运行（SSH 远端可能需要 ssh-add）".to_owned()
+        text::tr("SSH agent 未运行（SSH 远端可能需要 ssh-add）").to_owned()
     });
     if !listing.keyring_available {
-        parts.push("系统密钥链不可用，无法在本工具内保存 token".to_owned());
+        parts.push(text::tr("系统密钥链不可用，无法在本工具内保存 token").to_owned());
     } else if stored_hosts.is_empty() {
-        parts.push("尚未保存任何 token".to_owned());
+        parts.push(text::tr("尚未保存任何 token").to_owned());
     } else {
-        parts.push(format!("已保存 token 的主机：{}", stored_hosts.join("、")));
+        parts.push(text::trf(text::tr("已保存 token 的主机：{}"), &[&stored_hosts.join("、")]));
     }
     parts.join(" · ")
 }
@@ -1553,4 +1552,53 @@ mod advanced_tests {
         assert!(detail.contains("永久丢失"));
         assert!(detail.contains("替代做法"), "高危文案必须给出替代做法");
     }
+}
+
+/// 把 blame 载荷拆成界面行（FR-BLM-02）。
+///
+/// 提交显示短哈希（前 8 位）；未提交行（全零提交）显示"未提交"。
+#[must_use]
+pub fn build_blame_rows(
+    rows: &[BlameLine],
+    selected: Option<usize>,
+    now: i64,
+) -> Vec<BlameRow> {
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let uncommitted = row.commit.bytes().all(|b| b == b'0');
+            BlameRow {
+                line_no: i32::try_from(row.final_line).unwrap_or(0),
+                commit: SharedString::from(if uncommitted {
+                    "未提交"
+                } else {
+                    &row.commit[..row.commit.len().min(8)]
+                }),
+                author: SharedString::from(row.author.as_str()),
+                when: SharedString::from(relative_time(row.author_time, now)),
+                summary: SharedString::from(row.summary.as_str()),
+                is_selected: selected == Some(index),
+                is_boundary: row.boundary,
+            }
+        })
+        .collect()
+}
+
+/// 把文件历史拆成界面行（FR-BLM-01）。
+#[must_use]
+pub fn build_history_rows(
+    rows: &[FileHistoryEntry],
+    selected: Option<usize>,
+    now: i64,
+) -> Vec<HistRow> {
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| HistRow {
+            short_id: SharedString::from(row.short.as_str()),
+            subject: SharedString::from(row.summary.as_str()),
+            author: SharedString::from(row.author.as_str()),
+            when: SharedString::from(relative_time(row.author_time, now)),
+            is_selected: selected == Some(index),
+        })
+        .collect()
 }

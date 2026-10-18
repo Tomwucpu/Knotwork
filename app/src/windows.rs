@@ -271,7 +271,7 @@ impl WindowManager {
 
     /// 把共享配置里的"应用级设置"对齐到窗口（主题 / staging 模式 / 告警）。
     fn sync_preferences(state: &Rc<RefCell<SlotState>>, window: &MainWindow) {
-        let (dark, staging, warn_detached, strategy, patterns, hosts) = {
+        let (dark, english, staging, warn_detached, strategy, patterns, hosts) = {
             let shared = {
                 let guard = state.borrow();
                 Rc::clone(&guard.config)
@@ -279,6 +279,7 @@ impl WindowManager {
             let config = shared.borrow();
             (
                 matches!(config.appearance.theme, Theme::Dark | Theme::System),
+                matches!(config.appearance.language, Language::En),
                 config.git.staging_mode,
                 config.git.warn_detached_commit,
                 pull_strategy(config.git.update_strategy),
@@ -289,6 +290,11 @@ impl WindowManager {
 
         if window.get_dark_theme() != dark {
             window.set_dark_theme(dark);
+        }
+        // 语言：Rust 侧动态文案与 Slint 静态文案（Texts.en）一起切。
+        gt_ui::text::set_english(english);
+        if window.get_english_ui() != english {
+            window.set_english_ui(english);
         }
 
         let mut guard = state.borrow_mut();
@@ -315,6 +321,7 @@ impl WindowManager {
         };
         let config = shared.borrow();
         window.set_staging_mode(config.git.staging_mode);
+        window.set_set_language_en(matches!(config.appearance.language, Language::En));
         window.set_set_warn_detached(config.git.warn_detached_commit);
         window.set_set_warn_crlf(config.git.warn_crlf);
         window.set_set_protected(config.branches.protected_patterns.join(",").into());
@@ -722,8 +729,13 @@ impl WindowManager {
                 } else {
                     Theme::Light
                 };
-                // 语言在 M5 才资源化，这里保留字段以便配置项完整。
-                config.appearance.language = Language::ZhCn;
+                // NFR-L10N-01：语言随设置保存并即时生效。
+                let english = window.get_set_language_en();
+                config.appearance.language = if english {
+                    Language::En
+                } else {
+                    Language::ZhCn
+                };
                 config.git.staging_mode = window.get_staging_mode();
                 config.git.warn_detached_commit = window.get_set_warn_detached();
                 config.git.warn_crlf = window.get_set_warn_crlf();
@@ -745,10 +757,15 @@ impl WindowManager {
                 };
             }
             let saved = persist_shared(&slot);
-            // staging 模式即时生效；日志级别需要重启才生效 —— 如实说明，
+            // staging 模式与语言即时生效；日志级别需要重启才生效 —— 如实说明，
             // 而不是让用户以为改了没反应是 bug。
-            let mut status =
-                String::from("已保存并应用（staging 模式与主题即时生效；日志级别在下次启动生效）");
+            let english = window.get_set_language_en();
+            gt_ui::text::set_english(english);
+            window.set_english_ui(english);
+            let mut status = gt_ui::text::trf(
+                "已保存并应用（staging 模式、主题与语言即时生效；日志级别在下次启动生效）",
+                &[],
+            );
             if let Err(err) = &saved {
                 status = format!("已应用到本窗口，但写盘失败：{err}");
             }
@@ -1238,6 +1255,85 @@ impl WindowManager {
         window.on_compare_close(move || {
             if let Some(window) = weak.upgrade() {
                 Self::with_session(&slot, &window, Session::compare_close);
+            }
+        });
+
+        // ---- M5：Blame 与文件历史（FR-BLM）----
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_request_blame_selected(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::request_blame_selected);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_request_file_history_selected(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::request_file_history_selected);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_blame_select(move |index| {
+            let Ok(index) = usize::try_from(index) else {
+                return;
+            };
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.blame_select(index));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_blame_close(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::blame_close);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_blame_chain(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::blame_chain);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_blame_open_history(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::blame_open_history);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_history_select(move |index| {
+            let Ok(index) = usize::try_from(index) else {
+                return;
+            };
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.history_select(index));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_history_set_filter(move |filter| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| session.history_set_filter(filter));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_history_close(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::history_close);
             }
         });
 

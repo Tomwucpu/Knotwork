@@ -67,6 +67,10 @@ keyring = { version = "3", default-features = false, features = ["windows-native
 slint = { version = "1" }
 slint-build = "1"
 
+# ---- 图片 Diff（FR-DIF-04，M5）----
+# 只开常用位图的解码器，关掉默认特性避免拖入无关格式与 rayon。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+
 # ---- 后续里程碑引入（此处仅登记意图，避免过早锁定版本）----
 # git2           —— Git 写补充（M2 起：暂存 / merge / cherry-pick）
 # parking_lot    —— 仓库级锁（M2 起）

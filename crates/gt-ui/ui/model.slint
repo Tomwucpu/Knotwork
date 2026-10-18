@@ -1,0 +1,160 @@
+// Knotwork 数据结构（M4.5 UI 专项 S3）。
+//
+// 从 main-window.slint 原样迁出。**字段名与类型一律不改**：
+// 这些 struct 经 `include_modules!` 进入 Rust 侧（view_model.rs /
+// session.rs / app/windows.rs 都在用），改名即破坏接线。
+
+// 引用列表 / 分支面板的一行。
+export struct RefEntry {
+    name: string,
+    kind: string,
+    is-head: bool,
+    sync: string,
+    selected: bool,
+    // 0 = 本地分支，1 = 远程分支，2 = 标签
+    kind-id: int,
+}
+
+// 泳道图的一列：0 = 空，1 = 竖向连线，2 = 本行节点。
+export struct GraphCell {
+    kind: int,
+    color: color,
+}
+
+// 日志列表的一行。
+export struct LogRow {
+    short-id: string,
+    subject: string,
+    author: string,
+    when: string,
+    refs-text: string,
+    is-selected: bool,
+    // FR-LOG-06：我的提交加粗、合并提交置灰。
+    is-mine: bool,
+    is-merge: bool,
+    graph: [GraphCell],
+}
+
+// 本地更改列表的一行。
+export struct ChangeRow {
+    path: string,
+    code: string,
+    bucket: string,
+    note: string,
+    is-selected: bool,
+    is-conflict: bool,
+    is-untracked: bool,
+}
+
+// Diff 的一行。
+//
+// `hunk-index` / `line-index` 是"这一行对应哪一块、哪一行"，-1 表示不可选
+// （hunk 头、占位行）。Rust 侧据它把点击换算成补丁选择，界面不需要懂 diff 结构。
+export struct DiffRow {
+    kind: int,
+    old-no: string,
+    new-no: string,
+    segments: [string],
+    changed: [bool],
+    is-hunk-header: bool,
+    hunk-index: int,
+    line-index: int,
+    selectable: bool,
+    selected: bool,
+}
+
+// Console 的一行。
+export struct ConsoleRow {
+    route: string,
+    summary: string,
+    detail: string,
+    ok: bool,
+}
+
+// 推送预览的一行（将被推送的提交）。
+export struct PushRow {
+    short-id: string,
+    subject: string,
+    author: string,
+    when: string,
+}
+
+// 远端列表的一行。
+export struct RemoteRow {
+    name: string,
+    url: string,
+    detail: string,
+    selected: bool,
+}
+
+// 最近仓库的一项。
+export struct RecentRow {
+    name: string,
+    path: string,
+}
+
+// 贮藏列表的一行（FR-STH）。
+export struct StashRow {
+    index: int,
+    selector: string,
+    summary: string,
+    branch: string,
+}
+
+// 三路编辑器左侧的冲突文件行（FR-CFL-02）。
+export struct ConflictFileRow {
+    row-index: int,
+    path: string,
+    code: string,
+    hunks: int,
+    selected: bool,
+}
+
+// 三路编辑器的一行：kind=0 是上下文（只有 result），kind=1 是三栏冲突块。
+export struct ConflictRow {
+    kind: int,
+    block: int,
+    label: string,
+    ours: string,
+    theirs: string,
+    result: string,
+    decided: bool,
+}
+
+// 交互式变基步骤的一行（FR-MRG-03）。
+export struct RebaseStepRow {
+    row-index: int,
+    short-id: string,
+    subject: string,
+    action: int,
+    selected: bool,
+    has-message: bool,
+}
+
+// 两提交比较 / 快照浏览的文件行（FR-LOG-08）。
+export struct CompareRow {
+    path: string,
+    code: string,
+    status: string,
+    selected: bool,
+}
+
+// Blame 的一行（FR-BLM-02）：行号 + 归因。
+export struct BlameRow {
+    line-no: int,
+    commit: string,
+    author: string,
+    when: string,
+    summary: string,
+    is-selected: bool,
+    is-boundary: bool,
+}
+
+// 文件历史的一行（FR-BLM-01）。
+export struct HistRow {
+    short-id: string,
+    subject: string,
+    author: string,
+    when: string,
+    is-selected: bool,
+}

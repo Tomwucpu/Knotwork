@@ -1,0 +1,96 @@
+// Knotwork 设计 token（M4.5 UI 专项 S1）。
+//
+// 本文件是**唯一**的取色 / 取值来源。任何组件都不得出现裸色值字面量
+// （#RRGGBB）或裸字号 —— review 时以 `grep -E '#[0-9a-fA-F]{6}'` 校验，
+// theme.slint 是唯一允许出现色值的地方。
+//
+// 配色基调对齐 IDEA New UI：
+//   - 暗色底 `#1e1f22` 与 JetBrains New UI Dark 一致；
+//   - 选中态 / 强调态统一走 accent 系，不再各组件自带一套蓝；
+//   - 状态色（成功 / 警告 / 危险 / diff 增删）按语义命名，明暗各一套。
+
+export global Palette {
+    // 由窗口写入（init / 主题切换时），不作为绑定源，避免多窗口绑定冲突。
+    in-out property <bool> dark: true;
+
+    // ---- 表面 ----
+    out property <color> bg: dark ? #1e1f22 : #f7f8fa;
+    out property <color> panel: dark ? #26272b : #eef0f4;
+    out property <color> bar: dark ? #2b2d30 : #e4e7ec;
+    out property <color> line: dark ? #3c3f41 : #d7dbe1;
+    out property <color> hover: dark ? #2f3136 : #e9ecf1;
+    out property <color> border: dark ? #4a4d50 : #c7ccd4;
+    // 遮罩层底色。
+    out property <color> scrim: #00000099;
+
+    // ---- 文本 ----
+    out property <color> text: dark ? #e8eaed : #1f2328;
+    out property <color> text-dim: dark ? #bdc1c6 : #3d4450;
+    out property <color> text-faint: dark ? #8b9198 : #6a7280;
+
+    // ---- 强调与选中 ----
+    // accent：低饱和底色（侧栏当前分支底、chip 选中底）。
+    out property <color> accent: dark ? #35507a : #d3e3ff;
+    out property <color> accent-text: dark ? #ffffff : #12325e;
+    // accent-strong：高饱和强调（tab 下划线、输入框聚焦描边、主按钮底）。
+    out property <color> accent-strong: dark ? #6b9bd2 : #3574f0;
+    // accent-strong 之上的反白文字（主按钮文字）。
+    out property <color> on-accent: #ffffff;
+    // 列表行选中底色（Log / 本地更改行共用一个值，不再各写一份）。
+    out property <color> selection: dark ? #35507a : #cfe0ff;
+
+    // ---- 状态色 ----
+    out property <color> green: dark ? #6ee7b7 : #0d7350;
+    out property <color> amber: dark ? #f0b429 : #8a5a00;
+    out property <color> red: dark ? #f2a6ab : #a01b26;
+
+    // ---- 语义背景 ----
+    out property <color> add-bg: dark ? #1f3a24 : #e6ffed;
+    out property <color> del-bg: dark ? #3a1f22 : #ffeef0;
+    out property <color> danger-bg: dark ? #5a2a2a : #ffe1e1;
+    out property <color> danger-text: dark ? #ffd4d4 : #8b1111;
+    out property <color> warn-bg: dark ? #6b5100 : #fff2cc;
+    out property <color> warn-text: dark ? #ffe9a8 : #6b4b00;
+    out property <color> seg-changed: dark ? #ffd166 : #a15c00;
+
+    // ---- 按钮三态（全部按钮共用，不再内联写死）----
+    out property <color> btn-bg: bar;
+    out property <color> btn-hover: dark ? #35373a : #dfe3e9;
+    out property <color> btn-pressed: dark ? #3d3f42 : #d0d4da;
+    out property <color> btn-disabled: dark ? #33353a : #e6e8ec;
+
+    // ---- 字体 ----
+    out property <string> mono-font: "Consolas";
+    // 字号阶梯：辅助 11 / 正文 12 / 强调 13 / 标题 15 / 大标题 18。
+    out property <length> font-xs: 11px;
+    out property <length> font-sm: 12px;
+    out property <length> font-md: 13px;
+    out property <length> font-title: 15px;
+    out property <length> font-h1: 18px;
+    // 等宽字号沿用 mono-size；正文沿用 body-size（历史别名，保留引用兼容）。
+    out property <length> mono-size: font-xs;
+    out property <length> body-size: font-sm;
+
+    // ---- 圆角 ----
+    out property <length> radius-sm: 3px;
+    out property <length> radius: 4px;
+    out property <length> radius-lg: 6px;
+}
+
+// 尺寸与间距常量。
+export global Metrics {
+    // 泳道图与列表行高（三条渲染纪律的布局基准，勿随意改动）。
+    out property <length> lane-width: 12px;
+    out property <length> log-row-height: 24px;
+    out property <length> list-row-height: 22px;
+    out property <length> diff-row-height: 18px;
+    out property <length> blame-row-height: 22px;
+    out property <length> title-bar-height: 44px;
+    out property <length> panel-bar-height: 30px;
+
+    // 间距阶梯：4 / 8 / 12 / 16。
+    out property <length> space-1: 4px;
+    out property <length> space-2: 8px;
+    out property <length> space-3: 12px;
+    out property <length> space-4: 16px;
+}

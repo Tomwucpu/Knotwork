@@ -50,6 +50,7 @@
 //! | 冲突三方读取与"标记为已解决" | [`AdvancedOps::resolve_conflict`] | FR-CFL-01/03 |
 
 pub mod advanced;
+pub mod blame;
 pub mod cli;
 pub mod credential;
 pub mod error;
@@ -65,6 +66,10 @@ pub use advanced::{
     MergeStrategy, PatchApplyRequest, PatchSource, PlanError, RebaseAction, RebaseControl,
     RebasePlan, RebaseProgress, RebaseRequest, RebaseStep, ResetMode, ResetRequest, RevertRequest,
     StashEntry, StashOp, TagOp, ADVANCED_TIMEOUT, PLAN_DIR_NAME, REBASE_TIMEOUT,
+};
+pub use blame::{
+    blame, commit_parents, file_history, map_line_to_older, BlameLine, FileHistoryEntry,
+    MAX_BLAME_LINES,
 };
 pub use cli::{
     active_processes, CancelProbe, CliOutput, GitCli, NetworkOptions, ProgressSink, LOCAL_TIMEOUT,
