@@ -1,0 +1,1880 @@
+
+import { CheckBox, ListView, Slider } from "std-widgets.slint";
+import { Palette, Metrics } from "theme.slint";
+import { Texts } from "texts.slint";
+import {
+    RefEntry, GraphCell, LogRow, ChangeRow, DiffRow, ConsoleRow, PushRow,
+    RemoteRow, RecentRow, StashRow, ConflictFileRow, ConflictRow,
+    RebaseStepRow, CompareRow, BlameRow, HistRow,
+} from "model.slint";
+// 数据结构对 Rust 侧的再导出：include_modules! 据此生成类型，
+// view_model.rs / session.rs / app/windows.rs 都在引用。
+export {
+    RefEntry, GraphCell, LogRow, ChangeRow, DiffRow, ConsoleRow, PushRow,
+    RemoteRow, RecentRow, StashRow, ConflictFileRow, ConflictRow,
+    RebaseStepRow, CompareRow, BlameRow, HistRow,
+}
+import {
+    FlatButton, TabButton, Field, OptionToggle, Divider, VDivider, SectionLabel,
+    IdeaButton, IdeaIconButton, ToolbarSeparator, FilterButton, IdeaSearchField, IdeaCheckbox,
+} from "widgets.slint";
+import { IdeaIcon } from "icons.slint";
+import {
+    LogRowView, DiffRowView, ChangeRowView, ChangeGroupRowView, ConsoleRowView, BlameRowView,
+} from "rows.slint";
+import {
+    ConfirmDialog, SettingsDialog, PushDialog, RemotesDialog, CommitCtxMenu,
+    OpDialog, IplanDialog, CflDialog, CompareDialog, FileHistoryDialog,
+} from "dialogs.slint";
+
+export component MainWindow inherits Window {
+    // ---- 仓库与状态 ----
+    in-out property <string> repo-title: "Knotwork";
+    in-out property <string> repo-path: "";
+    in-out property <string> branch-text: "—";
+    in-out property <string> head-text: "—";
+    in-out property <string> git-text: "";
+    in-out property <string> state-text: "";
+    in-out property <bool> state-banner-visible: false;
+
+    // ---- 主题（FR-SET-02 外观组）----
+    in-out property <bool> dark-theme: true;
+
+    // ---- 界面语言（NFR-L10N-01）：英文为真时 Texts 全量切换 ----
+    in-out property <bool> english-ui: false;
+    // 设置对话框里的语言选择（保存并应用后写入 english-ui）。
+    in-out property <bool> set-language-en: false;
+
+    // ---- 只读模式（FR-MR-04）----
+    in-out property <bool> read-only: false;
+    in-out property <string> read-only-reason: "";
+
+    // ---- 侧栏 ----
+    in-out property <[RefEntry]> sidebar-refs: [];
+    in-out property <string> branch-input: "";
+    in-out property <int> selected-ref: -1;
+
+    // ---- 空状态（未打开仓库）----
+    in-out property <bool> has-repo: false;
+    in-out property <string> open-path: "";
+    in-out property <string> empty-message: Texts.s0;
+    in-out property <[RecentRow]> recent: [];
+
+    // ---- 日志面板 ----
+    in-out property <[LogRow]> log-rows: [];
+    in-out property <string> log-summary: "";
+    in-out property <int> log-total: 0;
+    in-out property <bool> log-loading: false;
+    in-out property <string> search-query: "";
+    in-out property <bool> search-regex: false;
+    in-out property <bool> search-active: false;
+    in-out property <bool> opt-topo: false;
+    in-out property <bool> opt-first-parent: false;
+    in-out property <bool> opt-hide-merges: false;
+    in-out property <bool> opt-collapse: false;
+
+    // ---- Diff 面板 ----
+    in-out property <[DiffRow]> diff-rows: [];
+    in-out property <string> diff-title: Texts.s1;
+    in-out property <string> diff-stats: "";
+    in-out property <bool> diff-loading: false;
+    in-out property <string> diff-hint: "";
+    // 当前差异是否来自"已暂存"一侧（决定按钮语义）。
+    in-out property <bool> diff-staged-view: false;
+    // 当前差异是否支持按块落库（新增/未跟踪文件只能整文件暂存）。
+    in-out property <bool> diff-selectable: false;
+
+    // ---- 本地更改 ----
+    in-out property <[ChangeRow]> change-rows: [];
+    in-out property <string> change-summary: "";
+    in-out property <bool> selection-is-untracked: false;
+    in-out property <bool> staged-collapsed: false;
+    in-out property <bool> unstaged-collapsed: false;
+    // 提交工具窗收起状态（纯界面状态，不落配置）。
+    in-out property <bool> commit-collapsed: false;
+
+    // ---- 提交（FR-CMT-01/02）----
+    in-out property <string> commit-message: "";
+    in-out property <bool> commit-amend: false;
+    in-out property <bool> commit-reset-author: false;
+    in-out property <string> commit-hint: "";
+    in-out property <bool> commit-enabled: true;
+    in-out property <bool> staging-mode: true;
+
+    // ---- Console ----
+    in-out property <[ConsoleRow]> console-rows: [];
+    in-out property <string> console-summary: "";
+
+    // ---- 远端（FR-RMT）----
+    // 网络操作进行中：显示进度条与取消按钮。
+    in-out property <bool> network-busy: false;
+    in-out property <string> network-label: "";
+    in-out property <string> network-progress: "";
+    // 最近一次远端失败（结论 + 建议，多行）。
+    in-out property <bool> network-error-visible: false;
+    in-out property <string> network-error: "";
+    // 当前仓库的远端名（工具栏显示与推送目标）。
+    in-out property <[string]> remote-names: [];
+    in-out property <string> remote-current: "";
+    // 更新策略：0 = 合并，1 = 变基，2 = 仅快进
+    in-out property <int> pull-strategy: 0;
+
+    // ---- 远端管理遮罩 ----
+    in-out property <bool> remotes-visible: false;
+    in-out property <[RemoteRow]> remote-rows: [];
+    in-out property <int> remote-selected: -1;
+    in-out property <string> remote-name-input: "";
+    in-out property <string> remote-url-input: "";
+    in-out property <string> remote-help: "";
+    in-out property <string> token-host: "";
+    in-out property <string> token-input: "";
+    in-out property <bool> keyring-available: true;
+
+    // ---- 推送预览遮罩（FR-RMT-03）----
+    in-out property <bool> push-visible: false;
+    in-out property <[PushRow]> push-rows: [];
+    in-out property <string> push-summary: "";
+    in-out property <string> push-hint: "";
+    in-out property <bool> push-force: false;
+    in-out property <bool> push-set-upstream: false;
+    in-out property <bool> push-creates-branch: false;
+    in-out property <bool> push-protected: false;
+
+    // ---- 底部面板标签：0 = Git 日志，1 = Console，2 = Stash ----
+    in-out property <int> bottom-tab: 0;
+
+    // ---- 能力提示（FR-STA-04）----
+    in-out property <bool> cli-missing: false;
+    in-out property <string> cli-missing-reason: "";
+
+    // ---- 提示条 ----
+    in-out property <string> toast: "";
+
+    // ---- 二次确认遮罩（FR-LC-02 / D4）----
+    in-out property <bool> confirm-visible: false;
+    in-out property <string> confirm-title: Texts.s2;
+    in-out property <string> confirm-detail: "";
+    in-out property <bool> confirm-danger: true;
+
+    // ---- 设置遮罩（FR-SET-01/02）----
+    in-out property <bool> settings-visible: false;
+    in-out property <bool> set-warn-detached: true;
+    in-out property <bool> set-warn-crlf: true;
+    in-out property <int> set-update-strategy: 0;
+    in-out property <int> set-cache-mib: 32;
+    in-out property <string> set-protected: "";
+    in-out property <string> set-diff-tool: "";
+    in-out property <string> set-merge-tool: "";
+    in-out property <int> set-log-level: 2;
+    in-out property <string> set-status: "";
+
+    // ---- M4：提交上下文菜单（FR-LOG-07/08）----
+    in-out property <bool> ctx-visible: false;
+    in-out property <length> ctx-x: 0px;
+    in-out property <length> ctx-y: 0px;
+    in-out property <string> ctx-subject: "";
+    in-out property <bool> ctx-is-head: false;
+
+    // ---- M4：通用操作对话框（合并/变基/重置/补丁/标签）----
+    // 用一个对话框承载五种"填一个参数再确认"的操作：它们的交互形态完全一致，
+    // 分成五个遮罩只会让 Slint 与接线各多五份一模一样的代码。
+    in-out property <bool> op-visible: false;
+    in-out property <int> op-kind: 0;
+    in-out property <string> op-title: "";
+    in-out property <string> op-hint: "";
+    in-out property <string> op-input: "";
+    in-out property <string> op-placeholder: "";
+    in-out property <string> op-input2: "";
+    in-out property <string> op-placeholder2: "";
+    in-out property <bool> op-show-input2: false;
+    in-out property <[string]> op-modes: [];
+    in-out property <int> op-mode: 0;
+    in-out property <bool> op-danger: false;
+
+    // ---- M4：交互式变基编辑器（FR-MRG-03）----
+    in-out property <bool> iplan-visible: false;
+    in-out property <[RebaseStepRow]> iplan-rows: [];
+    in-out property <string> iplan-title: "";
+    in-out property <string> iplan-summary: "";
+    in-out property <int> iplan-selected: -1;
+    in-out property <string> iplan-message: "";
+    in-out property <bool> iplan-message-visible: false;
+
+    // ---- M4：三路冲突编辑器（FR-CFL）----
+    in-out property <bool> cfl-visible: false;
+    in-out property <[ConflictFileRow]> cfl-files: [];
+    in-out property <[ConflictRow]> cfl-rows: [];
+    in-out property <string> cfl-title: "";
+    in-out property <string> cfl-summary: "";
+    in-out property <string> cfl-manual: "";
+    in-out property <bool> cfl-manual-visible: false;
+    in-out property <int> cfl-block: -1;
+
+    // ---- M4：贮藏面板（FR-STH）----
+    in-out property <[StashRow]> stash-rows: [];
+    in-out property <string> stash-message: "";
+    in-out property <bool> stash-untracked: false;
+    in-out property <string> stash-summary: "";
+
+    // ---- M4：比较 / 快照浏览（FR-LOG-08）----
+    in-out property <bool> compare-visible: false;
+    in-out property <[CompareRow]> compare-rows: [];
+    in-out property <string> compare-title: "";
+    in-out property <bool> compare-browse: false;
+
+    // ---- M4：忙碌与中断恢复 ----
+    in-out property <string> advanced-label: "";
+    in-out property <bool> resume-visible: false;
+    in-out property <bool> resume-can-skip: false;
+
+    in-out property <bool> blame-visible: false;
+    in-out property <[BlameRow]> blame-rows: [];
+    in-out property <string> blame-title: "";
+    in-out property <string> blame-spec-label: "";
+    in-out property <int> blame-selected: -1;
+    in-out property <int> blame-anchor: -1;
+    in-out property <bool> blame-can-chain: false;
+    in-out property <string> blame-truncated: "";
+
+    in-out property <bool> diff-image-visible: false;
+    in property <image> diff-img-old;
+    in property <image> diff-img-new;
+    in-out property <bool> diff-img-old-present: false;
+    in-out property <bool> diff-img-new-present: false;
+    in-out property <string> diff-img-meta-old: "";
+    in-out property <string> diff-img-meta-new: "";
+    in-out property <bool> diff-img-equal: false;
+    in-out property <int> img-mode: 0;
+    in-out property <float> img-blend: 0.5;
+
+    in-out property <bool> history-visible: false;
+    in-out property <[HistRow]> history-rows: [];
+    in-out property <string> history-title: "";
+    in-out property <bool> history-truncated: false;
+    in-out property <int> history-filter: 0;
+
+    callback poll();
+    callback refresh();
+    callback open-repo(string);
+    callback select-log(int);
+    callback select-change(int);
+    callback select-ref(int);
+    callback export-console();
+    callback clear-console();
+    callback use-recent(string);
+
+    // 写操作
+    callback stage-selected();
+    callback unstage-selected();
+    callback stage-all();
+    callback unstage-all();
+    callback toggle-change-group(int);
+    callback discard-selected();
+    callback delete-selected();
+    callback ignore-selected(int);
+    callback commit();
+    callback commit-and-push();
+    callback set-commit-message(string);
+    callback toggle-amend(bool);
+    callback toggle-reset-author(bool);
+    callback toggle-diff-row(int);
+    callback stage-hunks();
+    callback unstage-hunks();
+    callback discard-hunks();
+    callback set-branch-input(string);
+    callback branch-create(bool);
+    callback branch-checkout();
+    callback branch-rename();
+    callback branch-delete(bool);
+    callback branch-upstream();
+    callback checkout-selected-commit();
+    callback delete-tag();
+
+    // 搜索与图选项
+    callback set-search(string);
+    callback toggle-search-regex(bool);
+    callback run-search();
+    callback clear-search();
+    callback toggle-option(int);
+
+    // 远端（FR-RMT）
+    callback fetch-selected();
+    callback fetch-all();
+    callback update-project();
+    callback push-request();
+    callback push-confirm();
+    callback push-cancel();
+    callback toggle-push-force(bool);
+    callback toggle-push-upstream(bool);
+    callback set-pull-strategy(int);
+    callback select-remote(int);
+    callback cancel-network();
+    callback dismiss-network-error();
+    callback open-remotes();
+    callback close-remotes();
+    callback set-remote-name(string);
+    callback set-remote-url(string);
+    callback remote-add();
+    callback remote-remove();
+    callback remote-set-url();
+    callback set-token-input(string);
+    callback save-token();
+    callback forget-token();
+
+    // 遮罩
+    callback confirm-yes();
+    callback confirm-no();
+    callback open-settings();
+    callback close-settings();
+    callback apply-settings();
+    callback toggle-theme(bool);
+
+    // ---- M4：提交上下文菜单 ----
+    callback open-commit-menu(int, length, length);
+    callback close-commit-menu();
+    // 菜单项统一走一个回调：动作标识由 Rust 侧解释，避免十三个几乎相同的回调。
+    callback commit-action(string);
+
+    // ---- M4：通用操作对话框 ----
+    callback set-op-input(string);
+    callback set-op-input2(string);
+    callback set-op-mode(int);
+    callback op-confirm();
+    callback op-cancel();
+
+    // ---- M4：交互式变基 ----
+    callback iplan-select(int);
+    callback iplan-action(int, int);
+    callback iplan-set-message(string);
+    callback iplan-confirm();
+    callback iplan-cancel();
+
+    // ---- M4：三路冲突解决 ----
+    callback cfl-select(int);
+    callback cfl-pick-block(int);
+    callback cfl-take-side(int);
+    callback cfl-resolve(int, int);
+    callback cfl-resolve-all(int);
+    callback cfl-set-manual(string);
+    callback cfl-apply-manual();
+    callback cfl-mark-resolved();
+    callback cfl-close();
+
+    // ---- M4：贮藏 ----
+    callback request-stash-list();
+    callback set-stash-message(string);
+    callback toggle-stash-untracked(bool);
+    callback stash-create();
+    callback stash-apply(int);
+    callback stash-pop(int);
+    callback stash-drop(int);
+    callback stash-branch(int);
+
+    // ---- M4：比较 / 快照浏览 ----
+    callback compare-select(int);
+    callback compare-close();
+
+    // ---- M4：中断恢复（merge / rebase / cherry-pick / revert）----
+    callback resume-continue();
+    callback resume-skip();
+    callback resume-abort();
+
+    callback request-blame-selected();
+    callback request-file-history-selected();
+    callback blame-select(int);
+    callback blame-close();
+    callback blame-chain();
+    callback blame-open-history();
+    callback history-select(int);
+    callback history-set-filter(int);
+    callback history-close();
+
+    title: repo-title + (read-only ? Texts.s3 : "");
+    width: 1280px;
+    height: 860px;
+    background: Palette.bg;
+
+    init => {
+        Palette.dark = root.dark-theme;
+        Texts.en = root.english-ui;
+    }
+    changed dark-theme => { Palette.dark = root.dark-theme; }
+    changed english-ui => { Texts.en = root.english-ui; }
+
+    changed blame-anchor => {
+        if (root.blame-anchor >= 0) {
+            blame-list.content-y = min(0px, -(root.blame-anchor * Metrics.blame-row-height));
+            root.blame-anchor = -1;
+        }
+    }
+
+    // 每 100ms 向 Rust 侧要一次异步结果（UI 线程只做搬运，不做 I/O）。
+    Timer {
+        interval: 100ms;
+        running: true;
+        triggered => { root.poll(); }
+    }
+
+    VerticalLayout {
+        padding: 0px;
+        spacing: 0px;
+
+        // ---------------------------------------------------- 标题栏
+        // S4：按钮改 ghost 形态并按"取 / 更新 / 推送 / 管理"分组加分隔线，
+        // 分支名做成 IDEA 式分支标签。
+        Rectangle {
+            height: Metrics.title-bar-height;
+            background: Palette.bar;
+
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 10px;
+                spacing: 10px;
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 1px;
+
+                    Text {
+                        text: root.repo-title;
+                        color: Palette.text;
+                        font-size: Palette.font-title;
+                        font-weight: 600;
+                    }
+
+                    Text {
+                        text: root.repo-path;
+                        color: Palette.text-faint;
+                        font-size: Palette.font-xs;
+                        overflow: elide;
+                    }
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                // 分支 widget：IDEA 式当前分支标签。
+                Rectangle {
+                    height: 24px;
+                    border-radius: Palette.radius-sm;
+                    border-width: 1px;
+                    border-color: Palette.line;
+                    visible: root.has-repo;
+
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        alignment: center;
+
+                        Text {
+                            text: root.branch-text;
+                            color: Palette.green;
+                            font-size: Palette.font-md;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.head-text;
+                    color: Palette.text-faint;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.remote-current;
+                    color: Palette.text-faint;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                }
+
+                VDivider { }
+
+                // ---- 远端操作（FR-RMT-01/02/03）----
+                FlatButton {
+                    text: "Fetch";
+                    enabled: root.has-repo && !root.cli-missing && !root.network-busy;
+                    clicked => { root.fetch-selected(); }
+                }
+
+                FlatButton {
+                    text: Texts.s4;
+                    enabled: root.has-repo && !root.cli-missing && !root.network-busy;
+                    clicked => { root.fetch-all(); }
+                }
+
+                VDivider { }
+
+                FlatButton {
+                    text: "Update";
+                    enabled: root.has-repo && !root.cli-missing && !root.network-busy
+                        && !root.read-only;
+                    clicked => { root.update-project(); }
+                }
+
+                FlatButton {
+                    text: "Push";
+                    enabled: root.has-repo && !root.cli-missing && !root.network-busy
+                        && !root.read-only;
+                    clicked => { root.push-request(); }
+                }
+
+                VDivider { }
+
+                FlatButton {
+                    text: Texts.s5;
+                    enabled: root.has-repo && !root.cli-missing;
+                    clicked => { root.open-remotes(); }
+                }
+
+                FlatButton {
+                    text: Texts.s6;
+                    clicked => { root.open-settings(); }
+                }
+
+                FlatButton {
+                    text: Texts.s7;
+                    clicked => { root.refresh(); }
+                }
+            }
+        }
+
+        // ---------------------------------------------------- 进行中操作横幅
+        Rectangle {
+            height: root.state-banner-visible ? 28px : 0px;
+            background: Palette.warn-bg;
+            visible: root.state-banner-visible;
+
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 14px;
+                spacing: 10px;
+
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.state-text;
+                    color: Palette.warn-text;
+                    font-size: Palette.font-sm;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                FlatButton {
+                    text: Texts.s8;
+                    visible: root.resume-visible;
+                    clicked => { root.resume-continue(); }
+                }
+
+                FlatButton {
+                    text: Texts.s9;
+                    visible: root.resume-visible && root.resume-can-skip;
+                    danger: true;
+                    clicked => { root.resume-skip(); }
+                }
+
+                FlatButton {
+                    text: Texts.s10;
+                    visible: root.resume-visible;
+                    danger: true;
+                    clicked => { root.resume-abort(); }
+                }
+
+                FlatButton {
+                    text: Texts.s11;
+                    clicked => { root.bottom-tab = 1; }
+                }
+            }
+        }
+
+        // ---------------------------------------------------- 只读横幅（FR-MR-04）
+        Rectangle {
+            height: root.read-only ? 28px : 0px;
+            background: Palette.danger-bg;
+            visible: root.read-only;
+
+            Text {
+                x: 14px;
+                text: root.read-only-reason;
+                color: Palette.danger-text;
+                font-size: Palette.font-sm;
+                vertical-alignment: center;
+            }
+        }
+
+        // ---------------------------------------------------- git 缺失降级提示
+        Rectangle {
+            height: root.cli-missing ? 44px : 0px;
+            background: Palette.danger-bg;
+            visible: root.cli-missing;
+
+            Text {
+                x: 14px;
+                y: 6px;
+                width: parent.width - 28px;
+                text: root.cli-missing-reason;
+                color: Palette.danger-text;
+                font-size: Palette.font-sm;
+                vertical-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+
+        // ---------------------------------------------------- 网络操作进度（FR-RMT-05）
+        Rectangle {
+            height: root.network-busy ? 26px : 0px;
+            visible: root.network-busy;
+            background: Palette.panel;
+
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 10px;
+                spacing: 10px;
+
+                Text {
+                    text: root.network-label + "…";
+                    color: Palette.text;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.network-progress;
+                    color: Palette.text-faint;
+                    font-size: Palette.font-xs;
+                    font-family: Palette.mono-font;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                FlatButton {
+                    text: Texts.s12;
+                    danger: true;
+                    clicked => { root.cancel-network(); }
+                }
+            }
+        }
+
+        // ---------------------------------------------------- 远端失败提示（结论 + 建议）
+        Rectangle {
+            height: root.network-error-visible ? 62px : 0px;
+            visible: root.network-error-visible;
+            background: Palette.danger-bg;
+
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 10px;
+                spacing: 10px;
+
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.network-error;
+                    color: Palette.danger-text;
+                    font-size: Palette.font-xs;
+                    wrap: word-wrap;
+                    overflow: elide;
+                }
+
+                FlatButton {
+                    text: Texts.s13;
+                    clicked => { root.dismiss-network-error(); }
+                }
+            }
+        }
+
+        // ---------------------------------------------------- 主体
+        HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: 0px;
+
+            // 左：引用列表 + 分支操作
+            Rectangle {
+                width: 258px;
+                background: Palette.panel;
+                visible: root.has-repo;
+
+                VerticalLayout {
+                    padding: Metrics.space-2;
+                    spacing: 6px;
+
+                    SectionLabel { text: Texts.s14; }
+
+                    Divider { }
+
+                    ListView {
+                        vertical-stretch: 1;
+                        for entry[index] in root.sidebar-refs: Rectangle {
+                            height: 22px;
+                            background: entry.is-head
+                                ? Palette.accent
+                                : (entry.selected ? Palette.hover : transparent);
+
+                            Text {
+                                x: 6px;
+                                width: parent.width - 60px;
+                                text: entry.name;
+                                color: entry.is-head ? Palette.accent-text : Palette.text-dim;
+                                font-size: Palette.font-sm;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                x: parent.width - 52px;
+                                width: 46px;
+                                text: entry.sync;
+                                color: Palette.text-faint;
+                                font-size: 10px;
+                                vertical-alignment: center;
+                                horizontal-alignment: right;
+                            }
+
+                            TouchArea {
+                                clicked => { root.select-ref(index); }
+                            }
+                        }
+                    }
+
+                    Divider { }
+
+                    Field {
+                        // 双向绑定：Rust 侧选中分支时会回填名称，用户输入也要能写回属性。
+                        text <=> root.branch-input;
+                        placeholder: Texts.s15;
+                        edited(v) => { root.set-branch-input(v); }
+                    }
+
+                    HorizontalLayout {
+                        spacing: Metrics.space-1;
+
+                        FlatButton {
+                            text: Texts.s16;
+                            enabled: !root.read-only;
+                            clicked => { root.branch-create(true); }
+                        }
+                        FlatButton {
+                            text: Texts.s17;
+                            enabled: !root.read-only;
+                            clicked => { root.branch-create(false); }
+                        }
+                        FlatButton {
+                            text: Texts.s18;
+                            enabled: !root.read-only;
+                            clicked => { root.branch-checkout(); }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: Metrics.space-1;
+
+                        FlatButton {
+                            text: Texts.s19;
+                            enabled: !root.read-only;
+                            clicked => { root.branch-rename(); }
+                        }
+                        FlatButton {
+                            text: Texts.s20;
+                            enabled: !root.read-only;
+                            danger: true;
+                            clicked => { root.branch-delete(false); }
+                        }
+                        FlatButton {
+                            text: Texts.s21;
+                            enabled: !root.read-only;
+                            clicked => { root.branch-upstream(); }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: Metrics.space-1;
+
+                        FlatButton {
+                            text: Texts.s22;
+                            enabled: !root.read-only;
+                            clicked => { root.checkout-selected-commit(); }
+                        }
+
+                        FlatButton {
+                            text: Texts.s23;
+                            danger: true;
+                            enabled: !root.read-only;
+                            clicked => { root.delete-tag(); }
+                        }
+                    }
+                }
+            }
+
+            // 右：Log + Diff
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 0px;
+
+                // Log 面板
+                VerticalLayout {
+                    vertical-stretch: 3;
+                    spacing: 0px;
+
+                    Rectangle {
+                        height: Metrics.panel-bar-height;
+                        background: Palette.bar;
+
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 6px;
+
+                            SectionLabel { text: Texts.s24; }
+
+                            Text {
+                                text: root.log-summary;
+                                color: Palette.text-faint;
+                                font-size: Palette.font-xs;
+                                vertical-alignment: center;
+                            }
+
+                            Rectangle { horizontal-stretch: 1; }
+
+                            Field {
+                                width: 200px;
+                                text <=> root.search-query;
+                                placeholder: Texts.s25;
+                                monospace: true;
+                                edited(v) => { root.set-search(v); }
+                            }
+
+                            OptionToggle {
+                                text: Texts.s26;
+                                checked: root.search-regex;
+                                toggled => { root.toggle-search-regex(!root.search-regex); }
+                            }
+
+                            FlatButton {
+                                text: Texts.s27;
+                                clicked => { root.run-search(); }
+                            }
+
+                            FlatButton {
+                                text: Texts.s28;
+                                enabled: root.search-active;
+                                clicked => { root.clear-search(); }
+                            }
+                        }
+                    }
+
+                    // 图选项条（FR-LOG-05/06）
+                    Rectangle {
+                        height: 26px;
+                        background: Palette.panel;
+
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            spacing: 6px;
+
+                            Text {
+                                text: Texts.s29;
+                                color: Palette.text-faint;
+                                font-size: Palette.font-xs;
+                                vertical-alignment: center;
+                            }
+
+                            OptionToggle {
+                                text: Texts.s30;
+                                checked: root.opt-topo;
+                                toggled => { root.toggle-option(0); }
+                            }
+                            OptionToggle {
+                                text: Texts.s31;
+                                checked: root.opt-first-parent;
+                                toggled => { root.toggle-option(1); }
+                            }
+                            OptionToggle {
+                                text: Texts.s32;
+                                checked: root.opt-hide-merges;
+                                toggled => { root.toggle-option(2); }
+                            }
+                            OptionToggle {
+                                text: Texts.s33;
+                                checked: root.opt-collapse;
+                                toggled => { root.toggle-option(3); }
+                            }
+
+                            Rectangle { horizontal-stretch: 1; }
+
+                            Text {
+                                text: root.log-loading ? Texts.s34 : "";
+                                color: Palette.amber;
+                                font-size: Palette.font-xs;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    Divider { }
+
+                    ListView {
+                        vertical-stretch: 1;
+                        for row[index] in root.log-rows: LogRowView {
+                            height: Metrics.log-row-height;
+                            short-id: row.short-id;
+                            subject: row.subject;
+                            author: row.author;
+                            when: row.when;
+                            refs-text: row.refs-text;
+                            graph: row.graph;
+                            is-selected: row.is-selected;
+                            is-mine: row.is-mine;
+                            is-merge: row.is-merge;
+                            clicked => { root.select-log(index); }
+                            context-clicked(x, y) => {
+                                root.select-log(index);
+                                root.open-commit-menu(index, x, y);
+                            }
+                        }
+                    }
+                }
+
+                Divider { }
+
+                Rectangle {
+                    vertical-stretch: 2;
+
+                    Rectangle {
+                        visible: !root.blame-visible;
+
+                // Diff 面板
+                VerticalLayout {
+                    spacing: 0px;
+
+                    Rectangle {
+                        height: Metrics.panel-bar-height;
+                        background: Palette.bar;
+
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 6px;
+
+                            Text {
+                                width: 210px;
+                                text: root.diff-title;
+                                color: Palette.text;
+                                font-size: Palette.font-sm;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                text: root.diff-stats;
+                                color: Palette.text-faint;
+                                font-size: Palette.font-xs;
+                                vertical-alignment: center;
+                            }
+
+                            Rectangle { horizontal-stretch: 1; }
+
+                            Text {
+                                text: root.diff-hint;
+                                color: Palette.text-faint;
+                                font-size: Palette.font-xs;
+                                vertical-alignment: center;
+                            }
+
+                            FlatButton {
+                                text: Texts.s35;
+                                enabled: !root.read-only && root.diff-selectable
+                                    && !root.diff-staged-view && root.staging-mode;
+                                clicked => { root.stage-hunks(); }
+                            }
+                            FlatButton {
+                                text: Texts.s36;
+                                enabled: !root.read-only && root.diff-selectable && root.diff-staged-view;
+                                clicked => { root.unstage-hunks(); }
+                            }
+                            FlatButton {
+                                text: Texts.s37;
+                                enabled: !root.read-only && root.diff-selectable && !root.diff-staged-view;
+                                danger: true;
+                                clicked => { root.discard-hunks(); }
+                            }
+                        }
+                    }
+
+                    Divider { }
+
+                            Rectangle {
+                                vertical-stretch: 1;
+
+                    ListView {
+                                    width: 100%;
+                                    height: 100%;
+                                    visible: !root.diff-image-visible;
+                        for row[index] in root.diff-rows: DiffRowView {
+                            height: Metrics.diff-row-height;
+                            kind: row.kind;
+                            old-no: row.old-no;
+                            new-no: row.new-no;
+                            segments: row.segments;
+                            changed: row.changed;
+                            is-hunk-header: row.is-hunk-header;
+                            selectable: row.selectable;
+                            selected: row.selected;
+                            clicked => { root.toggle-diff-row(index); }
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 100%;
+                                    height: 100%;
+                                    visible: root.diff-image-visible;
+
+                                    VerticalLayout {
+                                        spacing: 0px;
+
+                                        Rectangle {
+                                            height: 26px;
+                                            background: Palette.panel;
+
+                                            HorizontalLayout {
+                                                padding-left: 6px;
+                                                spacing: 6px;
+
+                                                OptionToggle {
+                                                    text: Texts.s38;
+                                                    checked: root.img-mode == 0;
+                                                    toggled => { root.img-mode = 0; }
+                                                }
+                                                OptionToggle {
+                                                    text: Texts.s39;
+                                                    checked: root.img-mode == 1;
+                                                    toggled => { root.img-mode = 1; }
+                                                }
+
+                                                Text {
+                                                    text: root.diff-img-equal ? Texts.s40 : "";
+                                                    color: Palette.green;
+                                                    font-size: Palette.font-xs;
+                                                    vertical-alignment: center;
+                                                }
+
+                                                Rectangle { horizontal-stretch: 1; }
+
+                                                Slider {
+                                                    width: 160px;
+                                                    visible: root.img-mode == 1;
+                                                    minimum: 0;
+                                                    maximum: 1;
+                                                    value <=> root.img-blend;
+                                                }
+                                            }
+                                        }
+
+                                        Rectangle {
+                                            vertical-stretch: 1;
+
+                                            if root.img-mode == 0: HorizontalLayout {
+                                                spacing: 1px;
+
+                                                VerticalLayout {
+                                                    horizontal-stretch: 1;
+                                                    spacing: 2px;
+
+                                                    Rectangle {
+                                                        vertical-stretch: 1;
+                                                        clip: true;
+                                                        background: Palette.bg;
+                                                        Image {
+                                                            width: 100%;
+                                                            height: 100%;
+                                                            source: root.diff-img-old;
+                                                            image-fit: contain;
+                                                        }
+                                                        Text {
+                                                            width: 100%;
+                                                            vertical-alignment: center;
+                                                            horizontal-alignment: center;
+                                                            visible: !root.diff-img-old-present;
+                                                            text: root.diff-img-meta-old;
+                                                            color: Palette.text-faint;
+                                                            font-size: Palette.font-sm;
+                                                        }
+                                                    }
+
+                                                    Text {
+                                                        height: 18px;
+                                                        text: root.diff-img-meta-old;
+                                                        color: Palette.text-faint;
+                                                        font-size: Palette.font-xs;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+
+                                                VerticalLayout {
+                                                    horizontal-stretch: 1;
+                                                    spacing: 2px;
+
+                                                    Rectangle {
+                                                        vertical-stretch: 1;
+                                                        clip: true;
+                                                        background: Palette.bg;
+                                                        Image {
+                                                            width: 100%;
+                                                            height: 100%;
+                                                            source: root.diff-img-new;
+                                                            image-fit: contain;
+                                                        }
+                                                        Text {
+                                                            width: 100%;
+                                                            vertical-alignment: center;
+                                                            horizontal-alignment: center;
+                                                            visible: !root.diff-img-new-present;
+                                                            text: root.diff-img-meta-new;
+                                                            color: Palette.text-faint;
+                                                            font-size: Palette.font-sm;
+                                                        }
+                                                    }
+
+                                                    Text {
+                                                        height: 18px;
+                                                        text: root.diff-img-meta-new;
+                                                        color: Palette.text-faint;
+                                                        font-size: Palette.font-xs;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                            }
+
+                                            if root.img-mode == 1: Rectangle {
+                                                background: Palette.bg;
+                                                clip: true;
+
+                                                Image {
+                                                    width: 100%;
+                                                    height: 100%;
+                                                    source: root.diff-img-old;
+                                                    image-fit: contain;
+                                                    visible: root.diff-img-old-present;
+                                                }
+
+                                                Image {
+                                                    width: 100%;
+                                                    height: 100%;
+                                                    source: root.diff-img-new;
+                                                    image-fit: contain;
+                                                    visible: root.diff-img-new-present;
+                                                    opacity: root.img-blend;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        visible: root.blame-visible;
+
+                        VerticalLayout {
+                            spacing: 0px;
+
+                            Rectangle {
+                                height: Metrics.panel-bar-height;
+                                background: Palette.bar;
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 6px;
+
+                                    FlatButton {
+                                        text: Texts.s41;
+                                        clicked => { root.blame-close(); }
+                                    }
+
+                                    FlatButton {
+                                        text: Texts.s42;
+                                        clicked => { root.blame-open-history(); }
+                                    }
+
+                                    Text {
+                                        width: 220px;
+                                        text: root.blame-title;
+                                        color: Palette.text;
+                                        font-size: Palette.font-sm;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+
+                                    Text {
+                                        text: root.blame-spec-label;
+                                        color: Palette.amber;
+                                        font-size: Palette.font-xs;
+                                        vertical-alignment: center;
+                                    }
+
+                                    Rectangle { horizontal-stretch: 1; }
+
+                                    Text {
+                                        text: root.blame-truncated;
+                                        color: Palette.amber;
+                                        font-size: Palette.font-xs;
+                                        vertical-alignment: center;
+                                    }
+
+                                    FlatButton {
+                                        text: Texts.s43;
+                                        enabled: root.blame-can-chain && !root.read-only;
+                                        clicked => { root.blame-chain(); }
+                                    }
+                                }
+                            }
+
+                            Divider { }
+
+                            blame-list := ListView {
+                                vertical-stretch: 1;
+                                for row[index] in root.blame-rows: BlameRowView {
+                                    height: Metrics.blame-row-height;
+                                    line-no: row.line-no;
+                                    commit: row.commit;
+                                    author: row.author;
+                                    when: row.when;
+                                    summary: row.summary;
+                                    is-selected: row.is-selected;
+                                    is-boundary: row.is-boundary;
+                                    clicked => { root.blame-select(index); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------- 空状态
+        Rectangle {
+            vertical-stretch: 1;
+            background: Palette.bg;
+            visible: !root.has-repo;
+
+            VerticalLayout {
+                padding: 28px;
+                spacing: Metrics.space-3;
+                alignment: center;
+
+                Text {
+                    text: Texts.s44;
+                    color: Palette.text;
+                    font-size: Palette.font-h1;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: root.empty-message;
+                    color: Palette.text-faint;
+                    font-size: Palette.font-sm;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: Metrics.space-2;
+                    alignment: center;
+
+                    Field {
+                        width: 460px;
+                        height: 30px;
+                        text <=> root.open-path;
+                        placeholder: Texts.s45;
+                    }
+
+                    FlatButton {
+                        text: Texts.s46;
+                        clicked => { root.open-repo(root.open-path); }
+                    }
+                }
+
+                SectionLabel {
+                    text: Texts.s47;
+                    horizontal-alignment: center;
+                }
+
+                Rectangle {
+                    width: 520px;
+                    height: 200px;
+                    background: Palette.panel;
+                    border-color: Palette.line;
+                    border-width: 1px;
+
+                    ListView {
+                        for entry in root.recent: Rectangle {
+                            height: 26px;
+                            background: recent-touch.has-hover ? Palette.hover : transparent;
+
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                spacing: 10px;
+
+                                Text {
+                                    text: entry.name;
+                                    color: Palette.text;
+                                    font-size: Palette.font-sm;
+                                    vertical-alignment: center;
+                                }
+
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: entry.path;
+                                    color: Palette.text-faint;
+                                    font-size: Palette.font-xs;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+
+                            recent-touch := TouchArea {
+                                clicked => { root.use-recent(entry.path); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Divider { }
+
+        // ---------------------------------------------------- 底部面板
+        Rectangle {
+            height: root.has-repo ? 300px : 0px;
+            background: Palette.panel;
+            visible: root.has-repo;
+
+            VerticalLayout {
+                padding: 0px;
+                spacing: 0px;
+
+                Rectangle {
+                    height: 28px;
+                    background: Palette.bar;
+
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        spacing: Metrics.space-1;
+
+                        TabButton {
+                            text: Texts.s48 + root.change-summary;
+                            active: root.bottom-tab == 0;
+                            clicked => { root.bottom-tab = 0; }
+                        }
+
+                        TabButton {
+                            text: "Console " + root.console-summary;
+                            active: root.bottom-tab == 1;
+                            clicked => { root.bottom-tab = 1; }
+                        }
+
+                        TabButton {
+                            text: "Stash " + root.stash-summary;
+                            active: root.bottom-tab == 2;
+                            clicked => {
+                                root.bottom-tab = 2;
+                                root.request-stash-list();
+                            }
+                        }
+
+                        Rectangle { horizontal-stretch: 1; }
+
+                        FlatButton {
+                            text: Texts.s49;
+                            visible: root.bottom-tab == 1;
+                            clicked => { root.export-console(); }
+                        }
+
+                        FlatButton {
+                            text: Texts.s50;
+                            visible: root.bottom-tab == 1;
+                            clicked => { root.clear-console(); }
+                        }
+                    }
+                }
+
+                // ---- 本地更改
+                HorizontalLayout {
+                    vertical-stretch: 1;
+                    visible: root.bottom-tab == 0;
+                    spacing: 0px;
+
+                    // 左：操作栏 + 列表
+                    VerticalLayout {
+                        horizontal-stretch: 3;
+                        spacing: 0px;
+
+                        Rectangle {
+                            height: 26px;
+                            background: Palette.panel;
+
+                            HorizontalLayout {
+                                padding-left: 6px;
+                                spacing: Metrics.space-1;
+
+                                FlatButton {
+                                    text: Texts.s51;
+                                    enabled: !root.read-only;
+                                    clicked => { root.stage-selected(); }
+                                }
+                                FlatButton {
+                                    text: Texts.s52;
+                                    enabled: !root.read-only;
+                                    clicked => { root.unstage-selected(); }
+                                }
+                                FlatButton {
+                                    text: Texts.s53;
+                                    enabled: !root.read-only;
+                                    danger: true;
+                                    clicked => { root.discard-selected(); }
+                                }
+                                FlatButton {
+                                    text: Texts.s54;
+                                    enabled: !root.read-only && root.selection-is-untracked;
+                                    danger: true;
+                                    clicked => { root.delete-selected(); }
+                                }
+                                FlatButton {
+                                    text: Texts.s55;
+                                    enabled: !root.read-only && root.selection-is-untracked;
+                                    clicked => { root.ignore-selected(0); }
+                                }
+                                FlatButton {
+                                    text: Texts.s56;
+                                    enabled: !root.read-only && root.selection-is-untracked;
+                                    clicked => { root.ignore-selected(1); }
+                                }
+
+                                FlatButton {
+                                    text: "Blame";
+                                    clicked => { root.request-blame-selected(); }
+                                }
+                                FlatButton {
+                                    text: Texts.s42;
+                                    clicked => { root.request-file-history-selected(); }
+                                }
+
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                        }
+
+                        ListView {
+                            vertical-stretch: 1;
+                            for row[index] in root.change-rows: ChangeRowView {
+                                height: Metrics.list-row-height;
+                                path: row.path;
+                                code: row.code;
+                                bucket: row.bucket;
+                                note: row.note;
+                                is-selected: row.is-selected;
+                                is-conflict: row.is-conflict;
+                                clicked => { root.select-change(index); }
+                            }
+                        }
+                    }
+
+                    VDivider { }
+
+                    // 右：提交面板
+                    VerticalLayout {
+                        width: 330px;
+                        padding: Metrics.space-2;
+                        spacing: 6px;
+
+                        Text {
+                            text: Texts.s57;
+                            color: Palette.text-dim;
+                            font-size: Palette.font-xs;
+                        }
+
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: Palette.bg;
+                            border-color: Palette.border;
+                            border-width: 1px;
+                            border-radius: Palette.radius-sm;
+
+                            TextInput {
+                                x: 6px;
+                                y: 4px;
+                                width: parent.width - 12px;
+                                height: parent.height - 8px;
+                                text <=> root.commit-message;
+                                single-line: false;
+                                wrap: word-wrap;
+                                color: Palette.text;
+                                font-size: Palette.font-sm;
+                                font-family: Palette.mono-font;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+
+                            CheckBox {
+                                text: Texts.s58;
+                                checked: root.commit-amend;
+                                toggled => { root.toggle-amend(!root.commit-amend); }
+                            }
+
+                            CheckBox {
+                                text: Texts.s59;
+                                checked: root.commit-reset-author;
+                                enabled: root.commit-amend;
+                                toggled => { root.toggle-reset-author(!root.commit-reset-author); }
+                            }
+                        }
+
+                        Text {
+                            text: root.commit-hint;
+                            color: Palette.text-faint;
+                            font-size: Palette.font-xs;
+                            wrap: word-wrap;
+                        }
+
+                        FlatButton {
+                            text: root.commit-amend ? Texts.s60 : Texts.s61;
+                            enabled: !root.read-only && root.commit-enabled && root.cli-missing == false;
+                            clicked => { root.commit(); }
+                        }
+                    }
+                }
+
+                // ---- Console
+                ListView {
+                    vertical-stretch: 1;
+                    visible: root.bottom-tab == 1;
+                    for row in root.console-rows: ConsoleRowView {
+                        height: 20px;
+                        route: row.route;
+                        summary: row.summary;
+                        detail: row.detail;
+                        ok: row.ok;
+                    }
+                }
+
+                // ---- 贮藏（FR-STH）
+                HorizontalLayout {
+                    vertical-stretch: 1;
+                    visible: root.bottom-tab == 2;
+                    spacing: 0px;
+
+                    VerticalLayout {
+                        width: 310px;
+                        padding: Metrics.space-2;
+                        spacing: 6px;
+
+                        Text {
+                            text: Texts.s62;
+                            color: Palette.text-dim;
+                            font-size: Palette.font-xs;
+                        }
+
+                        Field {
+                            text <=> root.stash-message;
+                            placeholder: Texts.s63;
+                            edited(v) => { root.set-stash-message(v); }
+                        }
+
+                        CheckBox {
+                            text: Texts.s64;
+                            checked: root.stash-untracked;
+                            toggled => { root.toggle-stash-untracked(!root.stash-untracked); }
+                        }
+
+                        FlatButton {
+                            text: Texts.s65;
+                            enabled: !root.read-only;
+                            clicked => { root.stash-create(); }
+                        }
+
+                        Text {
+                            text: Texts.s66;
+                            color: Palette.text-faint;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
+
+                        Rectangle { vertical-stretch: 1; }
+                    }
+
+                    VDivider { }
+
+                    // S4：行内布局从"绝对定位 + parent.width 算术"改为弹性布局，
+                    // 窄窗口下按钮不再与摘要文字重叠。
+                    ListView {
+                        horizontal-stretch: 1;
+                        for row in root.stash-rows: Rectangle {
+                            height: 30px;
+                            background: transparent;
+
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                spacing: 8px;
+
+                                Text {
+                                    width: 86px;
+                                    text: row.selector;
+                                    color: Palette.text-faint;
+                                    font-size: Palette.font-xs;
+                                    font-family: Palette.mono-font;
+                                    vertical-alignment: center;
+                                }
+
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: row.branch == "" ? row.summary : row.summary + "   ·   " + row.branch;
+                                    color: Palette.text;
+                                    font-size: Palette.font-sm;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+
+                                FlatButton {
+                                    text: Texts.s67;
+                                    enabled: !root.read-only;
+                                    clicked => { root.stash-apply(row.index); }
+                                }
+                                FlatButton {
+                                    text: Texts.s68;
+                                    enabled: !root.read-only;
+                                    clicked => { root.stash-pop(row.index); }
+                                }
+                                FlatButton {
+                                    text: Texts.s20;
+                                    danger: true;
+                                    enabled: !root.read-only;
+                                    clicked => { root.stash-drop(row.index); }
+                                }
+                                FlatButton {
+                                    text: Texts.s69;
+                                    enabled: !root.read-only && root.branch-input != "";
+                                    clicked => { root.stash-branch(row.index); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------- 提示条
+        Rectangle {
+            height: root.toast == "" ? 0px : 24px;
+            background: Palette.warn-bg;
+            visible: root.toast != "";
+
+            Text {
+                x: 12px;
+                text: root.toast;
+                color: Palette.warn-text;
+                font-size: Palette.font-xs;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        // ---------------------------------------------------- 状态栏
+        Rectangle {
+            height: 22px;
+            background: Palette.bar;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: Metrics.space-3;
+
+                Text {
+                    text: root.git-text;
+                    color: Palette.text-faint;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                Text {
+                    text: root.advanced-label == "" ? "" : "⏳ " + root.advanced-label + Texts.s70;
+                    color: Palette.amber;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.has-repo ? root.branch-text : "";
+                    color: Palette.text-faint;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------- 浮层（组件见 dialogs.slint）
+    // 声明顺序即 z 序：后声明者在上。保持与重构前一致：
+    // 确认 / 设置 / 推送 / 远端 / 上下文菜单 / 操作 / 变基 / 冲突 / 比较。
+
+    ConfirmDialog {
+        visible: root.confirm-visible;
+        confirm-title: root.confirm-title;
+        confirm-detail: root.confirm-detail;
+        confirm-danger: root.confirm-danger;
+        yes => { root.confirm-yes(); }
+        no => { root.confirm-no(); }
+    }
+
+    SettingsDialog {
+        visible: root.settings-visible;
+        dark-theme <=> root.dark-theme;
+        set-language-en <=> root.set-language-en;
+        staging-mode <=> root.staging-mode;
+        set-warn-detached <=> root.set-warn-detached;
+        set-warn-crlf <=> root.set-warn-crlf;
+        set-update-strategy <=> root.set-update-strategy;
+        set-cache-mib <=> root.set-cache-mib;
+        set-protected <=> root.set-protected;
+        set-diff-tool <=> root.set-diff-tool;
+        set-merge-tool <=> root.set-merge-tool;
+        set-log-level <=> root.set-log-level;
+        set-status: root.set-status;
+        toggle-theme(dark) => { root.toggle-theme(dark); }
+        apply => { root.apply-settings(); }
+        cancel => { root.close-settings(); }
+    }
+
+    PushDialog {
+        visible: root.push-visible;
+        push-rows: root.push-rows;
+        push-summary: root.push-summary;
+        push-hint: root.push-hint;
+        push-protected: root.push-protected;
+        push-creates-branch: root.push-creates-branch;
+        push-force <=> root.push-force;
+        push-set-upstream <=> root.push-set-upstream;
+        confirm => { root.push-confirm(); }
+        cancel => { root.push-cancel(); }
+        toggle-force(on) => { root.toggle-push-force(on); }
+        toggle-upstream(on) => { root.toggle-push-upstream(on); }
+    }
+
+    RemotesDialog {
+        visible: root.remotes-visible;
+        remote-rows: root.remote-rows;
+        remote-selected: root.remote-selected;
+        remote-help: root.remote-help;
+        token-host: root.token-host;
+        keyring-available: root.keyring-available;
+        read-only: root.read-only;
+        remote-name-input <=> root.remote-name-input;
+        remote-url-input <=> root.remote-url-input;
+        token-input <=> root.token-input;
+        pull-strategy <=> root.pull-strategy;
+        select-remote(index) => { root.select-remote(index); }
+        name-edited(v) => { root.set-remote-name(v); }
+        url-edited(v) => { root.set-remote-url(v); }
+        add => { root.remote-add(); }
+        set-url => { root.remote-set-url(); }
+        remove => { root.remote-remove(); }
+        close => { root.close-remotes(); }
+        token-edited(v) => { root.set-token-input(v); }
+        save-token => { root.save-token(); }
+        forget-token => { root.forget-token(); }
+        set-strategy(index) => { root.set-pull-strategy(index); }
+    }
+
+    CommitCtxMenu {
+        visible: root.ctx-visible;
+        ctx-x: root.ctx-x;
+        ctx-y: root.ctx-y;
+        ctx-is-head: root.ctx-is-head;
+        read-only: root.read-only;
+        action(label) => { root.commit-action(label); }
+        close => { root.close-commit-menu(); }
+    }
+
+    OpDialog {
+        visible: root.op-visible;
+        op-title: root.op-title;
+        op-hint: root.op-hint;
+        op-placeholder: root.op-placeholder;
+        op-placeholder2: root.op-placeholder2;
+        op-show-input2: root.op-show-input2;
+        op-modes: root.op-modes;
+        op-danger: root.op-danger;
+        op-input <=> root.op-input;
+        op-input2 <=> root.op-input2;
+        op-mode <=> root.op-mode;
+        mode-changed(index) => { root.set-op-mode(index); }
+        input-edited(v) => { root.set-op-input(v); }
+        input2-edited(v) => { root.set-op-input2(v); }
+        confirm => { root.op-confirm(); }
+        cancel => { root.op-cancel(); }
+    }
+
+    IplanDialog {
+        visible: root.iplan-visible;
+        iplan-rows: root.iplan-rows;
+        iplan-title: root.iplan-title;
+        iplan-summary: root.iplan-summary;
+        iplan-message-visible: root.iplan-message-visible;
+        iplan-message <=> root.iplan-message;
+        read-only: root.read-only;
+        select(index) => { root.iplan-select(index); }
+        action(row, act) => { root.iplan-action(row, act); }
+        message-edited(v) => { root.iplan-set-message(v); }
+        confirm => { root.iplan-confirm(); }
+        cancel => { root.iplan-cancel(); }
+    }
+
+    CflDialog {
+        visible: root.cfl-visible;
+        cfl-files: root.cfl-files;
+        cfl-rows: root.cfl-rows;
+        cfl-title: root.cfl-title;
+        cfl-summary: root.cfl-summary;
+        cfl-manual-visible: root.cfl-manual-visible;
+        cfl-block: root.cfl-block;
+        cfl-manual <=> root.cfl-manual;
+        read-only: root.read-only;
+        resolve-all(code) => { root.cfl-resolve-all(code); }
+        take-side(code) => { root.cfl-take-side(code); }
+        mark-resolved => { root.cfl-mark-resolved(); }
+        close => { root.cfl-close(); }
+        select(index) => { root.cfl-select(index); }
+        resolve(block, code) => { root.cfl-resolve(block, code); }
+        pick-block(block) => { root.cfl-pick-block(block); }
+        manual-edited(v) => { root.cfl-set-manual(v); }
+        apply-manual => { root.cfl-apply-manual(); }
+    }
+
+    CompareDialog {
+        visible: root.compare-visible;
+        compare-rows: root.compare-rows;
+        compare-title: root.compare-title;
+        compare-browse: root.compare-browse;
+        select(index) => { root.compare-select(index); }
+        close => { root.compare-close(); }
+    }
+
+    FileHistoryDialog {
+        visible: root.history-visible;
+        history-rows: root.history-rows;
+        history-title: root.history-title;
+        history-truncated: root.history-truncated;
+        history-filter <=> root.history-filter;
+        select(index) => { root.history-select(index); }
+        set-filter(index) => { root.history-set-filter(index); }
+        close => { root.history-close(); }
+}
+}

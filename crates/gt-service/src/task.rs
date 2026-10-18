@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use gt_backend::{
-    BranchOp, BlameLine, CherryPickRequest, CommitRequest, CredentialKind, FetchRequest,
+    BlameLine, BranchOp, CherryPickRequest, CommitRequest, CredentialKind, FetchRequest,
     FileHistoryEntry, IgnoreTarget, MergeRequest, NetworkResult, PatchApplyRequest, PatchSource,
     PullRequest, PushPreview, PushRequest, RebaseControl, RebasePlan, RebaseProgress,
     RebaseRequest, RemoteEdit, RemoteInfo, RemoteListing, RepoLocation, ResetRequest,
@@ -563,6 +563,13 @@ pub enum RequestKind {
         /// 新侧修订。
         new: String,
     },
+    /// 某个提交相对第一父提交的文件清单（日志详情栏）。
+    CommitFiles {
+        /// 旧侧修订；[`None`] 表示根提交（空树）。
+        old: Option<String>,
+        /// 提交完整哈希；同时作为结果归属校验键。
+        commit: String,
+    },
     /// 单个文件的差异。
     FileDiff {
         /// 左侧来源。
@@ -707,7 +714,7 @@ impl RequestKind {
         match self {
             Self::Overview => RequestLane::Overview,
             Self::Status => RequestLane::Status,
-            Self::LogPage(_) | Self::Search(_) => RequestLane::Log,
+            Self::LogPage(_) | Self::Search(_) | Self::CommitFiles { .. } => RequestLane::Log,
             // 差异族（含 Blame / 文件历史）共用一条视图通道：它们都在"看
             // 某个文件的内容"，新请求作废旧请求是正确的语义。
             Self::TreeChanges { .. }
@@ -733,6 +740,7 @@ impl RequestKind {
             Self::Status => "工作区状态",
             Self::LogPage(_) => "日志页",
             Self::TreeChanges { .. } => "文件级变更",
+            Self::CommitFiles { .. } => "提交文件列表",
             Self::FileDiff { .. } => "文件差异",
             Self::Search(_) => "提交搜索",
             Self::Conflicts => "冲突清单",
@@ -870,6 +878,13 @@ pub enum Outcome {
     LogPage(Box<LogPageResult>),
     /// 文件级变更。
     TreeChanges(Vec<FileChange>),
+    /// 日志详情栏的文件清单（附带提交哈希，界面据此丢弃过期结果）。
+    CommitFiles {
+        /// 提交完整哈希。
+        commit: String,
+        /// 相对第一父提交的文件清单。
+        files: Vec<FileChange>,
+    },
     /// 文件差异。
     FileDiff(Box<gt_diff::FileDiff>),
     /// 搜索结果。

@@ -1,0 +1,44 @@
+// IDEA expui 单色图标集（Apache 2.0，来源见 icons/README.md）。
+//
+// 用法：IdeaIcon { name: "refresh"; tint: Palette.icon; }
+// 图标统一按 16px 画布绘制，点击热区由外层 IconButton 负责。
+
+import { Palette, Metrics } from "theme.slint";
+
+export component IdeaIcon inherits Image {
+    in property <string> name: "file";
+    in property <length> icon-size: Metrics.icon-size;
+    in property <color> tint: Palette.icon;
+
+    width: root.icon-size;
+    height: root.icon-size;
+    image-fit: contain;
+    colorize: root.tint;
+    source: root.name == "refresh" ? @image-url("icons/refresh.svg")
+        : root.name == "add" ? @image-url("icons/add.svg")
+        : root.name == "remove" ? @image-url("icons/remove.svg")
+        : root.name == "eye" ? @image-url("icons/eye.svg")
+        : root.name == "collapse-all" ? @image-url("icons/collapse-all.svg")
+        : root.name == "expand-all" ? @image-url("icons/expand-all.svg")
+        : root.name == "close" ? @image-url("icons/close.svg")
+        : root.name == "more" ? @image-url("icons/more.svg")
+        : root.name == "chevron-right" ? @image-url("icons/chevron-right.svg")
+        : root.name == "chevron-down" ? @image-url("icons/chevron-down.svg")
+        : root.name == "search" ? @image-url("icons/search.svg")
+        : root.name == "settings" ? @image-url("icons/settings.svg")
+        : root.name == "filter" ? @image-url("icons/filter.svg")
+        : root.name == "branch" ? @image-url("icons/branch.svg")
+        : root.name == "tag" ? @image-url("icons/tag.svg")
+        : root.name == "folder" ? @image-url("icons/folder.svg")
+        : root.name == "commit" ? @image-url("icons/commit.svg")
+        : root.name == "fetch" ? @image-url("icons/fetch.svg")
+        : root.name == "push" ? @image-url("icons/push.svg")
+        : root.name == "update" ? @image-url("icons/update.svg")
+        : root.name == "download" ? @image-url("icons/download.svg")
+        : root.name == "history" ? @image-url("icons/history.svg")
+        : root.name == "revert" ? @image-url("icons/revert.svg")
+        : root.name == "changes" ? @image-url("icons/changes.svg")
+        : root.name == "undo" ? @image-url("icons/undo.svg")
+        : root.name == "redo" ? @image-url("icons/redo.svg")
+        : @image-url("icons/file.svg");
+}

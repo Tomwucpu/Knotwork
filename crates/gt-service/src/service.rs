@@ -961,14 +961,21 @@ fn execute(
             let changes = repo.status().map_err(user_message)?;
             Ok(Outcome::Status(Box::new(changes)))
         }
-        RequestKind::LogPage(request) => {
-            execute_log_page(repo, handle, request, token)
-        }
+        RequestKind::LogPage(request) => execute_log_page(repo, handle, request, token),
         RequestKind::TreeChanges { old, new } => {
             let changes = repo
                 .tree_changes(old.as_deref(), new)
                 .map_err(user_message)?;
             Ok(Outcome::TreeChanges(changes))
+        }
+        RequestKind::CommitFiles { old, commit } => {
+            let files = repo
+                .tree_changes(old.as_deref(), commit)
+                .map_err(user_message)?;
+            Ok(Outcome::CommitFiles {
+                commit: commit.to_owned(),
+                files,
+            })
         }
         RequestKind::FileDiff { left, right, path } => {
             if is_image_path(path) {
@@ -1011,8 +1018,6 @@ fn execute(
         RequestKind::Network(_) => Err("网络请求不应进入读取路径".to_owned()),
     }
 }
-
-
 
 /// 日志页（FR-LOG-01/03）：从索引取 id 切片，再物化提交元数据。
 fn execute_log_page(
@@ -1138,7 +1143,6 @@ fn execute_blame(
         _ => Err("非 Blame 族请求不应进入此路径".to_owned()),
     }
 }
-
 
 /// 链式导航（FR-BLM-03）：在归属提交的父侧（或重命名前位置）重新 blame，
 /// 并把当前行号映射过去。两步都在服务线程完成，一次投递带回行数据与锚点。

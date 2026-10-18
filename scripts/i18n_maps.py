@@ -204,6 +204,8 @@ RUST_MAP = {
     "工作区": "Working tree",
     "无法提交：{}": "Cannot commit: {reason}",
     "暂存区为空：先暂存要提交的内容": "Nothing staged: stage what you want to commit first",
+    "没有可暂存的文件": "No files to stage",
+    "没有可反暂存的文件": "No files to unstage",
     "将提交 {} 个已暂存路径": "Will commit {} staged path(s)",
     "请先选择一个文件": "Select a file first",
     "请先选择一个未跟踪路径": "Select an untracked path first",

@@ -51,13 +51,22 @@ fn literals_with_positions(line: &str) -> Vec<(usize, String)> {
 
 /// 兼容别名：仅取内容。
 fn literals_on_line(line: &str) -> Vec<String> {
-    literals_with_positions(line).into_iter().map(|(_, lit)| lit).collect()
+    literals_with_positions(line)
+        .into_iter()
+        .map(|(_, lit)| lit)
+        .collect()
 }
 
 /// 判断一个字面量是否是资源键（紧跟在 `text::tr(` / `text::trf(` 之后）。
 fn is_resource_key(line: &str, literal_start: usize) -> bool {
     let before = &line[..literal_start];
     let trimmed = before.trim_end();
+    trimmed.ends_with("text::tr(") || trimmed.ends_with("text::trf(")
+}
+
+/// `rustfmt` 会把过长的资源键换到下一行；上一行以 `text::tr(` 结尾时同样视为资源键。
+fn is_wrapped_resource_key(previous_line: &str) -> bool {
+    let trimmed = previous_line.trim_end();
     trimmed.ends_with("text::tr(") || trimmed.ends_with("text::trf(")
 }
 
@@ -85,7 +94,11 @@ fn slint_ui_has_no_hardcoded_chinese_outside_texts() {
         .collect();
     entries.sort();
     for path in entries {
-        let name = path.file_name().expect("文件名").to_string_lossy().to_string();
+        let name = path
+            .file_name()
+            .expect("文件名")
+            .to_string_lossy()
+            .to_string();
         if name == "texts.slint" {
             continue; // 双语资源表本体
         }
@@ -113,16 +126,26 @@ fn rust_ui_code_has_no_hardcoded_chinese_outside_text_module() {
     let mut violations = Vec::new();
     for name in ["session.rs", "view_model.rs"] {
         let path = src.join(name);
+        let source = read(&path);
+        let lines: Vec<&str> = source.lines().collect();
         let mut in_test = false;
-        for (lineno, line) in read(&path).lines().enumerate() {
+        for (lineno, line) in lines.iter().enumerate() {
             if line.contains("#[cfg(test)]") {
                 in_test = true;
             }
             if in_test || line.trim_start().starts_with("//") {
                 continue;
             }
+            let previous = lineno
+                .checked_sub(1)
+                .and_then(|index| lines.get(index))
+                .copied()
+                .unwrap_or_default();
             for (start, lit) in literals_with_positions(line) {
-                if contains_cjk(&lit) && !is_resource_key(line, start) {
+                if contains_cjk(&lit)
+                    && !is_resource_key(line, start)
+                    && !is_wrapped_resource_key(previous)
+                {
                     violations.push(format!("{name}:{} \"{lit}\"", lineno + 1));
                 }
             }

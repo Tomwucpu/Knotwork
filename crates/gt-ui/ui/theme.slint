@@ -1,80 +1,102 @@
-// Knotwork 设计 token（M4.5 UI 专项 S1）。
+// Knotwork 设计 token。
 //
 // 本文件是**唯一**的取色 / 取值来源。任何组件都不得出现裸色值字面量
 // （#RRGGBB）或裸字号 —— review 时以 `grep -E '#[0-9a-fA-F]{6}'` 校验，
-// theme.slint 是唯一允许出现色值的地方。
+// theme.slint 是唯一允许出现色值的地方（图标 SVG 是素材，不在此列）。
 //
-// 配色基调对齐 IDEA New UI：
-//   - 暗色底 `#1e1f22` 与 JetBrains New UI Dark 一致；
-//   - 选中态 / 强调态统一走 accent 系，不再各组件自带一套蓝；
-//   - 状态色（成功 / 警告 / 危险 / diff 增删）按语义命名，明暗各一套。
+// 配色与尺寸对齐 IntelliJ IDEA 2025 New UI：
+//   - 暗色/亮色两套取自本机 IDEA `themes/expUI/expUI_*.theme.json`；
+//   - 日志当前分支底色、行选中色、Git 引用颜色使用 IDEA VCS Log 语义；
+//   - 正文 13px、列表行 24px、工具栏 32px、按钮圆角 8（视觉取 6~8px）。
 
 export global Palette {
     // 由窗口写入（init / 主题切换时），不作为绑定源，避免多窗口绑定冲突。
     in-out property <bool> dark: true;
 
-    // ---- 表面 ----
+    // ---- 表面（Gray1 / Gray2 / Gray3 / Gray4）----
     out property <color> bg: dark ? #1e1f22 : #f7f8fa;
-    out property <color> panel: dark ? #26272b : #eef0f4;
-    out property <color> bar: dark ? #2b2d30 : #e4e7ec;
-    out property <color> line: dark ? #3c3f41 : #d7dbe1;
-    out property <color> hover: dark ? #2f3136 : #e9ecf1;
-    out property <color> border: dark ? #4a4d50 : #c7ccd4;
+    out property <color> panel: dark ? #2b2d30 : #ffffff;
+    out property <color> bar: dark ? #2b2d30 : #f7f8fa;
+    out property <color> line: dark ? #393b40 : #ebecf0;
+    out property <color> border: dark ? #43454a : #dfe1e5;
+    out property <color> hover: dark ? #393b40 : #e9eaec;
+    // 工具窗之间的 1px 分隔：比普通分隔线更深，形成 IDE 的"窗格切分"感。
+    out property <color> toolwindow-border: bg;
+    out property <color> toolwindow-header: panel;
     // 遮罩层底色。
     out property <color> scrim: #00000099;
 
-    // ---- 文本 ----
-    out property <color> text: dark ? #e8eaed : #1f2328;
-    out property <color> text-dim: dark ? #bdc1c6 : #3d4450;
-    out property <color> text-faint: dark ? #8b9198 : #6a7280;
+    // ---- 文本（Gray12 / Gray10 / Gray9）----
+    out property <color> text: dark ? #dfe1e5 : #1e1f22;
+    out property <color> text-dim: dark ? #b4b8bf : #5a5d6b;
+    out property <color> text-faint: dark ? #9da0a8 : #6c707e;
+    // 工具条图标（Gray11）。
+    out property <color> icon: dark ? #ced0d6 : #5a5d6b;
+    out property <color> icon-hover: dark ? #dfe1e5 : #1e1f22;
 
-    // ---- 强调与选中 ----
-    // accent：低饱和底色（侧栏当前分支底、chip 选中底）。
-    out property <color> accent: dark ? #35507a : #d3e3ff;
-    out property <color> accent-text: dark ? #ffffff : #12325e;
-    // accent-strong：高饱和强调（tab 下划线、输入框聚焦描边、主按钮底）。
-    out property <color> accent-strong: dark ? #6b9bd2 : #3574f0;
-    // accent-strong 之上的反白文字（主按钮文字）。
+    // ---- 强调与选中（Blue2 / Blue3 / Blue6）----
+    out property <color> accent: dark ? #35538f : #d4e2ff;
+    out property <color> accent-text: dark ? #ffffff : #1e3a64;
+    out property <color> accent-strong: #3574f0;
     out property <color> on-accent: #ffffff;
-    // 列表行选中底色（Log / 本地更改行共用一个值，不再各写一份）。
-    out property <color> selection: dark ? #35507a : #cfe0ff;
+    // 列表行选中底色（Log / 本地更改行共用）。
+    out property <color> selection: dark ? #2e436e : #d4e2ff;
+    // IDEA VCS Log：当前分支上的提交行底色。
+    out property <color> log-branch-bg: dark ? #283044 : #edf3ff;
+    out property <color> log-ref-fg: dark ? #9da0a8 : #6c707e;
 
-    // ---- 状态色 ----
-    out property <color> green: dark ? #6ee7b7 : #0d7350;
-    out property <color> amber: dark ? #f0b429 : #8a5a00;
-    out property <color> red: dark ? #f2a6ab : #a01b26;
+    // ---- 状态色（IDEA Green / Yellow / Red / Purple）----
+    out property <color> green: dark ? #73bd79 : #369650;
+    out property <color> amber: dark ? #f2c55c : #b57b00;
+    out property <color> red: dark ? #e37774 : #c75450;
+    // Git 引用图标色（VCS Log.GitLog）。
+    out property <color> ref-head: dark ? #f5d273 : #ffaf0f;
+    out property <color> ref-local: dark ? #5fad65 : #369650;
+    out property <color> ref-remote: dark ? #b589ec : #834df0;
+    out property <color> ref-tag: dark ? #868a91 : #6c707e;
 
     // ---- 语义背景 ----
-    out property <color> add-bg: dark ? #1f3a24 : #e6ffed;
-    out property <color> del-bg: dark ? #3a1f22 : #ffeef0;
+    out property <color> add-bg: dark ? #384b3d : #e6ffec;
+    out property <color> del-bg: dark ? #4b3d3d : #ffebe9;
     out property <color> danger-bg: dark ? #5a2a2a : #ffe1e1;
     out property <color> danger-text: dark ? #ffd4d4 : #8b1111;
     out property <color> warn-bg: dark ? #6b5100 : #fff2cc;
     out property <color> warn-text: dark ? #ffe9a8 : #6b4b00;
-    out property <color> seg-changed: dark ? #ffd166 : #a15c00;
+    out property <color> seg-changed: dark ? #d7ba7d : #a15c00;
+
+    // ---- 输入框 / 徽标 ----
+    out property <color> field-bg: dark ? #1e1f22 : #ffffff;
+    out property <color> field-border: dark ? #393b40 : #c9ccd6;
+    out property <color> badge-bg: dark ? #2b2d30 : #ffffff;
+    out property <color> badge-border: dark ? #4e5157 : #c9ccd6;
 
     // ---- 按钮三态（全部按钮共用，不再内联写死）----
     out property <color> btn-bg: bar;
-    out property <color> btn-hover: dark ? #35373a : #dfe3e9;
-    out property <color> btn-pressed: dark ? #3d3f42 : #d0d4da;
+    out property <color> btn-hover: dark ? #35373a : #e9eaec;
+    out property <color> btn-pressed: dark ? #3d3f42 : #dfe1e5;
     out property <color> btn-disabled: dark ? #33353a : #e6e8ec;
+    // IDEA ActionButton 的半透明悬停叠色。
+    out property <color> action-hover: dark ? #ffffff16 : #00000012;
+    out property <color> action-pressed: dark ? #ffffff26 : #0000001d;
 
     // ---- 字体 ----
     out property <string> mono-font: "Consolas";
-    // 字号阶梯：辅助 11 / 正文 12 / 强调 13 / 标题 15 / 大标题 18。
+    out property <string> ui-font: "Segoe UI";
+    // 字号阶梯：元数据 11 / 辅助 12 / 正文 13 / 标题 15 / 大标题 18。
+    out property <length> font-meta: 11px;
     out property <length> font-xs: 11px;
     out property <length> font-sm: 12px;
     out property <length> font-md: 13px;
     out property <length> font-title: 15px;
     out property <length> font-h1: 18px;
-    // 等宽字号沿用 mono-size；正文沿用 body-size（历史别名，保留引用兼容）。
     out property <length> mono-size: font-xs;
-    out property <length> body-size: font-sm;
+    out property <length> body-size: font-md;
 
     // ---- 圆角 ----
-    out property <length> radius-sm: 3px;
-    out property <length> radius: 4px;
-    out property <length> radius-lg: 6px;
+    out property <length> radius-xs: 2px;
+    out property <length> radius-sm: 4px;
+    out property <length> radius: 6px;
+    out property <length> radius-lg: 8px;
 }
 
 // 尺寸与间距常量。
@@ -82,11 +104,22 @@ export global Metrics {
     // 泳道图与列表行高（三条渲染纪律的布局基准，勿随意改动）。
     out property <length> lane-width: 12px;
     out property <length> log-row-height: 24px;
-    out property <length> list-row-height: 22px;
+    out property <length> list-row-height: 24px;
     out property <length> diff-row-height: 18px;
     out property <length> blame-row-height: 22px;
-    out property <length> title-bar-height: 44px;
-    out property <length> panel-bar-height: 30px;
+    out property <length> title-bar-height: 40px;
+    out property <length> panel-bar-height: 32px;
+
+    // 工具窗骨架。
+    out property <length> toolwindow-header-height: 32px;
+    out property <length> toolbar-height: 32px;
+    out property <length> tab-height: 32px;
+    out property <length> icon-size: 16px;
+    out property <length> icon-button: 26px;
+    out property <length> commit-panel-width: 380px;
+    out property <length> details-panel-width: 340px;
+    out property <length> branch-rail-width: 36px;
+    out property <length> branch-tree-width: 196px;
 
     // 间距阶梯：4 / 8 / 12 / 16。
     out property <length> space-1: 4px;

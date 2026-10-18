@@ -13,12 +13,27 @@ export struct RefEntry {
     selected: bool,
     // 0 = 本地分支，1 = 远程分支，2 = 标签
     kind-id: int,
+    // 0 = 分组标题，1 = 引用行
+    row-kind: int,
+    // 引用行在 `ordered_refs` 中的下标；分组标题为 -1
+    ref-index: int,
+    // 0 = HEAD，1 = 本地，2 = 远程，3 = 标签，4 = 其他
+    group: int,
+    count: int,
+    collapsed: bool,
 }
 
 // 泳道图的一列：0 = 空，1 = 竖向连线，2 = 本行节点。
 export struct GraphCell {
     kind: int,
     color: color,
+}
+
+// 日志行上的引用徽标（分支 / 远程分支 / 标签）。
+// kind：0 = HEAD/当前分支，1 = 本地分支，2 = 远程分支，3 = 标签。
+export struct RefBadge {
+    name: string,
+    kind: int,
 }
 
 // 日志列表的一行。
@@ -28,15 +43,29 @@ export struct LogRow {
     author: string,
     when: string,
     refs-text: string,
+    refs: [RefBadge],
+    // 徽标列最多展示两个，其余以 +N 计数。
+    refs-more: int,
     is-selected: bool,
     // FR-LOG-06：我的提交加粗、合并提交置灰。
     is-mine: bool,
     is-merge: bool,
+    // 当前分支可达的提交（IDEA 日志的蓝色分支带）。
+    on-current-branch: bool,
     graph: [GraphCell],
 }
 
 // 本地更改列表的一行。
+//
+// 列表把「已暂存 / 未暂存」分组头与文件行放在同一个 ListView 里：
+// `kind == 1` 是分组头，`row-index == -1`；文件行用 `row-index` 回指
+// `ChangeSet.entries` 的下标，点击时不能再用 ListView 的行号。
 export struct ChangeRow {
+    row-index: int,
+    kind: int,
+    group: int,
+    count: int,
+    collapsed: bool,
     path: string,
     code: string,
     bucket: string,
@@ -137,6 +166,19 @@ export struct CompareRow {
     code: string,
     status: string,
     selected: bool,
+}
+
+// 日志详情栏：提交元数据 + 变更文件清单。
+export struct CommitDetail {
+    visible: bool,
+    subject: string,
+    author: string,
+    email: string,
+    when: string,
+    hash: string,
+    parents: string,
+    files: [CompareRow],
+    selected-file: int,
 }
 
 // Blame 的一行（FR-BLM-02）：行号 + 归因。

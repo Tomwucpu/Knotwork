@@ -5,7 +5,10 @@
 // 行高仍取自 Metrics（虚拟化列表的布局基准）。
 
 import { Palette, Metrics } from "theme.slint";
-import { BlameRow, GraphCell } from "model.slint";
+import { Texts } from "texts.slint";
+import { BlameRow, GraphCell, RefBadge } from "model.slint";
+import { IdeaIcon } from "icons.slint";
+import { IdeaRefBadge } from "widgets.slint";
 
 
 export component LogRowView inherits Rectangle {
@@ -14,8 +17,11 @@ export component LogRowView inherits Rectangle {
     in property <string> author;
     in property <string> when;
     in property <string> refs-text;
+    in property <[RefBadge]> refs;
+    in property <int> refs-more;
     in property <[GraphCell]> graph;
     in property <bool> is-selected;
+    in property <bool> on-current-branch;
     in property <bool> is-mine;
     in property <bool> is-merge;
     callback clicked();
@@ -24,7 +30,7 @@ export component LogRowView inherits Rectangle {
 
     background: root.is-selected
         ? Palette.selection
-        : (touch.has-hover ? Palette.hover : transparent);
+        : (touch.has-hover ? Palette.hover : (root.on-current-branch ? Palette.log-branch-bg : transparent));
 
     HorizontalLayout {
         spacing: 0px;
@@ -61,44 +67,70 @@ export component LogRowView inherits Rectangle {
             }
         }
 
-        Text {
-            width: 58px;
-            text: root.short-id;
-            color: Palette.text-faint;
-            font-size: Palette.font-xs;
-            vertical-alignment: center;
-            font-family: Palette.mono-font;
-        }
-
-        Text {
-            width: 140px;
-            text: root.refs-text;
-            color: Palette.amber;
-            font-size: Palette.font-xs;
-            vertical-alignment: center;
-            overflow: elide;
-        }
+        Rectangle { width: 4px; }
 
         Text {
             horizontal-stretch: 1;
             text: root.subject;
             // FR-LOG-06：合并提交置灰；我的提交加粗。
             color: root.is-merge ? Palette.text-faint : Palette.text;
-            font-size: Palette.body-size;
+            font-size: Palette.font-md;
             font-weight: root.is-mine ? 700 : 400;
             vertical-alignment: center;
             overflow: elide;
         }
 
+        // 引用徽标列：最多显示两个徽标，其余折叠为 +N，避免文字被生硬裁断。
+        Rectangle {
+            width: root.width < 520px ? 96px : 168px;
+            height: 100%;
+            clip: true;
+
+            HorizontalLayout {
+                padding-left: 4px;
+                spacing: 4px;
+
+                for badge in root.refs: IdeaRefBadge {
+                    text: badge.name;
+                    kind: badge.kind;
+                }
+
+                Text {
+                    text: "+" + root.refs-more;
+                    visible: root.refs-more > 0;
+                    color: Palette.text-faint;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        Rectangle {
+            width: 8px;
+            visible: root.width >= 520px;
+        }
+
         Text {
-            width: 180px;
-            text: root.author == "" ? root.when : root.author + "  ·  " + root.when;
+            width: 88px;
+            visible: root.width >= 520px;
+            text: root.author;
+            color: Palette.text-dim;
+            font-size: Palette.font-sm;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            width: root.width < 520px ? 92px : 112px;
+            text: root.when;
             color: Palette.text-faint;
-            font-size: Palette.font-xs;
+            font-size: Palette.font-meta;
             vertical-alignment: center;
             horizontal-alignment: right;
             overflow: elide;
         }
+
+        Rectangle { width: 8px; }
     }
 
     touch := TouchArea {
@@ -188,47 +220,173 @@ export component DiffRowView inherits Rectangle {
 }
 
 
-export component ChangeRowView inherits Rectangle {
+export component CommitFileRowView inherits Rectangle {
     in property <string> path;
     in property <string> code;
-    in property <string> bucket;
-    in property <string> note;
-    in property <bool> is-selected;
-    in property <bool> is-conflict;
+    in property <string> status;
+    in property <bool> selected;
     callback clicked();
 
-    background: root.is-selected
+    height: Metrics.list-row-height;
+    background: root.selected
         ? Palette.selection
         : (touch.has-hover ? Palette.hover : transparent);
 
     HorizontalLayout {
-        padding-left: 8px;
+        padding-left: 6px;
         padding-right: 8px;
-        spacing: 8px;
+        spacing: 6px;
 
-        Text {
-            width: 110px;
-            text: root.bucket;
-            color: root.is-conflict ? Palette.red : Palette.text-faint;
-            font-size: Palette.font-xs;
-            vertical-alignment: center;
-            overflow: elide;
+        IdeaIcon {
+            name: "file";
+            icon-size: 14px;
+            tint: Palette.text-faint;
         }
 
         Text {
-            width: 24px;
+            width: 22px;
             text: root.code;
             color: Palette.amber;
-            font-size: Palette.font-xs;
-            vertical-alignment: center;
+            font-size: Palette.font-meta;
             font-family: Palette.mono-font;
+            vertical-alignment: center;
         }
 
         Text {
             horizontal-stretch: 1;
             text: root.path;
             color: Palette.text;
-            font-size: Palette.body-size;
+            font-size: Palette.font-sm;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            width: 90px;
+            text: root.status;
+            color: Palette.text-faint;
+            font-size: Palette.font-meta;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+
+export component ChangeGroupRowView inherits Rectangle {
+    in property <string> title;
+    in property <int> group;
+    in property <int> count;
+    in property <bool> collapsed;
+    callback toggled();
+    callback action();
+
+    height: 28px;
+    background: touch.has-hover ? Palette.hover : Palette.panel;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 6px;
+        spacing: 6px;
+
+        IdeaIcon {
+            name: root.collapsed ? "chevron-right" : "chevron-down";
+            icon-size: 12px;
+            tint: Palette.text-faint;
+        }
+
+        Text {
+            text: root.title;
+            color: Palette.text;
+            font-size: Palette.font-md;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+
+        Text {
+            text: root.count + Texts.s164;
+            color: Palette.text-faint;
+            font-size: Palette.font-meta;
+            vertical-alignment: center;
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+
+        Rectangle {
+            width: 22px;
+            height: 22px;
+            border-radius: Palette.radius-xs;
+            background: action-touch.has-hover ? Palette.action-hover : transparent;
+
+            IdeaIcon {
+                name: root.group == 0 ? "remove" : "add";
+                icon-size: 14px;
+                tint: Palette.icon;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+
+            action-touch := TouchArea {
+                clicked => { root.action(); }
+            }
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { root.toggled(); }
+    }
+}
+
+
+export component ChangeRowView inherits Rectangle {
+    in property <int> row-index;
+    in property <int> group;
+    in property <string> path;
+    in property <string> code;
+    in property <string> bucket;
+    in property <string> note;
+    in property <bool> is-selected;
+    in property <bool> is-conflict;
+    in property <bool> is-untracked;
+    callback clicked();
+
+    height: Metrics.list-row-height;
+    background: root.is-selected
+        ? Palette.selection
+        : (touch.has-hover ? Palette.hover : transparent);
+
+    HorizontalLayout {
+        padding-left: 30px;
+        padding-right: 8px;
+        spacing: 6px;
+
+        IdeaIcon {
+            name: "file";
+            icon-size: 14px;
+            tint: root.is-selected ? Palette.icon-hover : Palette.text-faint;
+        }
+
+        Text {
+            width: 20px;
+            text: root.code;
+            color: root.is-conflict
+                ? Palette.red
+                : (root.is-untracked ? Palette.text-faint : Palette.amber);
+            font-size: Palette.font-meta;
+            font-family: Palette.mono-font;
+            vertical-alignment: center;
+        }
+
+        Text {
+            horizontal-stretch: 1;
+            text: root.path;
+            color: Palette.text;
+            font-size: Palette.font-md;
             vertical-alignment: center;
             overflow: elide;
         }
@@ -236,9 +394,10 @@ export component ChangeRowView inherits Rectangle {
         Text {
             width: 150px;
             text: root.note;
-            color: Palette.text-faint;
-            font-size: Palette.font-xs;
+            color: root.is-conflict ? Palette.red : Palette.text-faint;
+            font-size: Palette.font-meta;
             vertical-alignment: center;
+            horizontal-alignment: right;
             overflow: elide;
         }
     }

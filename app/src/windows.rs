@@ -394,6 +394,16 @@ impl WindowManager {
 
         let weak = window.as_weak();
         let slot = Rc::clone(state);
+        window.on_select_commit_file(move |index| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.select_commit_file(usize::try_from(index).unwrap_or(0));
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
         window.on_select_change(move |index| {
             if let Some(window) = weak.upgrade() {
                 Self::with_session(&slot, &window, |session| {
@@ -412,6 +422,16 @@ impl WindowManager {
             }
         });
 
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_toggle_ref_group(move |group| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.toggle_ref_group(group);
+                });
+            }
+        });
+
         // ---- 写操作 ----
         let weak = window.as_weak();
         let slot = Rc::clone(state);
@@ -426,6 +446,32 @@ impl WindowManager {
         window.on_unstage_selected(move || {
             if let Some(window) = weak.upgrade() {
                 Self::with_session(&slot, &window, Session::unstage_selected_change);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_stage_all(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::stage_all_changes);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_unstage_all(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::unstage_all_changes);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_toggle_change_group(move |group| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.toggle_change_group(group);
+                });
             }
         });
 
@@ -460,6 +506,14 @@ impl WindowManager {
         window.on_commit(move || {
             if let Some(window) = weak.upgrade() {
                 Self::with_session(&slot, &window, Session::request_commit);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_commit_and_push(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::request_commit_and_push);
             }
         });
 

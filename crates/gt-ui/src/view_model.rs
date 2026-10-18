@@ -18,17 +18,18 @@ use std::collections::BTreeSet;
 use gt_backend::{
     BlameLine, CommandRecord, FileHistoryEntry, PushPreview, RemoteInfo, RemoteListing,
 };
-use gt_core::{ChangeSet, CommitMeta, HeadKind, RefInfo, RefKind, RepoState};
+use gt_core::{ChangeSet, CommitMeta, HeadKind, RefInfo, RefKind, RepoState, StatusBucket};
 use gt_diff::{DiffLine, DiffPayload, FileDiff, LineKind};
 use gt_graph::RowLayout;
 use gt_service::NetworkFailure;
 use slint::{Color, ModelRc, SharedString, VecModel};
 
-use crate::text;
 use crate::generated::{
-    BlameRow, ChangeRow, CompareRow, ConflictFileRow, ConflictRow, ConsoleRow, DiffRow, GraphCell,
-    HistRow, LogRow, PushRow, RebaseStepRow, RecentRow, RefEntry, RemoteRow, StashRow,
+    BlameRow, ChangeRow, CommitDetail, CompareRow, ConflictFileRow, ConflictRow, ConsoleRow,
+    DiffRow, GraphCell, HistRow, LogRow, PushRow, RebaseStepRow, RecentRow, RefBadge, RefEntry,
+    RemoteRow, StashRow,
 };
+use crate::text;
 
 /// 泳道配色（8 色循环）。取自可访问性对比度足够的暗色系。
 const LANE_PALETTE: [u32; 8] = [
@@ -110,7 +111,9 @@ pub fn relative_time(timestamp: i64, now: i64) -> String {
         60..=3599 => text::trf(text::tr("{} 分钟前"), &[&(delta / 60).to_string()]),
         3600..=86_399 => text::trf(text::tr("{} 小时前"), &[&(delta / 3600).to_string()]),
         86_400..=2_591_999 => text::trf(text::tr("{} 天前"), &[&(delta / 86_400).to_string()]),
-        2_592_000..=31_535_999 => text::trf(text::tr("{} 个月前"), &[&(delta / 2_592_000).to_string()]),
+        2_592_000..=31_535_999 => {
+            text::trf(text::tr("{} 个月前"), &[&(delta / 2_592_000).to_string()])
+        }
         _ => text::trf(text::tr("{} 年前"), &[&(delta / 31_536_000).to_string()]),
     }
 }
@@ -153,30 +156,120 @@ pub fn build_log_rows(
     nodes: &[CommitMeta],
     layouts: &[RowLayout],
     refs_of: &[String],
+    refs: &[RefInfo],
     selected: Option<usize>,
     now: i64,
     my_email: Option<&str>,
 ) -> Vec<LogRow> {
     let count = nodes.len().min(layouts.len());
+    // 当前分支带：从 HEAD 指向的提交出发，沿已加载节点的父边取可达集。
+    let mut reachable = std::collections::HashSet::new();
+    if let Some(head) = refs.iter().find(|info| info.is_head) {
+        let by_id: std::collections::HashMap<gt_core::Oid, &CommitMeta> =
+            nodes.iter().map(|node| (node.id, node)).collect();
+        let mut stack = vec![head.target];
+        while let Some(id) = stack.pop() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            if let Some(node) = by_id.get(&id) {
+                stack.extend(node.parents.iter().copied());
+            }
+        }
+    }
     let mut rows = Vec::with_capacity(count);
     for index in 0..count {
         let node = &nodes[index];
         let is_mine = my_email.is_some_and(|email| {
             !email.is_empty() && node.author_email.eq_ignore_ascii_case(email)
         });
+        let badges = build_ref_badges(refs, node.id);
+        let refs_more = i32::try_from(badges.len().saturating_sub(2)).unwrap_or(i32::MAX);
         rows.push(LogRow {
             short_id: SharedString::from(node.short_id()),
             subject: SharedString::from(node.summary.as_str()),
             author: SharedString::from(node.author_name.as_str()),
             when: SharedString::from(relative_time(node.author_time, now)),
             refs_text: SharedString::from(refs_of.get(index).map_or("", String::as_str)),
+            refs: rc_model(badges.into_iter().take(2).collect::<Vec<_>>()),
+            refs_more,
             is_selected: selected == Some(index),
             is_mine,
             is_merge: node.is_merge(),
+            on_current_branch: reachable.contains(&node.id),
             graph: rc_model(build_graph_cells(&layouts[index])),
         });
     }
     rows
+}
+
+/// 把引用对齐到某个提交，按 HEAD / 本地 / 远程 / 标签排序。
+fn build_ref_badges(refs: &[RefInfo], target: gt_core::Oid) -> Vec<RefBadge> {
+    let mut badges: Vec<RefBadge> = refs
+        .iter()
+        .filter(|info| info.target == target)
+        .map(|info| RefBadge {
+            name: SharedString::from(info.name.as_str()),
+            kind: if info.is_head {
+                0
+            } else {
+                match info.kind {
+                    RefKind::LocalBranch | RefKind::Other => 1,
+                    RefKind::RemoteBranch => 2,
+                    RefKind::Tag => 3,
+                }
+            },
+        })
+        .collect();
+    badges.sort_by(|a, b| {
+        a.kind
+            .cmp(&b.kind)
+            .then_with(|| a.name.as_str().cmp(b.name.as_str()))
+    });
+    badges
+}
+
+/// 详情栏的空状态。
+#[must_use]
+pub fn empty_commit_detail() -> CommitDetail {
+    CommitDetail {
+        visible: false,
+        subject: SharedString::new(),
+        author: SharedString::new(),
+        email: SharedString::new(),
+        when: SharedString::new(),
+        hash: SharedString::new(),
+        parents: SharedString::new(),
+        files: rc_model(Vec::new()),
+        selected_file: -1,
+    }
+}
+
+/// 构造日志详情栏的提交信息与文件清单。
+#[must_use]
+pub fn build_commit_detail(
+    commit: &CommitMeta,
+    files: &[gt_core::FileChange],
+    selected: Option<usize>,
+    now: i64,
+) -> CommitDetail {
+    let parents = commit
+        .parents
+        .iter()
+        .map(|id| id.to_hex().chars().take(7).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(", ");
+    CommitDetail {
+        visible: true,
+        subject: SharedString::from(commit.summary.as_str()),
+        author: SharedString::from(commit.author_name.as_str()),
+        email: SharedString::from(commit.author_email.as_str()),
+        when: SharedString::from(relative_time(commit.author_time, now)),
+        hash: SharedString::from(commit.id.to_hex()),
+        parents: SharedString::from(parents),
+        files: rc_model(build_compare_rows(files, selected)),
+        selected_file: selected.map_or(-1, |index| i32::try_from(index).unwrap_or(i32::MAX)),
+    }
 }
 
 /// 把差异载荷拆成界面行。
@@ -215,11 +308,16 @@ pub fn build_diff_rows(diff: &FileDiff, selected: &BTreeSet<usize>) -> Vec<DiffR
                 }
             }
         }
-        DiffPayload::Binary => rows.push(placeholder_row(text::tr("（二进制文件，不显示内容差异）"))),
+        DiffPayload::Binary => {
+            rows.push(placeholder_row(text::tr("（二进制文件，不显示内容差异）")));
+        }
         DiffPayload::TooLarge {
             old_bytes,
             new_bytes,
-        } => rows.push(placeholder_row(&text::trf(text::tr("（文件过大，已跳过差异计算：旧 {} 字节 / 新 {} 字节）"), &[&old_bytes.to_string(), &new_bytes.to_string()]))),
+        } => rows.push(placeholder_row(&text::trf(
+            text::tr("（文件过大，已跳过差异计算：旧 {} 字节 / 新 {} 字节）"),
+            &[&old_bytes.to_string(), &new_bytes.to_string()],
+        ))),
         DiffPayload::Empty => rows.push(placeholder_row(text::tr("（两侧内容相同或为空）"))),
     }
 
@@ -285,73 +383,174 @@ fn diff_row(line: &DiffLine) -> DiffRow {
 }
 
 /// 构造本地更改行。
+///
+/// 「已暂存 / 未暂存」分组头与文件行共用同一个列表模型（kind：
+/// 0 = 文件，1 = 分组头），这样 `ListView` 仍是唯一滚动容器，虚拟化不受影响。
+/// 文件行的 `row-index` 回指 `ChangeSet.entries` 下标；分组头为 -1。
 #[must_use]
-pub fn build_change_rows(changes: &ChangeSet, selected: Option<usize>) -> Vec<ChangeRow> {
-    changes
-        .entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            let is_untracked = entry.index == gt_core::StatusFlag::Untracked
-                || entry.worktree == gt_core::StatusFlag::Untracked;
-            ChangeRow {
-                path: SharedString::from(entry.porcelain_path()),
-                code: SharedString::from(match entry.conflict {
-                    Some(kind) => {
-                        let (x, y) = kind.code();
-                        format!("{x}{y}")
-                    }
-                    None => format!("{}{}", entry.index.letter(), entry.worktree.letter()),
-                }),
-                bucket: SharedString::from(entry.bucket().label()),
-                note: SharedString::from(match entry.conflict {
-                    Some(kind) => kind.label().to_owned(),
-                    None => entry
-                        .old_path
-                        .as_ref()
-                        .map_or_else(String::new, |old| text::trf("原路径 {}", &[old])),
-                }),
-                is_selected: selected == Some(index),
-                is_conflict: entry.is_conflicted(),
-                is_untracked,
-            }
-        })
-        .collect()
+pub fn build_change_rows(
+    changes: &ChangeSet,
+    selected: Option<usize>,
+    staged_collapsed: bool,
+    unstaged_collapsed: bool,
+) -> Vec<ChangeRow> {
+    let mut staged = Vec::new();
+    let mut unstaged = Vec::new();
+    for (index, entry) in changes.entries.iter().enumerate() {
+        if entry.bucket() == StatusBucket::Staged {
+            staged.push(index);
+        } else {
+            // 冲突、未跟踪、工作区修改都归入「未暂存」；与 IDEA 的分组口径一致。
+            unstaged.push(index);
+        }
+    }
+
+    let mut rows = Vec::with_capacity(staged.len() + unstaged.len() + 2);
+    push_change_group(&mut rows, changes, &staged, 0, staged_collapsed, selected);
+    push_change_group(
+        &mut rows,
+        changes,
+        &unstaged,
+        1,
+        unstaged_collapsed,
+        selected,
+    );
+    rows
+}
+
+fn push_change_group(
+    rows: &mut Vec<ChangeRow>,
+    changes: &ChangeSet,
+    indices: &[usize],
+    group: i32,
+    collapsed: bool,
+    selected: Option<usize>,
+) {
+    let count = i32::try_from(indices.len()).unwrap_or(i32::MAX);
+    rows.push(ChangeRow {
+        row_index: -1,
+        kind: 1,
+        group,
+        count,
+        collapsed,
+        path: SharedString::new(),
+        code: SharedString::new(),
+        bucket: SharedString::new(),
+        note: SharedString::new(),
+        is_selected: false,
+        is_conflict: false,
+        is_untracked: false,
+    });
+    if collapsed {
+        return;
+    }
+    for &index in indices {
+        let entry = &changes.entries[index];
+        let is_untracked = entry.index == gt_core::StatusFlag::Untracked
+            || entry.worktree == gt_core::StatusFlag::Untracked;
+        rows.push(ChangeRow {
+            row_index: i32::try_from(index).unwrap_or(i32::MAX),
+            kind: 0,
+            group,
+            count,
+            collapsed: false,
+            path: SharedString::from(entry.porcelain_path()),
+            code: SharedString::from(match entry.conflict {
+                Some(kind) => {
+                    let (x, y) = kind.code();
+                    format!("{x}{y}")
+                }
+                None => format!("{}{}", entry.index.letter(), entry.worktree.letter()),
+            }),
+            bucket: SharedString::from(entry.bucket().label()),
+            note: SharedString::from(match entry.conflict {
+                Some(kind) => kind.label().to_owned(),
+                None => entry
+                    .old_path
+                    .as_ref()
+                    .map_or_else(String::new, |old| text::trf("原路径 {}", &[old])),
+            }),
+            is_selected: selected == Some(index),
+            is_conflict: entry.is_conflicted(),
+            is_untracked,
+        });
+    }
 }
 
 /// 构造引用列表行。
 ///
-/// 头部（当前分支）排最前，其余按 `gt-core` 的分组顺序与名称排列，
-/// 与侧栏"分支与标签"的阅读顺序一致。
+/// 按 HEAD / 本地 / 远程 / 标签 / 其他分组；分组标题与引用行共用
+/// 一个模型，引用行的 `ref_index` 始终按 [`ordered_refs`] 的下标解释。
 #[must_use]
-pub fn build_ref_rows(refs: &[RefInfo], selected: Option<usize>) -> Vec<RefEntry> {
-    // 先按"是否头指针 / 类别 / 名称"排序，再统一发 selected 标记：
-    // 选择下标是**排序后**的下标，否则点一行会选中另一行。
-    let mut order: Vec<&RefInfo> = refs.iter().collect();
-    order.sort_by(|a, b| {
-        b.is_head
-            .cmp(&a.is_head)
-            .then_with(|| a.kind.group_order().cmp(&b.kind.group_order()))
-            .then_with(|| a.name.cmp(&b.name))
-    });
+pub fn build_ref_rows(
+    refs: &[RefInfo],
+    selected: Option<usize>,
+    collapsed: &[bool; 5],
+) -> Vec<RefEntry> {
+    const HEAD_GROUP: usize = 0;
+    const LOCAL_GROUP: usize = 1;
 
-    order
-        .into_iter()
-        .enumerate()
-        .map(|(index, info)| RefEntry {
-            name: SharedString::from(info.name.as_str()),
-            kind: SharedString::from(info.kind.group_label()),
-            is_head: info.is_head,
-            sync: SharedString::from(info.sync_summary().unwrap_or_default()),
-            selected: selected == Some(index),
-            kind_id: match info.kind {
-                RefKind::LocalBranch => 0,
-                RefKind::RemoteBranch => 1,
-                RefKind::Tag => 2,
-                RefKind::Other => 3,
-            },
-        })
-        .collect()
+    let ordered = ordered_refs(refs);
+    let mut buckets: [Vec<usize>; 5] = std::array::from_fn(|_| Vec::new());
+    for (index, info) in ordered.iter().enumerate() {
+        let group = if info.is_head {
+            HEAD_GROUP
+        } else {
+            match info.kind {
+                RefKind::LocalBranch => LOCAL_GROUP,
+                RefKind::RemoteBranch => 2,
+                RefKind::Tag => 3,
+                RefKind::Other => 4,
+            }
+        };
+        buckets[group].push(index);
+    }
+
+    let mut rows =
+        Vec::with_capacity(ordered.len() + buckets.iter().filter(|b| !b.is_empty()).count());
+    for (group, indices) in buckets.iter().enumerate() {
+        if indices.is_empty() {
+            continue;
+        }
+        rows.push(RefEntry {
+            name: SharedString::default(),
+            kind: SharedString::default(),
+            is_head: false,
+            sync: SharedString::default(),
+            selected: false,
+            kind_id: -1,
+            row_kind: 0,
+            ref_index: -1,
+            group: i32::try_from(group).unwrap_or(i32::MAX),
+            count: i32::try_from(indices.len()).unwrap_or(i32::MAX),
+            collapsed: collapsed[group],
+        });
+        if collapsed[group] {
+            continue;
+        }
+        for &index in indices {
+            let info = &ordered[index];
+            rows.push(RefEntry {
+                name: SharedString::from(info.name.as_str()),
+                kind: SharedString::from(info.kind.group_label()),
+                is_head: info.is_head,
+                sync: SharedString::from(info.sync_summary().unwrap_or_default()),
+                selected: selected == Some(index),
+                kind_id: match info.kind {
+                    RefKind::LocalBranch => 0,
+                    RefKind::RemoteBranch => 1,
+                    RefKind::Tag => 2,
+                    RefKind::Other => 3,
+                },
+                row_kind: 1,
+                ref_index: i32::try_from(index).unwrap_or(i32::MAX),
+                group: i32::try_from(group).unwrap_or(i32::MAX),
+                count: 0,
+                collapsed: false,
+            });
+        }
+    }
+    rows
 }
 
 /// 按排序后的顺序取引用（与 [`build_ref_rows`] 的下标语义一致）。
@@ -474,14 +673,20 @@ pub fn diff_selection_hint(selected: usize, selectable: bool, staged_view: bool)
 pub fn discard_confirmation(paths: &[String], untracked: bool) -> (String, String) {
     let listed = paths.iter().take(8).cloned().collect::<Vec<_>>().join("\n");
     let more = if paths.len() > 8 {
-        text::trf(text::tr("\n…以及另外 {} 个路径"), &[&(paths.len() - 8).to_string()])
+        text::trf(
+            text::tr("\n…以及另外 {} 个路径"),
+            &[&(paths.len() - 8).to_string()],
+        )
     } else {
         String::new()
     };
 
     if untracked {
         (
-            text::trf(text::tr("永久删除 {} 个未跟踪路径？"), &[&paths.len().to_string()]),
+            text::trf(
+                text::tr("永久删除 {} 个未跟踪路径？"),
+                &[&paths.len().to_string()],
+            ),
             format!(
                 "这些路径从未被 Git 跟踪，删除后无法通过 Git 恢复：\n\n{listed}{more}\n\n\
                  替代做法：若只是不想看到它们，用「加入 .gitignore」。"
@@ -489,7 +694,10 @@ pub fn discard_confirmation(paths: &[String], untracked: bool) -> (String, Strin
         )
     } else {
         (
-            text::trf(text::tr("丢弃 {} 个文件的未提交修改？"), &[&paths.len().to_string()]),
+            text::trf(
+                text::tr("丢弃 {} 个文件的未提交修改？"),
+                &[&paths.len().to_string()],
+            ),
             format!(
                 "工作区中的这些修改将被还原为索引中的内容，此操作不可撤销：\n\n{listed}{more}\n\n\
                  替代做法：先「暂存」再提交，或先复制文件备份。"
@@ -555,7 +763,10 @@ pub fn build_remote_rows(remotes: &[RemoteInfo], selected: Option<usize>) -> Vec
 pub fn push_preview_text(preview: &PushPreview) -> String {
     let mut text = preview.summary();
     if preview.truncated {
-        text += &text::trf(text::tr("（仅列出前 {} 条）"), &[&preview.commits.len().to_string()]);
+        text += &text::trf(
+            text::tr("（仅列出前 {} 条）"),
+            &[&preview.commits.len().to_string()],
+        );
     }
     text
 }
@@ -565,7 +776,10 @@ pub fn push_preview_text(preview: &PushPreview) -> String {
 pub fn push_hints(preview: &PushPreview, force: bool) -> String {
     let mut lines: Vec<String> = Vec::new();
     if let Some(pattern) = preview.protection.as_deref() {
-        lines.push(text::trf("该分支命中受保护规则「{}」：禁止强制推送（普通推送不受影响）。", &[pattern]));
+        lines.push(text::trf(
+            "该分支命中受保护规则「{}」：禁止强制推送（普通推送不受影响）。",
+            &[pattern],
+        ));
     }
     if preview.needs_update_first() {
         lines.push(text::trf(
@@ -614,7 +828,10 @@ pub fn credential_help(listing: &RemoteListing, stored_hosts: &[String]) -> Stri
     } else if stored_hosts.is_empty() {
         parts.push(text::tr("尚未保存任何 token").to_owned());
     } else {
-        parts.push(text::trf(text::tr("已保存 token 的主机：{}"), &[&stored_hosts.join("、")]));
+        parts.push(text::trf(
+            text::tr("已保存 token 的主机：{}"),
+            &[&stored_hosts.join("、")],
+        ));
     }
     parts.join(" · ")
 }
@@ -622,9 +839,9 @@ pub fn credential_help(listing: &RemoteListing, stored_hosts: &[String]) -> Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_text, build_change_rows, build_console_rows, build_diff_rows, build_graph_cells,
-        build_log_rows, build_push_rows, build_ref_rows, build_remote_rows, credential_help,
-        diff_selection_hint, discard_confirmation, discard_selection_confirmation,
+        branch_text, build_change_rows, build_commit_detail, build_console_rows, build_diff_rows,
+        build_graph_cells, build_log_rows, build_push_rows, build_ref_rows, build_remote_rows,
+        credential_help, diff_selection_hint, discard_confirmation, discard_selection_confirmation,
         network_error_text, ordered_refs, push_hints, push_preview_text, relative_time,
         state_banner,
     };
@@ -711,21 +928,42 @@ mod tests {
             .collect();
 
         let refs = vec!["HEAD -> main".to_owned(), String::new()];
-        let rows = build_log_rows(&nodes, &layouts, &refs, Some(1), 1_700_000_200, None);
+        let ref_infos = vec![RefInfo {
+            name: "main".to_owned(),
+            kind: RefKind::LocalBranch,
+            target: nodes[0].id,
+            is_head: true,
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+        }];
+        let rows = build_log_rows(
+            &nodes,
+            &layouts,
+            &refs,
+            &ref_infos,
+            Some(1),
+            1_700_000_200,
+            None,
+        );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].subject.as_str(), "第一个提交");
         assert!(rows[1].is_selected);
         assert!(!rows[0].is_selected);
         assert_eq!(rows[0].when.as_str(), "3 分钟前");
         assert_eq!(rows[0].refs_text.as_str(), "HEAD -> main");
+        assert_eq!(rows[0].refs.row_count(), 1);
+        assert_eq!(rows[0].refs.row_data(0).expect("badge").kind, 0);
         assert!(!rows[0].is_mine, "未提供身份时不得标记为本人提交");
+        assert!(rows[0].on_current_branch, "HEAD 所在提交应带分支底色");
+        assert!(!rows[1].on_current_branch, "没有父边时不可达");
 
         // 长度不齐时按最短截断，绝不越界。
-        let short = build_log_rows(&nodes, &layouts[..1], &refs, None, 0, None);
+        let short = build_log_rows(&nodes, &layouts[..1], &refs, &ref_infos, None, 0, None);
         assert_eq!(short.len(), 1);
         let empty_refs: Vec<String> = Vec::new();
         assert_eq!(
-            build_log_rows(&nodes, &layouts, &empty_refs, None, 0, None).len(),
+            build_log_rows(&nodes, &layouts, &empty_refs, &ref_infos, None, 0, None).len(),
             2
         );
     }
@@ -754,6 +992,7 @@ mod tests {
             &nodes,
             &layouts,
             &[],
+            &[],
             None,
             1_700_000_100,
             Some("Z@example.com"),
@@ -762,6 +1001,127 @@ mod tests {
         assert!(!rows[0].is_merge);
         assert!(rows[1].is_merge, "双父提交必须标记为合并");
         assert!(!rows[1].is_mine);
+    }
+
+    #[test]
+    fn log_rows_color_the_current_branch_chain() {
+        let mut head = commit(1, "头提交", 1_700_000_300);
+        head.parents = vec![Oid::from_bytes(&[2; 20]).expect("Oid")];
+        let mut parent = commit(2, "父提交", 1_700_000_200);
+        parent.parents = vec![Oid::from_bytes(&[3; 20]).expect("Oid")];
+        let root = commit(3, "根提交", 1_700_000_100);
+        let side = commit(4, "旁支提交", 1_700_000_050);
+        let nodes = vec![head, parent, root, side];
+
+        let mut layout = LaneLayout::new();
+        let layouts: Vec<gt_graph::RowLayout> = nodes
+            .iter()
+            .map(|meta| {
+                layout.push(&gt_core::LogNode {
+                    id: meta.id,
+                    parents: meta.parents.clone(),
+                })
+            })
+            .collect();
+        let refs = vec![RefInfo {
+            name: "main".to_owned(),
+            kind: RefKind::LocalBranch,
+            target: nodes[0].id,
+            is_head: true,
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+        }];
+
+        let rows = build_log_rows(&nodes, &layouts, &[], &refs, None, 1_700_000_400, None);
+        assert!(rows[0].on_current_branch);
+        assert!(rows[1].on_current_branch, "沿父边可达的提交都属于当前分支");
+        assert!(rows[2].on_current_branch);
+        assert!(!rows[3].on_current_branch, "旁支提交不应带当前分支底色");
+    }
+
+    #[test]
+    fn log_rows_cap_ref_badges_at_two() {
+        let node = commit(1, "多引用提交", 1_700_000_000);
+        let nodes = vec![node.clone()];
+        let mut layout = LaneLayout::new();
+        let layouts = vec![layout.push(&gt_core::LogNode {
+            id: node.id,
+            parents: Vec::new(),
+        })];
+        let refs = vec![
+            RefInfo {
+                name: "main".to_owned(),
+                kind: RefKind::LocalBranch,
+                target: node.id,
+                is_head: true,
+                upstream: None,
+                ahead: 0,
+                behind: 0,
+            },
+            RefInfo {
+                name: "feature".to_owned(),
+                kind: RefKind::LocalBranch,
+                target: node.id,
+                is_head: false,
+                upstream: None,
+                ahead: 0,
+                behind: 0,
+            },
+            RefInfo {
+                name: "origin/main".to_owned(),
+                kind: RefKind::RemoteBranch,
+                target: node.id,
+                is_head: false,
+                upstream: None,
+                ahead: 0,
+                behind: 0,
+            },
+            RefInfo {
+                name: "v1.0".to_owned(),
+                kind: RefKind::Tag,
+                target: node.id,
+                is_head: false,
+                upstream: None,
+                ahead: 0,
+                behind: 0,
+            },
+        ];
+
+        let rows = build_log_rows(&nodes, &layouts, &[], &refs, None, 1_700_000_100, None);
+        assert_eq!(rows[0].refs.row_count(), 2, "徽标列最多两个");
+        assert_eq!(rows[0].refs_more, 2, "剩余引用折叠为 +N");
+        let badges = values(&rows[0].refs);
+        assert_eq!(badges[0].kind, 0, "HEAD 优先");
+        assert_eq!(badges[1].name.as_str(), "feature");
+    }
+
+    #[test]
+    fn commit_detail_lists_metadata_and_files() {
+        let mut tip = commit(1, "主题提交", 1_700_000_000);
+        tip.author_name = "李四".to_owned();
+        tip.author_email = "l@example.com".to_owned();
+        tip.parents = vec![
+            Oid::from_bytes(&[2; 20]).expect("Oid"),
+            Oid::from_bytes(&[3; 20]).expect("Oid"),
+        ];
+        let files = vec![
+            FileChange::new("README.md", ChangeKind::Added),
+            FileChange::new("src/main.rs", ChangeKind::Modified),
+        ];
+
+        let detail = build_commit_detail(&tip, &files, Some(1), 1_700_000_060);
+        assert!(detail.visible);
+        assert_eq!(detail.subject.as_str(), "主题提交");
+        assert_eq!(detail.author.as_str(), "李四");
+        assert_eq!(detail.email.as_str(), "l@example.com");
+        assert_eq!(detail.when.as_str(), "1 分钟前");
+        assert_eq!(detail.parents.as_str(), "0202020, 0303030");
+        assert_eq!(detail.files.row_count(), 2);
+        assert_eq!(detail.selected_file, 1);
+        let rows = values(&detail.files);
+        assert_eq!(rows[0].code.as_str(), "A");
+        assert!(rows[1].selected);
     }
 
     #[test]
@@ -870,27 +1230,50 @@ mod tests {
             StatusEntry::new("s.txt", StatusFlag::Added, StatusFlag::Unmodified),
             StatusEntry::new("m.txt", StatusFlag::Unmodified, StatusFlag::Modified),
         ]);
-        let rows = build_change_rows(&set, Some(0));
-        assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0].code.as_str(), "UU");
-        assert_eq!(rows[0].bucket.as_str(), "冲突");
-        assert!(rows[0].is_conflict);
-        assert!(rows[0].is_selected);
+        let rows = build_change_rows(&set, Some(0), false, false);
+        assert_eq!(rows.len(), 6, "2 个分组头 + 4 个文件行");
+        // 已暂存组：头 + s.txt；未暂存组：头 + c.txt + u.txt + m.txt。
+        assert_eq!(rows[0].kind, 1);
+        assert_eq!(rows[0].count, 1);
+        assert_eq!(rows[1].row_index, 2);
+        assert_eq!(rows[1].code.as_str(), "A ");
+        assert_eq!(rows[2].kind, 1);
+        assert_eq!(rows[2].count, 3);
+        assert_eq!(rows[3].row_index, 0);
+        assert_eq!(rows[3].code.as_str(), "UU");
+        assert_eq!(rows[3].bucket.as_str(), "冲突");
+        assert!(rows[3].is_conflict);
+        assert!(rows[3].is_selected);
         assert!(
-            rows[1].is_untracked,
+            rows[4].is_untracked,
             "未跟踪条目要能触发「删除 / 忽略」按钮"
         );
-        assert!(!rows[2].is_untracked);
-        assert!(!rows[3].is_selected);
+        assert!(!rows[5].is_untracked);
+        assert!(!rows[5].is_selected);
+    }
+
+    #[test]
+    fn change_rows_collapse_keeps_group_header() {
+        let set = ChangeSet::new(vec![StatusEntry::new(
+            "a.txt",
+            StatusFlag::Modified,
+            StatusFlag::Unmodified,
+        )]);
+        let rows = build_change_rows(&set, None, true, true);
+        assert_eq!(rows.len(), 2, "折叠后只保留两个分组头");
+        assert!(rows.iter().all(|row| row.kind == 1 && row.collapsed));
+        assert_eq!(rows[0].count, 1);
+        assert_eq!(rows[1].count, 0);
     }
 
     #[test]
     fn change_rows_show_old_path_for_renames() {
         let mut entry = StatusEntry::new("b.rs", StatusFlag::Renamed, StatusFlag::Unmodified);
         entry.old_path = Some("a.rs".to_owned());
-        let rows = build_change_rows(&ChangeSet::new(vec![entry]), None);
-        assert_eq!(rows[0].path.as_str(), "a.rs -> b.rs");
-        assert!(rows[0].note.as_str().contains("a.rs"));
+        let rows = build_change_rows(&ChangeSet::new(vec![entry]), None, false, false);
+        let file = rows.iter().find(|row| row.kind == 0).expect("文件行");
+        assert_eq!(file.path.as_str(), "a.rs -> b.rs");
+        assert!(file.note.as_str().contains("a.rs"));
     }
 
     #[test]
@@ -915,19 +1298,36 @@ mod tests {
                 behind: 1,
             },
         ];
-        let rows = build_ref_rows(&refs, Some(1));
-        assert_eq!(rows[0].name.as_str(), "main");
-        assert!(rows[0].is_head);
-        assert!(!rows[0].sync.is_empty(), "有上游时应给出同步摘要");
-        assert!(!rows[0].selected);
-        assert!(rows[1].selected, "选择下标按排序后的顺序解释");
+        let rows = build_ref_rows(&refs, Some(1), &[false; 5]);
+        assert_eq!(rows.len(), 4, "HEAD / 标签 两组标题 + 两条引用");
+        assert_eq!(rows[0].row_kind, 0);
+        assert_eq!(rows[0].group, 0);
+        assert_eq!(rows[0].count, 1);
+        assert_eq!(rows[0].ref_index, -1);
+        assert_eq!(rows[1].name.as_str(), "main");
+        assert!(rows[1].is_head);
+        assert_eq!(rows[1].ref_index, 0);
+        assert!(!rows[1].sync.is_empty(), "有上游时应给出同步摘要");
+        assert!(!rows[1].selected);
+        assert_eq!(rows[2].row_kind, 0);
+        assert_eq!(rows[2].group, 3, "标签组");
+        assert!(rows[3].selected, "选择下标按排序后的顺序解释");
+        assert_eq!(rows[3].ref_index, 1);
 
         // `ordered_refs` 必须与 `build_ref_rows` 的下标语义一致。
         let ordered = ordered_refs(&refs);
         assert_eq!(ordered[0].name, "main");
         assert_eq!(ordered[1].name, "v1.0");
-        assert_eq!(rows[0].kind_id, 0);
-        assert_eq!(rows[1].kind_id, 2);
+        assert_eq!(rows[1].kind_id, 0);
+        assert_eq!(rows[3].kind_id, 2);
+
+        // 折叠标签组后只保留标题行，引用下标语义不变。
+        let mut collapsed = [false; 5];
+        collapsed[3] = true;
+        let folded = build_ref_rows(&refs, Some(1), &collapsed);
+        assert_eq!(folded.len(), 3);
+        assert!(folded[2].collapsed);
+        assert_eq!(folded[1].ref_index, 0);
     }
 
     #[test]
@@ -1558,11 +1958,7 @@ mod advanced_tests {
 ///
 /// 提交显示短哈希（前 8 位）；未提交行（全零提交）显示"未提交"。
 #[must_use]
-pub fn build_blame_rows(
-    rows: &[BlameLine],
-    selected: Option<usize>,
-    now: i64,
-) -> Vec<BlameRow> {
+pub fn build_blame_rows(rows: &[BlameLine], selected: Option<usize>, now: i64) -> Vec<BlameRow> {
     rows.iter()
         .enumerate()
         .map(|(index, row)| {
