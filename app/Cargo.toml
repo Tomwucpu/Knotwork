@@ -24,6 +24,7 @@ gt-config.workspace = true
 gt-ui.workspace = true
 crossbeam-channel.workspace = true
 slint.workspace = true
+rfd.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

@@ -588,16 +588,91 @@ pub fn build_console_rows(records: &[CommandRecord]) -> Vec<ConsoleRow> {
         .collect()
 }
 
+/// 最近仓库头像配色（8 色循环）。与泳道色一样，选对比度足够、彼此可区分的色相。
+const RECENT_AVATAR_PALETTE: [u32; 8] = [
+    0xff5b_8def, // 蓝
+    0xff7c_5cf0, // 紫
+    0xff3f_bfae, // 青绿
+    0xfff2_9a3d, // 橙
+    0xffe0_5a6a, // 红
+    0xff4c_af7a, // 绿
+    0xff2f_a8c9, // 蓝绿
+    0xffa2_6b3f, // 棕
+];
+
 /// 构造最近仓库行。
 #[must_use]
 pub fn build_recent_rows(recent: &[gt_config::RecentRepo]) -> Vec<RecentRow> {
     recent
         .iter()
-        .map(|entry| RecentRow {
-            name: SharedString::from(entry.display_name()),
-            path: SharedString::from(entry.path.display().to_string()),
+        .map(|entry| {
+            let path = entry.path.display().to_string();
+            RecentRow {
+                name: SharedString::from(entry.display_name()),
+                initials: SharedString::from(recent_initials(&entry.display_name())),
+                accent: recent_avatar_color(&path),
+                path: SharedString::from(path),
+            }
         })
         .collect()
+}
+
+/// 从仓库名提取头像字母（IDEA 风格）。
+///
+/// 按分隔符（`-`、`_`、空格、点等）与驼峰边界切词，取前两词首字母；
+/// 只有单个词时取一个字母（`Knotwork` → `K`，`ListaryProKit` → `LP`）。
+#[must_use]
+pub fn recent_initials(name: &str) -> String {
+    let mut letters: Vec<char> = Vec::new();
+    let mut word_start = true;
+    let mut prev_lower = false;
+    for ch in name.chars() {
+        if ch.is_alphanumeric() {
+            if word_start || (ch.is_uppercase() && prev_lower) {
+                if let Some(upper) = ch.to_uppercase().next() {
+                    letters.push(upper);
+                }
+            }
+            word_start = false;
+            prev_lower = ch.is_lowercase() || ch.is_numeric();
+        } else {
+            word_start = true;
+            prev_lower = false;
+        }
+    }
+
+    let take = if letters.len() >= 2 { 2 } else { 1 };
+    let initials: String = letters.into_iter().take(take).collect();
+    if initials.is_empty() {
+        name.chars()
+            .find(|ch| ch.is_alphanumeric())
+            .map_or_else(|| "?".to_owned(), |ch| ch.to_uppercase().to_string())
+    } else {
+        initials
+    }
+}
+
+/// 头像底色：按路径散列固定（同一仓库每次打开颜色一致）。
+#[must_use]
+pub fn recent_avatar_color(path: &str) -> Color {
+    let index = (fnv1a(path) as usize) % RECENT_AVATAR_PALETTE.len();
+    let argb = RECENT_AVATAR_PALETTE[index];
+    Color::from_argb_u8(
+        0xff,
+        u8::try_from((argb >> 16) & 0xff).unwrap_or(0),
+        u8::try_from((argb >> 8) & 0xff).unwrap_or(0),
+        u8::try_from(argb & 0xff).unwrap_or(0),
+    )
+}
+
+/// FNV-1a 64 位散列：稳定、无依赖，只用来给头像挑色。
+fn fnv1a(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// 仓库状态的横幅文案（FR-STA-02）。
@@ -1840,9 +1915,10 @@ pub fn take_side_confirmation(path: &str, side: &str) -> (String, String, bool) 
 #[cfg(test)]
 mod advanced_tests {
     use super::{
-        build_compare_rows, build_conflict_rows, build_rebase_step_rows, build_stash_rows,
-        conflict_summary, rebase_action_code, rebase_action_from_code, reset_confirmation,
-        resolution_from_code, resolve_code,
+        build_compare_rows, build_conflict_rows, build_rebase_step_rows, build_recent_rows,
+        build_stash_rows, conflict_summary, rebase_action_code, rebase_action_from_code,
+        recent_avatar_color, recent_initials, reset_confirmation, resolution_from_code,
+        resolve_code,
     };
     use gt_backend::{RebaseAction, RebasePlan, RebaseStep, ResetMode, StashEntry};
     use gt_core::{ChangeKind, FileChange};
@@ -1951,6 +2027,33 @@ mod advanced_tests {
         assert!(title.contains("硬重置"));
         assert!(detail.contains("永久丢失"));
         assert!(detail.contains("替代做法"), "高危文案必须给出替代做法");
+    }
+
+    #[test]
+    fn recent_initials_split_words_and_camel_case() {
+        assert_eq!(recent_initials("Knotwork"), "K");
+        assert_eq!(recent_initials("healthcare-scheduling-system"), "HS");
+        assert_eq!(recent_initials("ccswitch_tmp"), "CT");
+        assert_eq!(recent_initials("ListaryProKit"), "LP");
+        assert_eq!(recent_initials("ravergand-tool"), "RT");
+        assert_eq!(recent_initials("flash_sale_service"), "FS");
+        assert_eq!(recent_initials("agentcode"), "A");
+        assert_eq!(recent_initials("---"), "?");
+    }
+
+    #[test]
+    fn recent_avatar_color_is_stable_per_path() {
+        let first = build_recent_rows(&[
+            gt_config::RecentRepo::new("/tmp/alpha", 0),
+            gt_config::RecentRepo::new("/tmp/beta", 0),
+        ]);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].accent, recent_avatar_color("/tmp/alpha"));
+        assert_eq!(first[1].accent, recent_avatar_color("/tmp/beta"));
+
+        let again = build_recent_rows(&[gt_config::RecentRepo::new("/tmp/alpha", 9)]);
+        assert_eq!(again[0].accent, first[0].accent, "同一路径颜色必须稳定");
+        assert_eq!(again[0].initials, "A");
     }
 }
 

@@ -120,6 +120,9 @@ export struct RemoteRow {
 export struct RecentRow {
     name: string,
     path: string,
+    // 头像字母（如 "KN"）与头像底色：颜色按路径散列固定，界面上是纯展示。
+    initials: string,
+    accent: color,
 }
 
 // 贮藏列表的一行（FR-STH）。

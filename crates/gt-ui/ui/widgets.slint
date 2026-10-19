@@ -175,6 +175,8 @@ export component IdeaSearchField inherits Rectangle {
     in-out property <string> text;
     in property <string> placeholder: "";
     in property <bool> regex;
+    // 纯搜索场景（如启动页的项目过滤）关掉正则开关，界面更接近普通搜索框。
+    in property <bool> show-regex: true;
     callback edited(string);
     callback regex-toggled();
     callback accepted();
@@ -190,7 +192,10 @@ export component IdeaSearchField inherits Rectangle {
         padding-left: 8px;
         padding-right: 4px;
         spacing: 6px;
-        alignment: center;
+        // 交叉轴（竖直）居中即可：主轴不能设 alignment，否则会压掉
+        // 输入框的 `horizontal-stretch`，输入区塌成零宽 —— 表现为点不进、
+        // 搜不了，放大镜也跑到中间。
+        cross-axis-alignment: center;
 
         IdeaIcon {
             name: "search";
@@ -214,6 +219,7 @@ export component IdeaSearchField inherits Rectangle {
             height: 20px;
             border-radius: Palette.radius-xs;
             background: regex-touch.has-hover ? Palette.action-hover : transparent;
+            visible: root.show-regex;
 
             regex-label := Text {
                 text: ".*";
@@ -232,7 +238,7 @@ export component IdeaSearchField inherits Rectangle {
 
     Text {
         x: 28px;
-        width: parent.width - 62px;
+        width: parent.width - (root.show-regex ? 62px : 24px);
         height: 100%;
         text: root.placeholder;
         color: Palette.text-faint;

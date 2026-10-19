@@ -25,7 +25,7 @@ import {
     CommitFileRowView,
 } from "rows.slint";
 import {
-    ConfirmDialog, SettingsDialog, PushDialog, RemotesDialog, CommitCtxMenu,
+    ConfirmDialog, SettingsDialog, PushDialog, RemotesDialog, CommitCtxMenu, RecentCtxMenu,
     OpDialog, IplanDialog, CflDialog, CompareDialog, FileHistoryDialog,
 } from "dialogs.slint";
 
@@ -61,6 +61,12 @@ export component MainWindow inherits Window {
     in-out property <string> open-path: "";
     in-out property <string> empty-message: Texts.s0;
     in-out property <[RecentRow]> recent: [];
+    // 最近项目搜索词（空串表示不过滤）与行内「⋮」菜单状态。
+    in-out property <string> project-search: "";
+    in-out property <bool> recent-menu-visible: false;
+    in-out property <length> recent-menu-x: 0px;
+    in-out property <length> recent-menu-y: 0px;
+    in-out property <string> recent-menu-path: "";
 
     // ---- 日志面板 ----
     in-out property <[LogRow]> log-rows: [];
@@ -272,6 +278,7 @@ export component MainWindow inherits Window {
     callback poll();
     callback refresh();
     callback open-repo(string);
+    callback browse-repo();
     callback select-log(int);
     callback select-change(int);
     callback select-commit-file(int);
@@ -280,6 +287,8 @@ export component MainWindow inherits Window {
     callback export-console();
     callback clear-console();
     callback use-recent(string);
+    callback filter-recent(string);
+    callback remove-recent(string);
 
     // 写操作
     callback stage-selected();
@@ -1706,92 +1715,159 @@ export component MainWindow inherits Window {
         }
 
         // ---------------------------------------------------- 空状态
+        //
+        // IDEA 欢迎页形态：顶部一行「搜索 + 打开」，下面是最近项目列表。
+        // 每行带彩色字母头像，悬停时右侧出现「⋮」菜单（打开 / 从最近项目移除）。
         if !root.has-repo: Rectangle {
             vertical-stretch: 1;
             background: Palette.bg;
 
             VerticalLayout {
-                padding: 28px;
-                spacing: Metrics.space-3;
-                alignment: center;
+                spacing: 0;
 
-                Text {
-                    text: Texts.s44;
-                    color: Palette.text;
-                    font-size: Palette.font-h1;
-                    font-weight: 600;
-                    horizontal-alignment: center;
-                }
-
-                Text {
-                    text: root.empty-message;
-                    color: Palette.text-faint;
-                    font-size: Palette.font-md;
-                    horizontal-alignment: center;
-                    wrap: word-wrap;
-                }
-
-                HorizontalLayout {
-                    spacing: Metrics.space-2;
-                    alignment: center;
-
-                    Field {
-                        width: 460px;
-                        height: 30px;
-                        text <=> root.open-path;
-                        placeholder: Texts.s45;
-                    }
-
-                    FlatButton {
-                        text: Texts.s46;
-                        clicked => { root.open-repo(root.open-path); }
-                    }
-                }
-
-                SectionLabel {
-                    text: Texts.s47;
-                    horizontal-alignment: center;
-                }
-
+                // ---- 顶部：搜索 + 打开 ----
                 Rectangle {
-                    width: 520px;
-                    height: 200px;
-                    background: Palette.panel;
-                    border-color: Palette.line;
-                    border-width: 1px;
-                    border-radius: Palette.radius;
+                    height: 52px;
+                    background: Palette.bg;
+
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        spacing: 8px;
+                        cross-axis-alignment: center;
+
+                        IdeaSearchField {
+                            width: 420px;
+                            height: 32px;
+                            show-regex: false;
+                            text <=> root.project-search;
+                            placeholder: Texts.s192;
+                            edited(v) => { root.filter-recent(v); }
+                        }
+
+                        Rectangle { horizontal-stretch: 1; }
+
+                        IdeaButton {
+                            text: Texts.s46;
+                            variant: "outline";
+                            height: 32px;
+                            clicked => { root.browse-repo(); }
+                        }
+                    }
+                }
+
+                Divider { }
+
+                // ---- 最近项目列表 ----
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: Palette.bg;
+                    clip: true;
 
                     ListView {
                         for entry in root.recent: Rectangle {
-                            height: 28px;
-                            background: recent-touch.has-hover ? Palette.hover : transparent;
+                            height: 52px;
+                            background: row-touch.has-hover ? Palette.hover : transparent;
 
                             HorizontalLayout {
-                                padding-left: 8px;
-                                padding-right: 8px;
-                                spacing: 10px;
+                                padding-left: 16px;
+                                padding-right: 12px;
+                                spacing: 12px;
+                                cross-axis-alignment: center;
 
-                                Text {
-                                    text: entry.name;
-                                    color: Palette.text;
-                                    font-size: Palette.font-md;
-                                    vertical-alignment: center;
+                                // 彩色字母头像
+                                Rectangle {
+                                    width: 30px;
+                                    height: 30px;
+                                    border-radius: 8px;
+                                    background: entry.accent;
+
+                                    Text {
+                                        text: entry.initials;
+                                        color: white;
+                                        font-size: Palette.font-sm;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
                                 }
 
-                                Text {
+                                VerticalLayout {
                                     horizontal-stretch: 1;
-                                    text: entry.path;
-                                    color: Palette.text-faint;
-                                    font-size: Palette.font-meta;
-                                    vertical-alignment: center;
-                                    overflow: elide;
+                                    spacing: 1px;
+                                    alignment: center;
+
+                                    Text {
+                                        text: entry.name;
+                                        color: Palette.text;
+                                        font-size: Palette.font-md;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+
+                                    Text {
+                                        text: entry.path;
+                                        color: Palette.text-faint;
+                                        font-size: Palette.font-meta;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
+
+                                // 「⋮」只是视觉：整行只有一个交互层（下面的 row-touch），
+                                // 热区按光标横坐标判定。两个交互层互相抢 hover 会闪烁，
+                                // 也会让人点不中按钮 —— 这里刻意不做成独立按钮。
+                                Rectangle {
+                                    width: 34px;
+                                    height: 34px;
+                                    border-radius: Palette.radius-sm;
+                                    background: row-touch.has-hover && row-touch.mouse-x >= row-touch.width - 46px
+                                        ? Palette.btn-hover
+                                        : transparent;
+                                    opacity: row-touch.has-hover
+                                        || (root.recent-menu-visible && root.recent-menu-path == entry.path)
+                                        ? 1
+                                        : 0;
+
+                                    IdeaIcon {
+                                        name: "more";
+                                        icon-size: 18px;
+                                        tint: Palette.icon;
+                                        x: (parent.width - self.width) / 2;
+                                        y: (parent.height - self.height) / 2;
+                                    }
                                 }
                             }
 
-                            recent-touch := TouchArea {
-                                clicked => { root.use-recent(entry.path); }
+                            // 唯一交互层：铺满整行，放在内容之后（最上层）。右侧 46px
+                            // 是「⋮」热区，其余部分打开仓库。光标横坐标用 `mouse-x`。
+                            row-touch := TouchArea {
+                                mouse-cursor: row-touch.mouse-x >= row-touch.width - 46px ? pointer : default;
+                                clicked => {
+                                    if (self.mouse-x >= self.width - 46px) {
+                                        root.recent-menu-path = entry.path;
+                                        root.recent-menu-x = self.absolute-position.x + self.width - 236px;
+                                        root.recent-menu-y = self.absolute-position.y + self.height + 2px;
+                                        root.recent-menu-visible = true;
+                                    } else {
+                                        root.recent-menu-visible = false;
+                                        root.use-recent(entry.path);
+                                    }
+                                }
                             }
                         }
+                    }
+
+                    // 空占位：区分「没有记录」与「搜索无结果」。
+                    Text {
+                        width: 100%;
+                        height: 100%;
+                        text: root.project-search == "" ? Texts.s191 : Texts.s193;
+                        color: Palette.text-faint;
+                        font-size: Palette.font-md;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        visible: root.recent.length == 0;
                     }
                 }
             }
@@ -2004,5 +2080,20 @@ export component MainWindow inherits Window {
         select(index) => { root.history-select(index); }
         set-filter(index) => { root.history-set-filter(index); }
         close => { root.history-close(); }
-}
+    }
+
+    RecentCtxMenu {
+        visible: root.recent-menu-visible;
+        ctx-x: root.recent-menu-x;
+        ctx-y: root.recent-menu-y;
+        action(label) => {
+            root.recent-menu-visible = false;
+            if label == "open" {
+                root.use-recent(root.recent-menu-path);
+            } else if label == "remove" {
+                root.remove-recent(root.recent-menu-path);
+            }
+        }
+        close => { root.recent-menu-visible = false; }
+    }
 }

@@ -46,6 +46,11 @@ struct Slot {
 /// 窗口的运行状态。
 struct SlotState {
     service: Arc<GitService>,
+    /// Console 缓冲（与窗口管理器共享）。
+    ///
+    /// 会话可能在窗口存续期间被创建 —— 启动页选中仓库时就地转成仓库窗口 ——
+    /// 因此这里必须自带一份引用，而不能只在 `WindowManager` 上持有。
+    console: Arc<ConsoleBuffer>,
     /// 会话；窗口关闭后置空以释放仓库相关资源。
     session: Option<Session>,
     /// 文件变化批次（由监听线程投递，UI 线程轮询）。
@@ -54,6 +59,8 @@ struct SlotState {
     location: Option<RepoLocation>,
     /// 未打开仓库时的空状态（显示最近仓库）。
     empty: bool,
+    /// 启动页最近项目搜索词（空串表示不过滤）。
+    recent_filter: String,
     /// 应用级配置（与窗口管理器共享）。
     config: Rc<RefCell<UserConfig>>,
     /// 配置文件路径（与窗口管理器共享）：设置保存必须落到同一处，
@@ -167,10 +174,12 @@ impl WindowManager {
 
         let state = Rc::new(RefCell::new(SlotState {
             service: Arc::clone(&self.service),
+            console: Arc::clone(&self.console),
             session: Some(session),
             changes,
             location: Some(location.clone()),
             empty: false,
+            recent_filter: String::new(),
             config: Rc::clone(&self.config),
             config_path: Rc::new(self.config_path.clone()),
             _watch_sender: Some(sender),
@@ -181,11 +190,13 @@ impl WindowManager {
         self.install(&window, &state);
 
         // 记录到最近仓库并落盘。
+        //
+        // 这里必须记**绝对路径**：命令行给相对路径时，`RepoLocation` 会保留相对形式，
+        // 这条记录在下次以别的工作目录启动时就再也打不开了。
         {
+            let recorded = absolute(location.work_dir_or_git_dir());
             let mut config = self.config.borrow_mut();
-            config
-                .recent
-                .touch(location.work_dir_or_git_dir(), None, now_unix());
+            config.recent.touch(&recorded, None, now_unix());
         }
         self.persist();
 
@@ -201,10 +212,12 @@ impl WindowManager {
         let (_sender, changes) = crossbeam_channel::unbounded();
         let state = Rc::new(RefCell::new(SlotState {
             service: Arc::clone(&self.service),
+            console: Arc::clone(&self.console),
             session: None,
             changes,
             location: None,
             empty: true,
+            recent_filter: String::new(),
             config: Rc::clone(&self.config),
             config_path: Rc::new(self.config_path.clone()),
             _watch_sender: None,
@@ -370,6 +383,88 @@ impl WindowManager {
             drop(guard);
             if !events.is_empty() {
                 Self::apply_config_events(&poll_state, &events);
+            }
+        });
+
+        // ---- 启动页：打开仓库 ----
+        //
+        // 这两个回调是启动页上的全部出口：手填路径点「打开」、或点最近仓库列表。
+        // 它们曾经漏接 —— 界面声明了回调而 Rust 侧没有处理者时，Slint 不会报错，
+        // 只会把点击静默丢弃，表现就是"点上去完全没反应"。
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_open_repo(move |path| {
+            if let Some(window) = weak.upgrade() {
+                open_from_start_page(&slot, &window, path.as_str());
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_use_recent(move |path| {
+            if let Some(window) = weak.upgrade() {
+                open_from_start_page(&slot, &window, path.as_str());
+            }
+        });
+
+        // ---- 启动页：资源管理器选择文件夹 ----
+        //
+        // 原生文件夹选择框会阻塞 UI 线程直到用户选定或取消。这是**用户交互**
+        // 而非仓库 I/O —— 它不读工作区、不起 git 子进程，是启动页唯一合理的
+        // 阻塞点（架构规划 4.2 的"UI 线程零 I/O"约束针对的是仓库访问）。
+        // 选定后立刻就地打开：这正是用户点「浏览…」想要的结果。
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_browse_repo(move || {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            let Some(dir) = rfd::FileDialog::new()
+                .set_title("选择仓库文件夹")
+                .pick_folder()
+            else {
+                return; // 用户取消。
+            };
+            let path = dir.display().to_string();
+            window.set_open_path(path.clone().into());
+            open_from_start_page(&slot, &window, &path);
+        });
+
+        // ---- 启动页：最近项目搜索 / 移除 ----
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_filter_recent(move |query| {
+            if let Some(window) = weak.upgrade() {
+                let list = {
+                    let mut guard = slot.borrow_mut();
+                    guard.recent_filter = query.to_string();
+                    let config = guard.config.borrow();
+                    filter_recent(&config.recent.entries, &guard.recent_filter)
+                };
+                window.set_recent(gt_ui::recent_model(&list));
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_remove_recent(move |path| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            let list = {
+                let guard = slot.borrow_mut();
+                guard
+                    .config
+                    .borrow_mut()
+                    .recent
+                    .remove(Path::new(path.as_str()));
+                let config = guard.config.borrow();
+                filter_recent(&config.recent.entries, &guard.recent_filter)
+            };
+            window.set_recent(gt_ui::recent_model(&list));
+            window.set_recent_menu_visible(false);
+            if let Err(err) = persist_shared(&slot) {
+                tracing::warn!(%err, "保存最近仓库失败");
             }
         });
 
@@ -1499,12 +1594,7 @@ impl WindowManager {
             return;
         }
         if let Some(session) = guard.session.as_mut() {
-            session.set_preferences(config.git.staging_mode, config.git.warn_detached_commit);
-            session.set_remote_preferences(
-                pull_strategy(config.git.update_strategy),
-                config.branches.protected_patterns.clone(),
-                config.remote.stored_token_hosts.clone(),
-            );
+            apply_session_preferences(session, &config);
             session.request_initial();
             // 远端名用于工具栏提示与推送目标：首屏静默取一次（不弹提示条）。
             session.prime_remotes();
@@ -1602,6 +1692,137 @@ fn normalize(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// 转为绝对路径（不解析符号链接，也不引入 `\\?\` 前缀）。
+///
+/// 最近仓库必须按绝对路径记账：命令行传入相对路径时，`RepoLocation` 会保留相对形式，
+/// 这条记录在下次以别的工作目录启动时就再也打不开了。
+fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// 把应用级设置灌进会话（启动页就地打开仓库与首次装载共用同一套口径）。
+fn apply_session_preferences(session: &mut Session, config: &UserConfig) {
+    session.set_preferences(config.git.staging_mode, config.git.warn_detached_commit);
+    session.set_remote_preferences(
+        pull_strategy(config.git.update_strategy),
+        config.branches.protected_patterns.clone(),
+        config.remote.stored_token_hosts.clone(),
+    );
+}
+
+/// 从启动页打开仓库：把当前这个空窗口**就地**变成仓库窗口。
+///
+/// 不新开窗口有两个理由：启动页本身占着一个槽位，另开窗口会把启动页留在原地
+/// （用户点一次却得到两个窗口，其中一个还是空的）；而且空槽位此后既不会被用到，
+/// 也无法被 `reap` 回收。
+// 字段名带下划线是为了表明"只为保活、不读其值"，但这里必须写入它来接管监听，
+// 因此该 lint 在本函数内不适用。
+#[allow(clippy::used_underscore_binding)]
+fn open_from_start_page(state: &Rc<RefCell<SlotState>>, window: &MainWindow, raw: &str) {
+    // 资源管理器的「复制路径」会带首尾引号，用户手填时也可能留下空白。
+    let trimmed = raw.trim();
+    let path = trimmed.trim_matches('"').trim();
+    if path.is_empty() {
+        window.set_toast(gt_ui::text::tr("请先填写仓库路径，或从下面的最近仓库中选择").into());
+        return;
+    }
+
+    // 只有尚未打开仓库的启动页可以就地转换；已有会话时这两个入口在界面上也不可见。
+    if !state.borrow().empty {
+        return;
+    }
+
+    let service = {
+        let guard = state.borrow();
+        Arc::clone(&guard.service)
+    };
+    let handle = match service.open_repo(Path::new(path)) {
+        Ok(handle) => handle,
+        Err(err) => {
+            // 失败必须说清原因：静默失败正是这个问题最初的表现。
+            tracing::warn!(path, %err, "启动页打开仓库失败");
+            window.set_toast(format!("打开失败：{err}").into());
+            return;
+        }
+    };
+    let location = handle.location().clone();
+
+    // 文件监听与 `WindowManager::open_repo` 同口径：监听失败不阻断打开，
+    // 只是不再自动刷新。
+    let (sender, changes) = crossbeam_channel::unbounded();
+    let watch_sender = Arc::new(sender.clone());
+    if let Err(err) =
+        handle.start_watching(Arc::clone(&watch_sender), gt_service::default_debounce())
+    {
+        tracing::warn!(%err, "文件监听启动失败，自动刷新不可用");
+    }
+
+    let (console, config) = {
+        let guard = state.borrow();
+        let console = Arc::clone(&guard.console);
+        let config = guard.config.borrow().clone();
+        (console, config)
+    };
+    let mut session = Session::new(service, Arc::clone(&handle), console, CONSOLE_CAPACITY);
+    apply_session_preferences(&mut session, &config);
+
+    // 状态切换与"最近仓库"记账放在同一个可变借用里：中间不留半转换状态。
+    {
+        let mut guard = state.borrow_mut();
+        guard.session = Some(session);
+        guard.changes = changes;
+        guard.location = Some(location.clone());
+        guard.empty = false;
+        guard._watch_sender = Some(sender);
+        // 与 `open_repo` 同口径：最近仓库一律按绝对路径记账。
+        let recorded = absolute(location.work_dir_or_git_dir());
+        guard
+            .config
+            .borrow_mut()
+            .recent
+            .touch(&recorded, None, now_unix());
+    }
+    if let Err(err) = persist_shared(state) {
+        tracing::warn!(%err, "保存最近仓库失败");
+    }
+
+    // 首屏请求与界面刷新：`apply_to` 会把 `has-repo` 置真，启动页随之卸下。
+    {
+        let mut guard = state.borrow_mut();
+        let Some(session) = guard.session.as_mut() else {
+            return;
+        };
+        session.request_initial();
+        session.prime_remotes();
+        session.apply_to(window);
+    }
+
+    window.set_toast(String::new().into());
+    window.set_open_path(String::new().into());
+    tracing::info!(path, "启动页已打开仓库");
+}
+
+/// 启动页最近项目过滤：按展示名与路径做大小写不敏感的子串匹配。
+fn filter_recent(entries: &[RecentRepo], query: &str) -> Vec<RecentRepo> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return entries.to_vec();
+    }
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.display_name().to_lowercase().contains(&needle)
+                || entry
+                    .path
+                    .display()
+                    .to_string()
+                    .to_lowercase()
+                    .contains(&needle)
+        })
+        .cloned()
+        .collect()
+}
+
 /// 把"未打开仓库"的状态写进窗口。
 fn render_empty_state(window: &MainWindow, service: &GitService, recent: &[RecentRepo]) {
     window.set_has_repo(false);
@@ -1657,11 +1878,11 @@ fn write_console_export_into(dir: &Path, text: &str) -> Result<PathBuf, String> 
 #[cfg(test)]
 mod tests {
     use super::{
-        index_log_level, log_level_index, non_empty, normalize, same_repo,
+        absolute, filter_recent, index_log_level, log_level_index, non_empty, normalize, same_repo,
         write_console_export_into,
     };
     use gt_backend::RepoLocation;
-    use gt_config::LogLevel;
+    use gt_config::{LogLevel, RecentRepo};
     use std::path::PathBuf;
 
     fn location(work: Option<&str>, git: &str) -> RepoLocation {
@@ -1689,6 +1910,30 @@ mod tests {
         // 不存在的路径也必须返回一个可比较的值，而不是 panic。
         let value = normalize(std::path::Path::new("/definitely/not/here/knotwork"));
         assert!(!value.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn recent_paths_are_recorded_absolute() {
+        // 相对路径在换工作目录启动后会失效，因此记账前必须先绝对化。
+        let relative = std::path::Path::new(".workbuddy/tmp-ui");
+        let recorded = absolute(relative);
+        assert!(recorded.is_absolute(), "{recorded:?}");
+        assert_eq!(absolute(&recorded), recorded, "绝对路径应保持稳定");
+        // 不解析符号链接意味着不引入 Windows 的 `\\?\` 前缀，界面上的路径才好读。
+        assert!(!recorded.to_string_lossy().starts_with(r"\\?\"));
+    }
+
+    #[test]
+    fn filter_recent_matches_name_and_path_case_insensitively() {
+        let entries = vec![
+            RecentRepo::new("/work/alpha-repo", 0),
+            RecentRepo::new("/work/beta", 0),
+        ];
+
+        assert_eq!(filter_recent(&entries, "  ").len(), 2, "空查询不过滤");
+        assert_eq!(filter_recent(&entries, "ALPHA").len(), 1);
+        assert_eq!(filter_recent(&entries, "work").len(), 2, "路径也参与匹配");
+        assert!(filter_recent(&entries, "gamma").is_empty());
     }
 
     #[test]
@@ -1726,5 +1971,34 @@ mod tests {
     fn empty_tool_commands_become_none() {
         assert_eq!(non_empty("  "), None);
         assert_eq!(non_empty(" code --diff "), Some("code --diff".to_owned()));
+    }
+
+    /// 界面声明的每个回调都必须在 `wire` 里有处理者。
+    ///
+    /// 漏接一个回调不会编译失败，也不会在运行时报警 —— 点击被静默丢弃，
+    /// 表现就是"按钮没反应"。启动页的「打开」与最近仓库列表曾经正是这样失效的
+    /// （`open-repo` / `use-recent` 未接线），因此用这条测试把契约钉住。
+    #[test]
+    fn every_ui_callback_has_a_handler() {
+        const UI: &str = include_str!("../../crates/gt-ui/ui/main-window.slint");
+        const APP: &str = include_str!("windows.rs");
+
+        let mut missing = Vec::new();
+        for line in UI.lines() {
+            let Some(rest) = line.trim().strip_prefix("callback ") else {
+                continue;
+            };
+            let Some((name, _)) = rest.split_once('(') else {
+                continue;
+            };
+            let handler = format!("on_{}", name.trim().replace('-', "_"));
+            if !APP.contains(&format!(".{handler}(")) {
+                missing.push(name.trim().to_owned());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "以下界面回调在 Rust 侧没有处理者，点击会被静默丢弃：{missing:?}"
+        );
     }
 }

@@ -67,6 +67,11 @@ keyring = { version = "3", default-features = false, features = ["windows-native
 slint = { version = "1" }
 slint-build = "1"
 
+# ---- 系统对话框（M1 遗留 D 项：启动页「浏览…」）----
+# 原生文件夹选择框：Windows 走 IFileDialog（资源管理器风格）。
+# 关掉默认特性，避免把 xdg-portal / wayland / async-std 拖进 Windows 构建。
+rfd = { version = "0.16", default-features = false }
+
 # ---- 图片 Diff（FR-DIF-04，M5）----
 # 只开常用位图的解码器，关掉默认特性避免拖入无关格式与 rayon。
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }

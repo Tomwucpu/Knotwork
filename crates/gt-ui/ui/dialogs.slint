@@ -675,8 +675,54 @@ export component CommitCtxMenu inherits Rectangle {
     }
 }
 
-// ================================================================ 通用操作对话框
+// ================================================================ 最近项目上下文菜单
 
+// 与 CommitCtxMenu 同构：贴着触发按钮弹出、点空白关闭，实例化处必须排在
+// 其他遮罩之后。用于启动页把一条最近仓库打开或移出列表。
+export component RecentCtxMenu inherits Rectangle {
+    in property <length> ctx-x: 0px;
+    in property <length> ctx-y: 0px;
+    // 菜单项统一走一个回调：动作标识由 Rust 侧解释。
+    callback action(string);
+    callback close();
+
+    background: transparent;
+
+    // 点空白处关闭；这层必须在菜单面板**之前**声明，否则会盖住菜单。
+    TouchArea {
+        clicked => { root.close(); }
+    }
+
+    Rectangle {
+        width: 236px;
+        height: menu.preferred-height + 8px;
+        x: min(root.ctx-x, root.width - 248px);
+        y: min(root.ctx-y, root.height - self.height - 16px);
+        background: Palette.panel;
+        border-color: Palette.border;
+        border-width: 1px;
+        border-radius: Palette.radius;
+
+        menu := VerticalLayout {
+            x: 4px;
+            y: 4px;
+            width: parent.width - 8px;
+            spacing: 1px;
+
+            MenuItem {
+                text: Texts.s46;
+                clicked => { root.action("open"); }
+            }
+            MenuItem {
+                text: Texts.s194;
+                danger: true;
+                clicked => { root.action("remove"); }
+            }
+        }
+    }
+}
+
+// ================================================================ 通用操作对话框
 export component OpDialog inherits DialogShell {
     in property <string> op-title: "";
     in property <string> op-hint: "";
