@@ -23,14 +23,15 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, TryRecvError};
 use gt_backend::RepoLocation;
 use gt_config::{
     DiagnosticsConfig, Language, LogLevel, RecentRepo, Theme, UpdateStrategy, UserConfig,
 };
-use gt_service::{ChangeBatch, ConsoleBuffer, GitService};
+use gt_service::{ChangeBatch, ChangeImpact, ConsoleBuffer, GitService};
 use gt_ui::{MainWindow, Session};
 use slint::ComponentHandle;
 
@@ -59,6 +60,8 @@ struct SlotState {
     location: Option<RepoLocation>,
     /// 未打开仓库时的空状态（显示最近仓库）。
     empty: bool,
+    /// 后台打开仓库的挂起状态；完成后由 `poll` 接管为会话。
+    opening: Option<Opening>,
     /// 启动页最近项目搜索词（空串表示不过滤）。
     recent_filter: String,
     /// 应用级配置（与窗口管理器共享）。
@@ -68,6 +71,30 @@ struct SlotState {
     config_path: Rc<PathBuf>,
     /// 与监听线程保持连接：`Sender` 一旦全部丢弃，批次就送不进来了。
     _watch_sender: Option<crossbeam_channel::Sender<ChangeBatch>>,
+}
+
+/// 后台打开仓库的挂起状态。
+///
+/// 打开仓库要读文件系统（`discover`）、取写锁、注册文件监听 —— 这些在
+/// 大仓库上都可能耗时数百毫秒。它们被放到后台线程执行，UI 线程只在
+/// 100ms 轮询里检查结果，窗口全程保持可响应（架构规划 4.2 的"UI 线程零 I/O"）。
+struct Opening {
+    /// 后台线程回送打开结果。
+    receiver: Receiver<Result<OpenedRepo, String>>,
+    /// 窗口在完成前关闭时置位：后台线程据此尽量早地注销仓库，避免泄漏。
+    cancelled: Arc<AtomicBool>,
+}
+
+/// 后台打开成功的产物。
+///
+/// 只含能跨线程传递的部分；`Session`/窗口必须在 UI 线程构建，因此在轮询里才建。
+struct OpenedRepo {
+    /// 已注册到服务层的仓库句柄。
+    handle: Arc<gt_service::RepoHandle>,
+    /// 仓库物理位置。
+    location: RepoLocation,
+    /// 用于最近仓库记账的绝对路径（`canonicalize` 已移出 UI 线程）。
+    absolute: PathBuf,
 }
 
 /// 窗口管理器。
@@ -107,7 +134,7 @@ impl WindowManager {
             .iter()
             .filter(|slot| {
                 let guard = slot.state.borrow();
-                guard.session.is_some() || guard.empty
+                guard.session.is_some() || guard.empty || guard.opening.is_some()
             })
             .count()
     }
@@ -119,7 +146,7 @@ impl WindowManager {
     fn reap(&mut self) {
         self.slots.retain(|slot| {
             let guard = slot.state.borrow();
-            guard.session.is_some() || guard.empty
+            guard.session.is_some() || guard.empty || guard.opening.is_some()
         });
     }
 
@@ -133,8 +160,11 @@ impl WindowManager {
     ///
     /// 同一路径重复打开会被拒绝（FR-MR-04：同一仓库不允许重复多开）。
     ///
+    /// 本方法**立即返回**：真正的 `discover` / 写锁 / 文件监听在后台线程执行，
+    /// 窗口先以"正在打开…"的空状态显示，结果由 100ms 轮询接管（架构规划 4.2）。
+    ///
     /// # Errors
-    /// 路径不是仓库、或该仓库已打开时返回可展示的错误文本。
+    /// 窗口创建失败时返回错误文本；路径不是仓库等打开期错误通过界面提示。
     pub fn open_repo(&mut self, path: &Path) -> Result<(), String> {
         self.reap();
         if let Some(existing) = self
@@ -149,56 +179,25 @@ impl WindowManager {
             ));
         }
 
-        let handle = self
-            .service
-            .open_repo(path)
-            .map_err(|err| err.to_string())?;
-        let location = handle.location().clone();
-
-        // 文件监听：批次先收进通道，由 UI 线程轮询后再决定要不要重算。
-        let (sender, changes) = crossbeam_channel::unbounded();
-        let watch_sender = Arc::new(sender.clone());
-        if let Err(err) =
-            handle.start_watching(Arc::clone(&watch_sender), gt_service::default_debounce())
-        {
-            // 监听失败不阻断打开：状态仍然是好的，只是不会自动刷新。
-            tracing::warn!(%err, "文件监听启动失败，自动刷新不可用");
-        }
-
-        let session = Session::new(
-            Arc::clone(&self.service),
-            Arc::clone(&handle),
-            Arc::clone(&self.console),
-            CONSOLE_CAPACITY,
-        );
-
+        let (_sender, changes) = crossbeam_channel::unbounded();
         let state = Rc::new(RefCell::new(SlotState {
             service: Arc::clone(&self.service),
             console: Arc::clone(&self.console),
-            session: Some(session),
+            session: None,
             changes,
-            location: Some(location.clone()),
-            empty: false,
+            location: None,
+            empty: true,
+            opening: None,
             recent_filter: String::new(),
             config: Rc::clone(&self.config),
             config_path: Rc::new(self.config_path.clone()),
-            _watch_sender: Some(sender),
+            _watch_sender: None,
         }));
 
         let window = MainWindow::new().map_err(|err| err.to_string())?;
         Self::wire(&window, &state);
         self.install(&window, &state);
-
-        // 记录到最近仓库并落盘。
-        //
-        // 这里必须记**绝对路径**：命令行给相对路径时，`RepoLocation` 会保留相对形式，
-        // 这条记录在下次以别的工作目录启动时就再也打不开了。
-        {
-            let recorded = absolute(location.work_dir_or_git_dir());
-            let mut config = self.config.borrow_mut();
-            config.recent.touch(&recorded, None, now_unix());
-        }
-        self.persist();
+        begin_open(&state, &window, path);
 
         self.slots.push(Slot { window, state });
         Ok(())
@@ -217,6 +216,7 @@ impl WindowManager {
             changes,
             location: None,
             empty: true,
+            opening: None,
             recent_filter: String::new(),
             config: Rc::clone(&self.config),
             config_path: Rc::new(self.config_path.clone()),
@@ -249,6 +249,11 @@ impl WindowManager {
             if let Some(session) = state.session.as_ref() {
                 state.service.close_repo(session.handle().id());
             }
+            // 后台打开尚未完成的窗口也要放弃：否则仓库在退出前被注册，写锁与
+            // 监听会一直挂到进程结束。
+            if let Some(opening) = state.opening.as_ref() {
+                opening.cancelled.store(true, Ordering::SeqCst);
+            }
         }
     }
 
@@ -270,14 +275,15 @@ impl WindowManager {
             return;
         };
 
-        let mut needs_refresh = false;
+        let mut impact = ChangeImpact::default();
         for batch in &batches {
-            let impact = service.apply_change_batch(repo_id, batch);
-            needs_refresh |= impact.needs_status_refresh();
+            let batch_impact = service.apply_change_batch(repo_id, batch);
+            impact.worktree_changed |= batch_impact.worktree_changed;
+            impact.git_state_changed |= batch_impact.git_state_changed;
         }
-        if needs_refresh {
+        if impact.needs_status_refresh() {
             tracing::debug!(batches = batches.len(), "检测到文件变化，刷新视图");
-            session.refresh();
+            session.apply_change_impact(impact);
         }
         session.apply_to(window);
     }
@@ -368,6 +374,7 @@ impl WindowManager {
             };
             Self::sync_preferences(&poll_state, &window);
             Self::apply_changes(&poll_state, &window);
+            poll_opening(&poll_state, &window);
 
             let mut guard = poll_state.borrow_mut();
             let Some(session) = guard.session.as_mut() else {
@@ -1523,6 +1530,17 @@ impl WindowManager {
             if let Some(session) = guard.session.take() {
                 guard.service.close_repo(session.handle().id());
             }
+            // 后台打开尚未完成：标记取消，并立即消费可能已到达的结果 ——
+            // 否则窗口关掉后句柄无人认领，仓库会在服务层一直挂着。
+            if let Some(opening) = guard.opening.take() {
+                opening.cancelled.store(true, Ordering::SeqCst);
+                if let Ok(Ok(opened)) = opening.receiver.try_recv() {
+                    guard.service.close_repo(opened.handle.id());
+                }
+                // 这个槽位是被关闭的打开窗口（不是启动页）：标记为非空，
+                // 好让 `reap` 回收它，而不是当成常驻的启动页留下。
+                guard.empty = false;
+            }
             slint::CloseRequestResponse::HideWindow
         });
     }
@@ -1715,9 +1733,8 @@ fn apply_session_preferences(session: &mut Session, config: &UserConfig) {
 /// 不新开窗口有两个理由：启动页本身占着一个槽位，另开窗口会把启动页留在原地
 /// （用户点一次却得到两个窗口，其中一个还是空的）；而且空槽位此后既不会被用到，
 /// 也无法被 `reap` 回收。
-// 字段名带下划线是为了表明"只为保活、不读其值"，但这里必须写入它来接管监听，
-// 因此该 lint 在本函数内不适用。
-#[allow(clippy::used_underscore_binding)]
+///
+/// 真正的打开放在后台（见 [`begin_open`]）：本函数只做入参清洗与状态置位。
 fn open_from_start_page(state: &Rc<RefCell<SlotState>>, window: &MainWindow, raw: &str) {
     // 资源管理器的「复制路径」会带首尾引号，用户手填时也可能留下空白。
     let trimmed = raw.trim();
@@ -1727,41 +1744,119 @@ fn open_from_start_page(state: &Rc<RefCell<SlotState>>, window: &MainWindow, raw
         return;
     }
 
-    // 只有尚未打开仓库的启动页可以就地转换；已有会话时这两个入口在界面上也不可见。
-    if !state.borrow().empty {
-        return;
-    }
+    begin_open(state, window, Path::new(path));
+}
 
-    let service = {
-        let guard = state.borrow();
-        Arc::clone(&guard.service)
-    };
-    let handle = match service.open_repo(Path::new(path)) {
-        Ok(handle) => handle,
-        Err(err) => {
-            // 失败必须说清原因：静默失败正是这个问题最初的表现。
-            tracing::warn!(path, %err, "启动页打开仓库失败");
-            window.set_toast(format!("打开失败：{err}").into());
+/// 提交一次后台打开请求；立即返回，结果由 [`poll_opening`] 接管。
+///
+/// 关键点：`discover`、写锁、文件监听与绝对路径换算全部在后台线程完成，
+/// UI 线程只创建通道并置位 `opening`，窗口在打开期间保持可交互。
+// `_watch_sender` 的名字带下划线是为了表明"只为保活、不读其值"，
+// 但这里必须写入它来接管监听，因此该 lint 在本函数内不适用。
+#[allow(clippy::used_underscore_binding)]
+fn begin_open(state: &Rc<RefCell<SlotState>>, window: &MainWindow, path: &Path) {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (service, watch_sender, reply) = {
+        let mut guard = state.borrow_mut();
+        // 已有会话、或另一次打开仍在进行：忽略重复触发。
+        if guard.session.is_some() || guard.opening.is_some() {
             return;
         }
+        // 每条打开请求用独立的监听通道：完成时连同接收端一起接管。
+        let (sender, changes) = crossbeam_channel::unbounded();
+        guard.changes = changes;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        guard.opening = Some(Opening {
+            receiver: rx,
+            cancelled: Arc::clone(&cancelled),
+        });
+        guard._watch_sender = Some(sender.clone());
+        (Arc::clone(&guard.service), sender, tx)
     };
+
+    window.set_toast(gt_ui::text::tr("正在打开仓库…").into());
+    let owned = path.to_path_buf();
+    std::thread::spawn(move || {
+        let result = open_repo_blocking(&service, &owned, watch_sender, &cancelled);
+        // 接收端已被丢弃（窗口在完成前关闭）时，自行注销仓库，避免写锁与
+        // 文件监听泄漏到进程结束。
+        if let Err(err) = reply.send(result) {
+            if let Ok(opened) = err.into_inner() {
+                service.close_repo(opened.handle.id());
+            }
+        }
+    });
+}
+
+/// 后台线程执行的实际打开：仓库发现 + 写锁 + 文件监听 + 绝对路径换算。
+fn open_repo_blocking(
+    service: &GitService,
+    path: &Path,
+    watch_sender: crossbeam_channel::Sender<ChangeBatch>,
+    cancelled: &AtomicBool,
+) -> Result<OpenedRepo, String> {
+    let handle = service.open_repo(path).map_err(|err| err.to_string())?;
     let location = handle.location().clone();
 
-    // 文件监听与 `WindowManager::open_repo` 同口径：监听失败不阻断打开，
-    // 只是不再自动刷新。
-    let (sender, changes) = crossbeam_channel::unbounded();
-    let watch_sender = Arc::new(sender.clone());
-    if let Err(err) =
-        handle.start_watching(Arc::clone(&watch_sender), gt_service::default_debounce())
-    {
+    if cancelled.load(Ordering::SeqCst) {
+        service.close_repo(handle.id());
+        return Err("已取消".to_owned());
+    }
+
+    // 文件监听：批次先收进通道，由 UI 线程轮询后再决定要不要重算。
+    // 大工作区的递归注册在 Windows 上可达数百毫秒，因此必须在后台做。
+    let sink = Arc::new(watch_sender);
+    if let Err(err) = handle.start_watching(sink, gt_service::default_debounce()) {
+        // 监听失败不阻断打开：状态仍然是好的，只是不会自动刷新。
         tracing::warn!(%err, "文件监听启动失败，自动刷新不可用");
     }
 
-    let (console, config) = {
+    // 最近仓库必须按绝对路径记账：命令行给相对路径时，`RepoLocation` 会保留
+    // 相对形式，这条记录在下次以别的工作目录启动时就再也打不开了。
+    let absolute = absolute(location.work_dir_or_git_dir());
+
+    Ok(OpenedRepo {
+        handle,
+        location,
+        absolute,
+    })
+}
+
+/// 轮询后台打开结果：完成即就地构建会话，失败则回退到启动页并提示。
+fn poll_opening(state: &Rc<RefCell<SlotState>>, window: &MainWindow) {
+    let outcome = {
         let guard = state.borrow();
-        let console = Arc::clone(&guard.console);
+        let Some(opening) = guard.opening.as_ref() else {
+            return;
+        };
+        match opening.receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("打开仓库的后台任务意外结束".to_owned()),
+        }
+    };
+    match outcome {
+        Ok(opened) => finish_open(state, window, opened),
+        Err(message) => fail_open(state, window, &message),
+    }
+}
+
+/// 后台打开成功：在 UI 线程构建会话、记账并请求首屏数据。
+fn finish_open(state: &Rc<RefCell<SlotState>>, window: &MainWindow, opened: OpenedRepo) {
+    let OpenedRepo {
+        handle,
+        location,
+        absolute,
+    } = opened;
+
+    let (service, console, config) = {
+        let guard = state.borrow();
         let config = guard.config.borrow().clone();
-        (console, config)
+        (
+            Arc::clone(&guard.service),
+            Arc::clone(&guard.console),
+            config,
+        )
     };
     let mut session = Session::new(service, Arc::clone(&handle), console, CONSOLE_CAPACITY);
     apply_session_preferences(&mut session, &config);
@@ -1769,18 +1864,15 @@ fn open_from_start_page(state: &Rc<RefCell<SlotState>>, window: &MainWindow, raw
     // 状态切换与"最近仓库"记账放在同一个可变借用里：中间不留半转换状态。
     {
         let mut guard = state.borrow_mut();
+        guard.opening = None;
         guard.session = Some(session);
-        guard.changes = changes;
-        guard.location = Some(location.clone());
+        guard.location = Some(location);
         guard.empty = false;
-        guard._watch_sender = Some(sender);
-        // 与 `open_repo` 同口径：最近仓库一律按绝对路径记账。
-        let recorded = absolute(location.work_dir_or_git_dir());
         guard
             .config
             .borrow_mut()
             .recent
-            .touch(&recorded, None, now_unix());
+            .touch(&absolute, None, now_unix());
     }
     if let Err(err) = persist_shared(state) {
         tracing::warn!(%err, "保存最近仓库失败");
@@ -1799,7 +1891,23 @@ fn open_from_start_page(state: &Rc<RefCell<SlotState>>, window: &MainWindow, raw
 
     window.set_toast(String::new().into());
     window.set_open_path(String::new().into());
-    tracing::info!(path, "启动页已打开仓库");
+    tracing::info!(path = %absolute.display(), "已打开仓库");
+}
+
+/// 后台打开失败：清掉挂起状态、提示原因，并保证窗口回到启动页。
+fn fail_open(state: &Rc<RefCell<SlotState>>, window: &MainWindow, message: &str) {
+    // 失败必须说清原因：静默失败正是这个问题最初的表现。
+    tracing::warn!(%message, "打开仓库失败");
+    let (service, recent) = {
+        let mut guard = state.borrow_mut();
+        guard.opening = None;
+        // 失败后回退为空状态，窗口继续作为启动页可用。
+        guard.empty = true;
+        let recent = guard.config.borrow().recent.entries.clone();
+        (Arc::clone(&guard.service), recent)
+    };
+    render_empty_state(window, &service, &recent);
+    window.set_toast(format!("打开失败：{message}").into());
 }
 
 /// 启动页最近项目过滤：按展示名与路径做大小写不敏感的子串匹配。

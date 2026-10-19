@@ -34,7 +34,7 @@ use gt_backend::{
     RemoteOps, RepoLocation, RepoWriter, SharedGitRepo, SharedObserver, TokenStore, UpstreamRow,
     WriteLock, WriteOutcome,
 };
-use gt_core::{BranchScope, GraphOptions, LogPageRequest, Oid, RepoId};
+use gt_core::{BranchScope, GraphOptions, LogPageRequest, LogSort, Oid, RepoId};
 
 use crate::cancel::CancellationToken;
 use crate::generation::{Generation, RequestGate};
@@ -49,6 +49,12 @@ use crate::watch::{ChangeBatch, ChangeSink, RepoPaths, RepoWatcher, DEFAULT_DEBO
 
 /// blob 读取上限：超过即返回占位而不是内容（架构规划 5.5 的 2MB 阈值）。
 pub const MAX_BLOB_BYTES: usize = 2 * 1024 * 1024;
+
+/// 首屏日志索引的初始遍历窗口。
+///
+/// 完整遍历大仓库的全部历史正是"打开很久"的主因。首屏只需要够渲染前几页，
+/// 因此先只枚举这么多条；滚动接近末尾时再按需放大窗口（见 [`LogIndex::ensure`]）。
+const LOG_INDEX_INITIAL_WINDOW: usize = gt_core::DEFAULT_PAGE_SIZE * 4;
 
 /// 启动探测得到的可用能力。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -500,43 +506,108 @@ struct LogIndex {
     ids: Vec<Oid>,
     /// 该列表的降级说明（例如拓扑排序因规模退回日期序）。
     note: Option<String>,
+    /// 是否已遍历完整个历史；`false` 时 `ids` 可能被窗口截断，滚动时应继续扩展。
+    complete: bool,
 }
 
+/// 该图选项是否必须遍历完整历史。
+///
+/// 拓扑排序与"线性折叠"都要用到整段历史的父项关系，无法只枚举一个前缀，
+/// 因此这两种口径保持全量遍历（规模超限时沿用 `walk_ids_with` 的降级说明）。
+const fn requires_full_history(graph: GraphOptions) -> bool {
+    matches!(graph.sort, LogSort::Topological) || graph.collapse_linear
+}
+
+/// `LogIndex::ensure` 的返回值别名：id 切片、是否命中缓存、降级说明、是否已完整。
+type LogIndexView<'a> = (&'a [Oid], bool, Option<String>, bool);
+
 impl LogIndex {
-    /// 确保缓存与查询口径匹配，返回 id 列表的引用与降级说明。
+    /// 确保缓存与查询口径匹配，并按需扩展遍历窗口。
+    ///
+    /// `needed` 是本次要取到的位置（`offset + limit`）。首屏只遍历
+    /// [`LOG_INDEX_INITIAL_WINDOW`] 条；当滚到接近末尾、`needed` 超出已缓存长度时，
+    /// 再按更大的窗口重走一次 —— 同一口径下 revwalk 顺序稳定，已有前缀直接命中，
+    /// 实际开销只落在新增区间上。
+    ///
+    /// 返回 `(id 列表, 是否命中缓存, 降级说明, 是否已遍历完整)`。
     ///
     /// # Errors
-    /// 仓库读取失败时返回错误。
+    /// 仓库读取失败或操作被取消时返回错误。
     fn ensure(
         &mut self,
         repo: &GitRepo,
         scope: BranchScope,
         graph: GraphOptions,
         token: &CancellationToken,
-    ) -> Result<(&[Oid], bool, Option<String>), BackendError> {
+        needed: usize,
+    ) -> Result<LogIndexView<'_>, BackendError> {
+        self.ensure_with_window(repo, scope, graph, token, needed, LOG_INDEX_INITIAL_WINDOW)
+    }
+
+    /// [`LogIndex::ensure`] 的实现；`initial_window` 便于测试用小窗口触发扩展。
+    fn ensure_with_window(
+        &mut self,
+        repo: &GitRepo,
+        scope: BranchScope,
+        graph: GraphOptions,
+        token: &CancellationToken,
+        needed: usize,
+        initial_window: usize,
+    ) -> Result<LogIndexView<'_>, BackendError> {
         let key = (scope, graph);
+        let full = requires_full_history(graph);
         let from_cache = self.key == Some(key);
+
         if !from_cache {
             token
                 .check()
                 .map_err(|_| BackendError::Status("操作已取消".to_owned()))?;
-            // 构建完整请求只为拿 scope/graph：offset/limit 在下游切片时用。
-            let request = LogPageRequest {
-                filter: gt_core::LogFilter {
-                    scope,
-                    ..gt_core::LogFilter::default()
-                },
-                offset: 0,
-                limit: gt_core::DEFAULT_PAGE_SIZE,
-                graph,
+            let window = if full {
+                None
+            } else {
+                Some(needed.max(initial_window))
             };
-            let (ids, note) = repo.walk_ids_with(&request, None)?;
+            let (ids, note) = walk_log_ids(repo, scope, graph, window)?;
+            self.complete = window.is_none_or(|window| ids.len() < window);
             self.ids = ids;
             self.note = note;
             self.key = Some(key);
+        } else if !full && !self.complete && self.ids.len() < needed {
+            token
+                .check()
+                .map_err(|_| BackendError::Status("操作已取消".to_owned()))?;
+            // 扩展窗口：至少翻倍，避免每滚一页就重走一次。
+            let window = needed
+                .max(self.ids.len().saturating_mul(2))
+                .max(initial_window);
+            let (ids, note) = walk_log_ids(repo, scope, graph, Some(window))?;
+            self.complete = ids.len() < window;
+            self.ids = ids;
+            self.note = note;
         }
-        Ok((&self.ids, from_cache, self.note.clone()))
+
+        Ok((&self.ids, from_cache, self.note.clone(), self.complete))
     }
+}
+
+/// 按给定口径遍历一次；`limit` 为 [`None`] 时遍历完整历史。
+fn walk_log_ids(
+    repo: &GitRepo,
+    scope: BranchScope,
+    graph: GraphOptions,
+    limit: Option<usize>,
+) -> Result<(Vec<Oid>, Option<String>), BackendError> {
+    // 构建完整请求只为拿 scope/graph：offset/limit 在下游切片时用。
+    let request = LogPageRequest {
+        filter: gt_core::LogFilter {
+            scope,
+            ..gt_core::LogFilter::default()
+        },
+        offset: 0,
+        limit: gt_core::DEFAULT_PAGE_SIZE,
+        graph,
+    };
+    repo.walk_ids_with(&request, limit)
 }
 
 /// 服务层入口。
@@ -1027,20 +1098,21 @@ fn execute_log_page(
     token: &CancellationToken,
 ) -> Result<Outcome, String> {
     let scope = request.filter.scope;
-    let (ids, from_cache, note) = {
+    // 下界取 1：分页大小由调用方决定（首次加载与滚动预取可能不同），
+    // 只对"异常大的一页"设上界，避免一次物化过多提交元数据。
+    let limit = request.limit.clamp(1, gt_core::MAX_PAGE_SIZE);
+    let needed = request.offset.saturating_add(limit);
+    let (ids, from_cache, note, complete) = {
         let mut index = handle.lock_log_index();
-        let (ids, from_cache, note) = index
-            .ensure(repo, scope, request.graph, token)
+        let (ids, from_cache, note, complete) = index
+            .ensure(repo, scope, request.graph, token, needed)
             .map_err(user_message)?;
-        (ids.to_vec(), from_cache, note)
+        (ids.to_vec(), from_cache, note, complete)
     };
     token.check().map_err(user_message)?;
 
     let total = ids.len();
-    // 下界取 1：分页大小由调用方决定（首次加载与滚动预取可能不同），
-    // 只对"异常大的一页"设上界，避免一次物化过多提交元数据。
-    let limit = request.limit.clamp(1, gt_core::MAX_PAGE_SIZE);
-    let end = request.offset.saturating_add(limit).min(total);
+    let end = needed.min(total);
     let slice: Vec<Oid> = if request.offset < total {
         ids[request.offset..end].to_vec()
     } else {
@@ -1049,7 +1121,8 @@ fn execute_log_page(
     token.check().map_err(user_message)?;
 
     let nodes = repo.commit_metas(&slice, request).map_err(user_message)?;
-    let exhausted = end >= total;
+    // 只有在确已遍历完整、且已取到末尾时才算"没有更多"：否则滚动会继续扩展索引。
+    let exhausted = end >= total && complete;
 
     Ok(Outcome::LogPage(Box::new(LogPageResult {
         page: gt_core::LogNodePage {
@@ -1873,8 +1946,10 @@ pub fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_branch_scope, display_path, Capabilities, GitService, RequestKind, MAX_BLOB_BYTES,
+        default_branch_scope, display_path, Capabilities, GitService, LogIndex, RequestKind,
+        MAX_BLOB_BYTES,
     };
+    use crate::cancel::CancellationToken;
     use crate::console::ConsoleBuffer;
     use crate::task::{DiffSide, Outcome, SelectionMode, WriteRequest};
     use crossbeam_channel::unbounded;
@@ -1909,6 +1984,38 @@ mod tests {
         std::fs::write(root.join("a.txt"), "hello\n").expect("写文件");
         run(&["add", "-A"]);
         run(&["commit", "-q", "-m", "初始提交"]);
+        Some(root)
+    }
+
+    /// 造一个含 `count` 个线性提交的临时仓库；git 不可用时返回 `None`。
+    fn tmp_repo_with_commits(label: &str, count: usize) -> Option<PathBuf> {
+        let cli = gt_backend::GitCli::detect()?;
+        let root =
+            std::env::temp_dir().join(format!("knotwork-service-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("建临时目录");
+
+        let run = |args: &[&str]| {
+            let output = cli
+                .run(
+                    Some(&root),
+                    args,
+                    &gt_backend::NoopObserver,
+                    gt_backend::LOCAL_TIMEOUT,
+                )
+                .expect("执行 git");
+            assert!(output.is_success(), "git {args:?} 失败：{}", output.stderr);
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "service@knotwork.invalid"]);
+        run(&["config", "user.name", "Knotwork Service"]);
+        run(&["config", "core.autocrlf", "false"]);
+        for n in 0..count {
+            std::fs::write(root.join("a.txt"), format!("line {n}\n")).expect("写文件");
+            let message = format!("提交 {n}");
+            run(&["add", "-A"]);
+            run(&["commit", "-q", "-m", &message]);
+        }
         Some(root)
     }
 
@@ -2025,6 +2132,43 @@ mod tests {
         assert!(page.from_cache, "同口径的后续请求应复用 id 列表");
 
         service.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn log_index_window_extends_lazily_until_complete() {
+        let Some(root) = tmp_repo_with_commits("lazy-log", 3) else {
+            return;
+        };
+        let repo = gt_backend::GitRepo::open(&root, gt_backend::noop_observer()).expect("打开仓库");
+        let token = CancellationToken::new();
+        let mut index = LogIndex::default();
+        let scope = default_branch_scope();
+        let graph = gt_core::GraphOptions::default();
+
+        // 首屏只取 1 条：窗口被压到 1，只能判定"未完整"。
+        let (ids, from_cache, _note, complete) = index
+            .ensure_with_window(&repo, scope, graph, &token, 1, 1)
+            .expect("枚举日志");
+        assert_eq!(ids.len(), 1, "窗口为 1 时应只枚举 1 条");
+        assert!(!from_cache, "首次请求必然未命中缓存");
+        assert!(!complete, "只枚举了 1 条，不应判定为完整");
+
+        // 扩到 2：仍在同一口径内（应命中缓存），窗口继续放大。
+        let (ids, from_cache, _note, complete) = index
+            .ensure_with_window(&repo, scope, graph, &token, 2, 1)
+            .expect("扩展日志窗口");
+        assert!(from_cache, "同口径应命中缓存");
+        assert_eq!(ids.len(), 2, "窗口应扩到 2 条");
+        assert!(!complete, "3 条历史里只枚举 2 条，仍不完整");
+
+        // 扩到超过历史长度：应枚举全部并判定完整。
+        let (ids, _from_cache, _note, complete) = index
+            .ensure_with_window(&repo, scope, graph, &token, 4, 1)
+            .expect("扩展日志窗口");
+        assert_eq!(ids.len(), 3, "应枚举出全部 3 条提交");
+        assert!(complete, "已枚举完全部历史");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

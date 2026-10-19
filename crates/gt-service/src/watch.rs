@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
+use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, Debouncer, NoCache};
 
 /// 去抖窗口下限（FR-STA-03：200–300ms 合并）。
 pub const DEBOUNCE_MIN: Duration = Duration::from_millis(200);
@@ -274,7 +274,7 @@ impl ChangeSink for crossbeam_channel::Sender<ChangeBatch> {
 /// 最容易漏掉的一环：监听器线程若持有强引用，仓库的内存就永远回不去。
 pub struct RepoWatcher {
     /// `Debouncer::stop` 会消费自身，因此用 `Option` 表达"已停止"。
-    debouncer: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
+    debouncer: Option<Debouncer<RecommendedWatcher, NoCache>>,
     roots: Vec<PathBuf>,
     debounce: Duration,
 }
@@ -313,23 +313,29 @@ impl RepoWatcher {
         }
 
         let owned = paths.clone();
-        let mut debouncer = new_debouncer(debounce, None, move |result: DebounceEventResult| {
-            match result {
-                Ok(events) => {
-                    // 一个 `notify::Event` 可能携带多个路径（重命名会给出旧、新两个）。
-                    let touched = events.iter().flat_map(|event| event.event.paths.clone());
-                    if let Some(batch) = merge_events(touched, &owned) {
-                        sink.on_change(batch);
+        let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
+            debounce,
+            None,
+            move |result: DebounceEventResult| {
+                match result {
+                    Ok(events) => {
+                        // 一个 `notify::Event` 可能携带多个路径（重命名会给出旧、新两个）。
+                        let touched = events.iter().flat_map(|event| event.event.paths.clone());
+                        if let Some(batch) = merge_events(touched, &owned) {
+                            sink.on_change(batch);
+                        }
+                    }
+                    Err(errors) => {
+                        // 单个路径的监听失败不应中断整体监听（例如权限不足的子目录）。
+                        for error in errors {
+                            tracing::warn!(%error, "文件监听错误");
+                        }
                     }
                 }
-                Err(errors) => {
-                    // 单个路径的监听失败不应中断整体监听（例如权限不足的子目录）。
-                    for error in errors {
-                        tracing::warn!(%error, "文件监听错误");
-                    }
-                }
-            }
-        })
+            },
+            NoCache::new(),
+            notify::Config::default(),
+        )
         .map_err(WatchError::Notify)?;
 
         let mut registered = Vec::with_capacity(roots.len());

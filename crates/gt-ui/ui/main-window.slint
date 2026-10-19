@@ -417,8 +417,16 @@ export component MainWindow inherits Window {
     callback history-close();
 
     title: repo-title + (read-only ? Texts.s3 : "");
-    width: 1180px;
-    height: 680px;
+    // 初始尺寸用 preferred-* 而不是 width/height：后者会被 Slint 同时当作 min/max，
+    // 令窗口变成固定尺寸（winit 据此 set_resizable(false)，既不能拖边拉伸也没有
+    // 最大化按钮）。这里显式给出 min/max，避免 min/max 从内容推导（部分视图会推导出
+    // min==max 而再次卡死尺寸）；preferred-* 只决定首屏尺寸。
+    preferred-width: 1000px;
+    preferred-height: 650px;
+    min-width: 900px;
+    min-height: 600px;
+    max-width: 100000px;
+    max-height: 100000px;
     background: Palette.bg;
 
     init => {
@@ -427,6 +435,14 @@ export component MainWindow inherits Window {
     }
     changed dark-theme => { Palette.dark = root.dark-theme; }
     changed english-ui => { Texts.en = root.english-ui; }
+
+    // 布局断环：若在子元素 binding 里直接读 root.width/height，Slint 会判定为
+    // binding loop（窗口 layoutinfo <-> 子尺寸，因为 width 由 layoutinfo 推导）。
+    // 这里把窗口尺寸经 changed 拷进普通属性，布局只读这些普通属性即可断环。
+    property <length> viewport-width: 1000px;
+    property <length> viewport-height: 650px;
+    changed width => { root.viewport-width = root.width; }
+    changed height => { root.viewport-height = root.height; }
 
     changed blame-anchor => {
         if root.blame-anchor >= 0 {
@@ -614,7 +630,7 @@ export component MainWindow inherits Window {
                 Rectangle {
                     width: root.commit-collapsed
                         ? 0px
-                        : (root.width < 1100px ? 320px : Metrics.commit-panel-width);
+                        : (root.viewport-width < 1100px ? 320px : Metrics.commit-panel-width);
                     visible: !root.commit-collapsed;
                     background: Palette.panel;
                     clip: true;
@@ -682,7 +698,7 @@ export component MainWindow inherits Window {
                         ListView {
                             height: max(
                                 50px,
-                                root.height - 573px
+                                root.viewport-height - 573px
                                     - (root.state-banner-visible ? 28px : 0px)
                                     - (root.read-only ? 28px : 0px)
                                     - (root.cli-missing ? 44px : 0px)
@@ -1247,7 +1263,7 @@ export component MainWindow inherits Window {
 
                         // 分支树 + 分支操作
                         Rectangle {
-                            width: root.width < 1060px ? 190px : 228px;
+                            width: root.viewport-width < 1060px ? 190px : 228px;
                             background: Palette.panel;
 
                             VerticalLayout {
@@ -1472,13 +1488,13 @@ export component MainWindow inherits Window {
                             }
 
                         VDivider {
-                            visible: root.width >= 1080px;
+                            visible: root.viewport-width >= 1080px;
                         }
 
                         // 提交详情：元数据 + 文件清单（点文件在主差异区打开）
                         Rectangle {
-                            width: root.width >= 1080px ? Metrics.details-panel-width : 0px;
-                            visible: root.width >= 1080px;
+                            width: root.viewport-width >= 1080px ? Metrics.details-panel-width : 0px;
+                            visible: root.viewport-width >= 1080px;
                             background: Palette.panel;
 
                             Text {

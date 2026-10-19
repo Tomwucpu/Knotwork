@@ -192,34 +192,76 @@ fn make_token() -> String {
 ///
 /// 不用 `libc`/`unsafe`（工作区禁止 `unsafe`），因此走各自平台的命令行工具：
 /// Windows 用 `tasklist`，Unix 用 `kill -0`。两者都是系统自带。
+///
+/// 起子进程本身有成本（Windows 上冷启动可达数百毫秒），因此这里给它设了
+/// 硬超时：超时后保守地按"存活"处理（宁可只读，也不要两个实例同时写），
+/// 而不是把调用方（打开仓库的流程）无限拖住。
 fn process_alive(pid: u32) -> bool {
+    let deadline = std::time::Instant::now() + SUBPROCESS_TIMEOUT;
+    // 无法判定时保守地认为"存活"：宁可只读，也不要两个实例同时写。
+    let Ok(mut child) = spawn_alive_probe(pid).spawn() else {
+        return true;
+    };
+    // 先取走 stdout：子进程退出后据此读取输出，同时避免无人读取时管道被填满。
     #[cfg(windows)]
-    {
-        let output = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-        let Ok(output) = output else {
-            // 无法判定时保守地认为"存活"：宁可只读，也不要两个实例同时写。
-            return true;
-        };
-        let text = String::from_utf8_lossy(&output.stdout);
-        let needle = format!("\"{pid}\"");
-        text.contains(&needle) || text.contains(&format!(",{pid},"))
+    let mut stdout = child.stdout.take();
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                #[cfg(windows)]
+                {
+                    let _ = status;
+                    let mut text = String::new();
+                    if let Some(out) = stdout.as_mut() {
+                        use std::io::Read as _;
+                        if out.read_to_string(&mut text).is_err() {
+                            return true;
+                        }
+                    }
+                    // tasklist 在"没有匹配进程"时也会成功退出，因此不能只看退出码：
+                    // 必须确认输出里出现了该 PID。
+                    let needle = format!("\"{pid}\"");
+                    return text.contains(&needle) || text.contains(&format!(",{pid},"));
+                }
+                #[cfg(not(windows))]
+                {
+                    return status.success();
+                }
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                // 超时：杀掉探针并保守判活。
+                let _ = child.kill();
+                let _ = child.wait();
+                return true;
+            }
+            Err(_) => return true,
+        }
     }
-    #[cfg(not(windows))]
-    {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(true)
-    }
+}
+
+/// 进程存活判定探针的超时上限。
+const SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 构造"进程存活"探测命令（stdin 关闭、stdout 管道、stderr 丢弃）。
+fn spawn_alive_probe(pid: u32) -> Command {
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new("tasklist");
+        command.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
+        command
+    } else {
+        let mut command = Command::new("kill");
+        command.args(["-0", &pid.to_string()]);
+        command
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    command
 }
 
 #[cfg(test)]

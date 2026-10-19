@@ -38,9 +38,9 @@ use gt_core::{
 use gt_diff::{FileDiff, HunkSelection};
 use gt_graph::LaneLayout;
 use gt_service::{
-    first_log_page, AdvancedResult, ConflictedEntry, ConsoleBuffer, Delivery, DiffSide, GitService,
-    NetworkFailure, NetworkOutcome, NetworkRequest, NetworkSnapshot, Outcome, PushPreviewRequest,
-    RepoHandle, RequestKind, SearchRequest, SelectionMode, WriteRequest,
+    first_log_page, AdvancedResult, ChangeImpact, ConflictedEntry, ConsoleBuffer, Delivery,
+    DiffSide, GitService, NetworkFailure, NetworkOutcome, NetworkRequest, NetworkSnapshot, Outcome,
+    PushPreviewRequest, RepoHandle, RequestKind, SearchRequest, SelectionMode, WriteRequest,
 };
 
 use crate::generated::{DiffRow, MainWindow};
@@ -883,7 +883,7 @@ impl Session {
         self.request_log_page(0);
     }
 
-    /// 全部重算（用户点"刷新"或文件系统变化后调用）。
+    /// 全部重算（用户点"刷新"，或 git 状态变化后调用）。
     pub fn refresh(&mut self) {
         // 引用 / 索引 / HEAD 可能已变：日志 id 列表缓存作废，
         // 泳道布局与已加载节点也要重来，否则新旧历史会接不上。
@@ -895,6 +895,21 @@ impl Session {
         self.request_initial();
         // 差异也重算：写操作后它极可能已经过期（例如暂存了一个 hunk）。
         self.reload_diff();
+    }
+
+    /// 按一批文件变化的影响刷新视图。
+    ///
+    /// git 状态（引用 / 索引 / HEAD）变化才需要重算日志与概览；
+    /// 纯工作区变化只影响状态列表与当前差异，重算日志只会白费一次 revwalk。
+    pub fn apply_change_impact(&mut self, impact: ChangeImpact) {
+        if impact.git_state_changed {
+            self.refresh();
+        } else if impact.worktree_changed {
+            // 在飞的状态请求已经过期：清标记后再发，代次推进会作废旧结果。
+            self.status_in_flight = false;
+            self.request_status();
+            self.reload_diff();
+        }
     }
 
     /// 清空全部"在飞"标记。
@@ -4431,6 +4446,76 @@ mod tests {
         assert!(
             before.iter().zip(&after).all(|(early, late)| early < late),
             "刷新必须重新发号（清了在飞标记才会真的重发）：{before:?} -> {after:?}"
+        );
+
+        // 收尾：让服务工作线程退出，再清理临时目录。
+        drop(session);
+        drop(handle);
+        let mut service = std::sync::Arc::try_unwrap(service)
+            .unwrap_or_else(|_| panic!("服务不应还有其它强引用"));
+        service.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worktree_impact_refreshes_status_but_git_state_impact_relogs() {
+        // 回归防线：纯工作区变化不应重算日志与概览，否则每次编译都会白跑一次
+        // revwalk；只有 git 状态（引用 / 索引 / HEAD）变化才需要整表重来。
+        let Some(root) = tmp_repo("change-impact") else {
+            return;
+        };
+        let service = std::sync::Arc::new(
+            gt_service::GitService::new(gt_service::silent_observer()).expect("建服务"),
+        );
+        let handle = service.open_repo(&root).expect("打开仓库");
+        let console = gt_service::ConsoleBuffer::shared(8);
+        let mut session =
+            super::Session::new(std::sync::Arc::clone(&service), handle.clone(), console, 8);
+
+        session.request_initial();
+        let lanes = [
+            gt_service::RequestLane::Overview,
+            gt_service::RequestLane::Status,
+            gt_service::RequestLane::Log,
+        ];
+        let generations = || {
+            lanes
+                .iter()
+                .map(|lane| handle.generation(*lane))
+                .collect::<Vec<_>>()
+        };
+
+        let before_worktree = generations();
+        session.apply_change_impact(gt_service::ChangeImpact {
+            worktree_changed: true,
+            git_state_changed: false,
+        });
+        let after_worktree = generations();
+        assert!(
+            after_worktree[1] > before_worktree[1],
+            "工作区变化必须重发状态请求"
+        );
+        assert_eq!(
+            after_worktree[0], before_worktree[0],
+            "工作区变化不应重算概览"
+        );
+        assert_eq!(
+            after_worktree[2], before_worktree[2],
+            "工作区变化不应重算日志"
+        );
+
+        session.apply_change_impact(gt_service::ChangeImpact {
+            worktree_changed: false,
+            git_state_changed: true,
+        });
+        let after_git_state = generations();
+        assert!(
+            after_git_state[2] > after_worktree[2],
+            "git 状态变化必须重算日志"
+        );
+        assert!(
+            after_git_state[0] > after_worktree[0],
+            "git 状态变化必须重算概览"
         );
 
         // 收尾：让服务工作线程退出，再清理临时目录。
