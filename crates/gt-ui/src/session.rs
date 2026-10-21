@@ -28,8 +28,8 @@ use crossbeam_channel::{Receiver, Sender};
 use gt_backend::{
     CherryPickRequest, FetchRequest, MergeRequest, MergeStrategy, PatchApplyRequest, PatchSource,
     PullRequest, PullStrategy, PushRequest, PushTarget, RebaseAction, RebaseControl, RebasePlan,
-    RebaseProgress, RebaseRequest, RemoteEdit, RemoteInfo, RemoteListing, ResetMode, ResetRequest,
-    RevertRequest, RepoModule, StashEntry, StashOp, TagOp,
+    RebaseProgress, RebaseRequest, RemoteEdit, RemoteInfo, RemoteListing, RepoModule, ResetMode,
+    ResetRequest, RevertRequest, StashEntry, StashOp, TagOp,
 };
 use gt_core::{
     ChangeSet, CommitCheck, CommitCheckInput, CommitMeta, HeadInfo, LogNode, RepoState,
@@ -53,7 +53,8 @@ use crate::view_model::{
     discard_confirmation, discard_selection_confirmation, empty_commit_detail, head_text,
     network_error_text, ordered_refs, push_hints, push_preview_text, rc_model,
     rebase_action_from_code, rebase_skip_confirmation, reset_confirmation, resolution_from_code,
-    stash_drop_confirmation, state_banner, take_side_confirmation, ChangeGrouping, ChangeViewOptions,
+    stash_drop_confirmation, state_banner, take_side_confirmation, ChangeGrouping,
+    ChangeViewOptions,
 };
 
 /// 距离已加载末尾多少行时预取下一页。
@@ -1523,10 +1524,7 @@ impl Session {
             return;
         };
         if entry.is_conflicted()
-            || matches!(
-                entry.bucket(),
-                StatusBucket::Staged | StatusBucket::Ignored
-            )
+            || matches!(entry.bucket(), StatusBucket::Staged | StatusBucket::Ignored)
         {
             return;
         }
@@ -1558,10 +1556,7 @@ impl Session {
             .iter()
             .filter(|entry| {
                 !entry.is_conflicted()
-                    && !matches!(
-                        entry.bucket(),
-                        StatusBucket::Staged | StatusBucket::Ignored
-                    )
+                    && !matches!(entry.bucket(), StatusBucket::Staged | StatusBucket::Ignored)
                     && path_is_under(&entry.path, prefix)
             })
             .map(|entry| entry.path.clone())
@@ -1580,9 +1575,7 @@ impl Session {
             .entries
             .iter()
             .filter(|entry| {
-                entry.is_staged()
-                    && !entry.is_conflicted()
-                    && path_is_under(&entry.path, prefix)
+                entry.is_staged() && !entry.is_conflicted() && path_is_under(&entry.path, prefix)
             })
             .map(|entry| entry.path.clone())
             .collect();
@@ -3206,7 +3199,8 @@ fn path_is_under(path: &str, prefix: &str) -> bool {
 
 /// 更新策略 → 界面下标（0 合并 / 1 变基 / 2 仅快进）。
 #[must_use]
-fn strategy_index(strategy: PullStrategy) -> i32 {    match strategy {
+fn strategy_index(strategy: PullStrategy) -> i32 {
+    match strategy {
         PullStrategy::Merge => 0,
         PullStrategy::Rebase => 1,
         PullStrategy::FastForwardOnly => 2,
@@ -4539,7 +4533,9 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_log_page, path_is_under, Confirm, LogState, LOG_PAGE_SIZE, PREFETCH_MARGIN};
+    use super::{
+        append_log_page, path_is_under, Confirm, LogState, LOG_PAGE_SIZE, PREFETCH_MARGIN,
+    };
     use gt_core::{CommitMeta, Oid};
 
     fn commit(byte: u8, parents: Vec<Oid>) -> CommitMeta {
@@ -4821,7 +4817,10 @@ mod tests {
         assert!(path_is_under("src/a.rs", "src"));
         assert!(path_is_under("docs/", "docs"), "折叠目录带尾随斜杠也要命中");
         assert!(path_is_under("a.rs", ""), "空前缀表示仓库根");
-        assert!(!path_is_under("src-tools/a.rs", "src"), "不能按字符前缀误判");
+        assert!(
+            !path_is_under("src-tools/a.rs", "src"),
+            "不能按字符前缀误判"
+        );
         assert!(!path_is_under("src", "src/a.rs"));
     }
 }

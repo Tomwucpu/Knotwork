@@ -347,7 +347,10 @@ fn ignored_files_are_opt_in_and_match_git_cli() {
         "默认状态不得包含忽略条目：{:?}",
         default.entries
     );
-    assert!(!default.entries.iter().any(|entry| entry.path == "debug.log"));
+    assert!(!default
+        .entries
+        .iter()
+        .any(|entry| entry.path == "debug.log"));
 
     let with_ignored = repo.status_with_ignored(true).expect("含忽略状态");
     let ignored: Vec<&str> = with_ignored
@@ -900,15 +903,8 @@ fn blame_matches_git_blame_l_including_rename() {
     commit_all(&fixture, "重命名");
 
     let location = fixture.open().location().clone();
-    let rows = gt_backend::blame::blame(
-        &cli,
-        &location,
-        &NoopObserver,
-        None,
-        "renamed.txt",
-        None,
-    )
-    .expect("blame 成功");
+    let rows = gt_backend::blame::blame(&cli, &location, &NoopObserver, None, "renamed.txt", None)
+        .expect("blame 成功");
 
     let reference = parse_blame_l(&fixture.git(&["blame", "-l", "--", "renamed.txt"]));
     assert_eq!(reference.len(), 4, "git blame 参照行数");
@@ -919,11 +915,14 @@ fn blame_matches_git_blame_l_including_rename() {
         .collect();
 
     // 边界提交在 -l 输出中被截短一位以容纳 `^` 前缀：规范化为前 39 位再比对。
-    let norm = |sha: &str| sha.trim_start_matches('^').chars().take(39).collect::<String>();
-    let ours_norm: Vec<(String, usize)> =
-        ours.iter().map(|(s, n)| (norm(s), *n)).collect();
-    let ref_norm: Vec<(String, usize)> =
-        reference.iter().map(|(s, n)| (norm(s), *n)).collect();
+    let norm = |sha: &str| {
+        sha.trim_start_matches('^')
+            .chars()
+            .take(39)
+            .collect::<String>()
+    };
+    let ours_norm: Vec<(String, usize)> = ours.iter().map(|(s, n)| (norm(s), *n)).collect();
+    let ref_norm: Vec<(String, usize)> = reference.iter().map(|(s, n)| (norm(s), *n)).collect();
     assert_eq!(ours_norm, ref_norm, "blame 输出应与 git blame -l 逐行一致");
 
     // 字段抽查：第一行来自第一版，第四行来自第二版。
@@ -971,8 +970,9 @@ fn chain_navigation_maps_line_and_hits_expected_commit() {
     assert_eq!(mapped, 7, "头部插 3 行后第 10 行应来自旧侧第 7 行");
 
     // 上溯后 blame 旧侧：第 7 行应命中"第一版"提交（与手工 `git blame HEAD~` 一致）。
-    let rows = gt_backend::blame::blame(&cli, &location, &NoopObserver, Some(&first), "f.txt", None)
-        .expect("旧侧 blame 成功");
+    let rows =
+        gt_backend::blame::blame(&cli, &location, &NoopObserver, Some(&first), "f.txt", None)
+            .expect("旧侧 blame 成功");
     assert_eq!(rows[6].commit, first, "上溯后第 7 行应归因到第一版提交");
     assert_eq!(rows[6].summary, "第一版");
 }
@@ -989,9 +989,8 @@ fn worktree_blame_covers_uncommitted_lines() {
     fixture.write("f.txt", "committed\nstaged-later\n");
 
     let location = fixture.open().location().clone();
-    let rows =
-        gt_backend::blame::blame(&cli, &location, &NoopObserver, None, "f.txt", None)
-            .expect("工作区 blame 成功");
+    let rows = gt_backend::blame::blame(&cli, &location, &NoopObserver, None, "f.txt", None)
+        .expect("工作区 blame 成功");
     assert_eq!(rows.len(), 2);
     // 未提交的行归因到"未提交"（git 输出为全零提交）。
     assert!(
@@ -1016,17 +1015,15 @@ fn file_history_follows_renames() {
     commit_all(&fixture, "重命名");
 
     let location = fixture.open().location().clone();
-    let rows = gt_backend::blame::file_history(
-        &cli,
-        &location,
-        &NoopObserver,
-        false,
-        "new.txt",
-        None,
-    )
-    .expect("文件历史成功");
+    let rows =
+        gt_backend::blame::file_history(&cli, &location, &NoopObserver, false, "new.txt", None)
+            .expect("文件历史成功");
     let summaries: Vec<&str> = rows.iter().map(|r| r.summary.as_str()).collect();
-    assert_eq!(summaries, vec!["重命名", "第二次", "第一次"], "--follow 应覆盖重命名前");
+    assert_eq!(
+        summaries,
+        vec!["重命名", "第二次", "第一次"],
+        "--follow 应覆盖重命名前"
+    );
     for row in &rows {
         assert_eq!(row.commit.len(), 40);
         assert_eq!(row.short.len(), 7, "%h 短哈希");

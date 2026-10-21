@@ -224,7 +224,10 @@ fn repeated_read_operations_do_not_grow_rss() {
          各轮采样：{:?}",
         growth / (1024 * 1024),
         max / (1024 * 1024),
-        samples.iter().map(|s| s / (1024 * 1024)).collect::<Vec<_>>()
+        samples
+            .iter()
+            .map(|s| s / (1024 * 1024))
+            .collect::<Vec<_>>()
     );
 }
 

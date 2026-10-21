@@ -978,7 +978,9 @@ mod tests {
     fn request_labels_cover_every_kind() {
         let kinds = [
             RequestKind::Overview,
-            RequestKind::Status { include_ignored: false },
+            RequestKind::Status {
+                include_ignored: false,
+            },
             RequestKind::LogPage(LogPageRequest::default()),
             RequestKind::TreeChanges {
                 old: Some("HEAD~1".to_owned()),
@@ -1000,7 +1002,13 @@ mod tests {
     #[test]
     fn every_kind_maps_to_exactly_one_lane() {
         assert_eq!(RequestKind::Overview.lane(), RequestLane::Overview);
-        assert_eq!(RequestKind::Status { include_ignored: false }.lane(), RequestLane::Status);
+        assert_eq!(
+            RequestKind::Status {
+                include_ignored: false
+            }
+            .lane(),
+            RequestLane::Status
+        );
         assert_eq!(
             RequestKind::LogPage(LogPageRequest::default()).lane(),
             RequestLane::Log
@@ -1093,7 +1101,9 @@ mod tests {
 
         let delivery = Delivery {
             generation: Generation::INITIAL,
-            kind: RequestKind::Status { include_ignored: false },
+            kind: RequestKind::Status {
+                include_ignored: false,
+            },
             outcome: Outcome::Failed("x".to_owned()),
         };
         assert_eq!(delivery.clone(), delivery);

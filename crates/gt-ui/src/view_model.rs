@@ -538,15 +538,12 @@ fn push_module_rows(
         let path = changes.entries[index].path.as_str();
         let (root, name) = if view.modules.is_empty() {
             // 非 Cargo 仓库：模块分组退化为顶层目录。
-            path.split_once('/').map_or(
-                ("", view.root_module_name),
-                |(first, _)| (first, first),
-            )
+            path.split_once('/')
+                .map_or(("", view.root_module_name), |(first, _)| (first, first))
         } else {
-            module_for_path(view.modules, path).map_or(
-                ("", view.root_module_name),
-                |module| (module.path.as_str(), module.name.as_str()),
-            )
+            module_for_path(view.modules, path).map_or(("", view.root_module_name), |module| {
+                (module.path.as_str(), module.name.as_str())
+            })
         };
         buckets
             .entry(root.to_owned())
@@ -715,7 +712,16 @@ fn push_directory_rows(
             .cmp(&changes.entries[*right].path)
     });
     for index in files {
-        push_file_row(rows, changes, index, group, depth, selected, view, module_root);
+        push_file_row(
+            rows,
+            changes,
+            index,
+            group,
+            depth,
+            selected,
+            view,
+            module_root,
+        );
     }
 }
 
@@ -740,7 +746,12 @@ fn directory_file_count(node: &ChangeDirNode) -> i32 {
 }
 
 fn directory_file_count_usize(node: &ChangeDirNode) -> usize {
-    node.files.len() + node.dirs.values().map(directory_file_count_usize).sum::<usize>()
+    node.files.len()
+        + node
+            .dirs
+            .values()
+            .map(directory_file_count_usize)
+            .sum::<usize>()
 }
 
 /// 模块 / 目录节点的折叠键。分组号参与键，避免同一路径在不同分区互相影响。
@@ -1825,13 +1836,23 @@ mod tests {
         assert_eq!(rows[1].kind, 1);
         assert_eq!(rows[1].count, 3);
         assert_eq!(
-            (rows[2].kind, rows[2].name.as_str(), rows[2].count, rows[2].depth),
+            (
+                rows[2].kind,
+                rows[2].name.as_str(),
+                rows[2].count,
+                rows[2].depth
+            ),
             (3, "src", 2, 1),
             "目录节点先于文件，并统计子树文件数"
         );
         assert_eq!(rows[2].node_path.as_str(), "src");
         assert_eq!(
-            (rows[3].kind, rows[3].name.as_str(), rows[3].count, rows[3].depth),
+            (
+                rows[3].kind,
+                rows[3].name.as_str(),
+                rows[3].count,
+                rows[3].depth
+            ),
             (3, "nested", 1, 2)
         );
         assert_eq!(rows[3].node_path.as_str(), "src/nested");
@@ -1871,7 +1892,11 @@ mod tests {
     #[test]
     fn change_rows_group_by_cargo_modules() {
         let set = ChangeSet::new(vec![
-            StatusEntry::new("docs/guide.md", StatusFlag::Unmodified, StatusFlag::Modified),
+            StatusEntry::new(
+                "docs/guide.md",
+                StatusFlag::Unmodified,
+                StatusFlag::Modified,
+            ),
             StatusEntry::new(
                 "crates/gt-ui/src/lib.rs",
                 StatusFlag::Unmodified,
@@ -1921,7 +1946,11 @@ mod tests {
     fn change_rows_module_grouping_falls_back_to_top_level() {
         let set = ChangeSet::new(vec![
             StatusEntry::new("README.md", StatusFlag::Unmodified, StatusFlag::Modified),
-            StatusEntry::new("crates/tool.rs", StatusFlag::Unmodified, StatusFlag::Modified),
+            StatusEntry::new(
+                "crates/tool.rs",
+                StatusFlag::Unmodified,
+                StatusFlag::Modified,
+            ),
         ]);
         let empty = BTreeSet::new();
         let mut view = view_for(&empty);
@@ -1994,7 +2023,9 @@ mod tests {
         let empty = BTreeSet::new();
         let default_rows = build_change_rows(&set, None, &view_for(&empty));
         assert!(
-            default_rows.iter().all(|row| row.group != 2 && !row.is_ignored),
+            default_rows
+                .iter()
+                .all(|row| row.group != 2 && !row.is_ignored),
             "默认不显示忽略分组"
         );
 

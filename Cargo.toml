@@ -21,16 +21,17 @@ edition = "2021"
 rust-version = "1.85"
 publish = false
 authors = ["Knotwork"]
+license = "MIT"
 
 [workspace.dependencies]
 # ---- 内部 crate（依赖图见架构规划 4.4 节）----
-gt-core = { path = "crates/gt-core" }
-gt-backend = { path = "crates/gt-backend" }
-gt-service = { path = "crates/gt-service" }
-gt-diff = { path = "crates/gt-diff" }
-gt-graph = { path = "crates/gt-graph" }
-gt-config = { path = "crates/gt-config" }
-gt-ui = { path = "crates/gt-ui" }
+gt-core = { path = "crates/gt-core", version = "0.1.0" }
+gt-backend = { path = "crates/gt-backend", version = "0.1.0" }
+gt-service = { path = "crates/gt-service", version = "0.1.0" }
+gt-diff = { path = "crates/gt-diff", version = "0.1.0" }
+gt-graph = { path = "crates/gt-graph", version = "0.1.0" }
+gt-config = { path = "crates/gt-config", version = "0.1.0" }
+gt-ui = { path = "crates/gt-ui", version = "0.1.0" }
 
 # ---- 基础库（阶段 0 实际使用）----
 thiserror = "2"

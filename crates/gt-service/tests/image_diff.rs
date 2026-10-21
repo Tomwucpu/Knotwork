@@ -22,7 +22,12 @@ fn make_png(path: &std::path::Path, rgb: [u8; 3]) {
 fn git(repo: &std::path::Path, args: &[&str]) {
     let cli = GitCli::detect().expect("本机应装有 git");
     let output = cli
-        .run(Some(repo), args, &gt_backend::NoopObserver, gt_backend::LOCAL_TIMEOUT)
+        .run(
+            Some(repo),
+            args,
+            &gt_backend::NoopObserver,
+            gt_backend::LOCAL_TIMEOUT,
+        )
         .expect("执行 git");
     assert!(output.is_success(), "git {args:?} 失败：{}", output.stderr);
 }
@@ -67,11 +72,9 @@ fn image_diff_reports_sides_and_equality() {
     git(&root, &["add", "-A"]);
     git(&root, &["commit", "-q", "-m", "二进制"]);
 
-    let mut service = GitService::with_token_store(
-        noop_observer(),
-        Arc::new(MemoryTokenStore::new()),
-    )
-    .expect("建服务");
+    let mut service =
+        GitService::with_token_store(noop_observer(), Arc::new(MemoryTokenStore::new()))
+            .expect("建服务");
     let (sender, receiver) = crossbeam_channel::unbounded();
     let handle = service.open_repo(&root).expect("打开仓库");
     let id = handle.id();
@@ -137,7 +140,10 @@ fn image_diff_reports_sides_and_equality() {
     let Outcome::FileDiff(diff) = outcome else {
         panic!("非图片应返回 FileDiff，实际 {outcome:?}");
     };
-    assert!(matches!(diff.payload, DiffPayload::Binary | DiffPayload::Text(_)));
+    assert!(matches!(
+        diff.payload,
+        DiffPayload::Binary | DiffPayload::Text(_)
+    ));
 
     service.shutdown();
     let _ = std::fs::remove_dir_all(&root);

@@ -187,11 +187,7 @@ pub fn file_history(
     path: &str,
     cancel: Option<&dyn CancelProbe>,
 ) -> Result<Vec<FileHistoryEntry>> {
-    let mut args: Vec<&str> = vec![
-        "log",
-        "--follow",
-        "--format=%H%x1f%h%x1f%an%x1f%at%x1f%s",
-    ];
+    let mut args: Vec<&str> = vec!["log", "--follow", "--format=%H%x1f%h%x1f%an%x1f%at%x1f%s"];
     if all_refs {
         args.push("--all");
     }

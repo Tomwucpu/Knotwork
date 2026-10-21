@@ -123,8 +123,10 @@ fn create_deep_dir(root: &Path, segments: &[&str]) -> (PathBuf, usize) {
     let mut probe = root.to_path_buf();
     for segment in segments {
         probe.push(segment);
-        let probe_verbatim =
-            PathBuf::from(format!(r"\\?\{}", probe.canonicalize().unwrap_or(probe.clone()).display()));
+        let probe_verbatim = PathBuf::from(format!(
+            r"\\?\{}",
+            probe.canonicalize().unwrap_or(probe.clone()).display()
+        ));
         let _ = probe_verbatim;
         std::fs::create_dir_all(&probe).expect("逐级创建深目录");
     }
@@ -148,7 +150,10 @@ fn long_paths_beyond_260_chars_are_supported() {
     let (dir, len) = create_deep_dir(&fixture.root, &segment_refs);
     let file = dir.join(format!("{}.txt", "f".repeat(34)));
     let total_len = file.display().to_string().chars().count();
-    assert!(total_len > 260, "构造的全路径应超过 260 字符，实际 {total_len}");
+    assert!(
+        total_len > 260,
+        "构造的全路径应超过 260 字符，实际 {total_len}"
+    );
 
     let content = "deep file content\n".repeat(10);
     std::fs::write(&file, &content).expect("写深路径文件");
@@ -193,8 +198,11 @@ fn crlf_with_autocrlf_stays_consistent() {
     fixture.assert_status_matches("CRLF：干净工作区");
 
     // 修改一行（保持 CRLF）。
-    std::fs::write(fixture.root.join("win.txt"), "line-one\r\nLINE-TWO\r\nline-three\r\n")
-        .expect("修改 CRLF 文件");
+    std::fs::write(
+        fixture.root.join("win.txt"),
+        "line-one\r\nLINE-TWO\r\nline-three\r\n",
+    )
+    .expect("修改 CRLF 文件");
     fixture.assert_status_matches("CRLF：修改后");
 
     // blob 读取：blob_at 走对象库原文（LF），git cat-file 同源。
@@ -223,10 +231,16 @@ fn case_only_rename_matches_git_cli() {
     fixture.assert_status_matches("大小写：干净");
 
     // NTFS 允许仅大小写的改名（两步走，避免被视作同路径）。
-    std::fs::rename(fixture.root.join("Name.txt"), fixture.root.join("name__.tmp"))
-        .expect("先改成中转名");
-    std::fs::rename(fixture.root.join("name__.tmp"), fixture.root.join("name.txt"))
-        .expect("再改成目标大小写");
+    std::fs::rename(
+        fixture.root.join("Name.txt"),
+        fixture.root.join("name__.tmp"),
+    )
+    .expect("先改成中转名");
+    std::fs::rename(
+        fixture.root.join("name__.tmp"),
+        fixture.root.join("name.txt"),
+    )
+    .expect("再改成目标大小写");
 
     // 判据是与 git CLI 一致（git 对这种场景的呈现随版本可能不同，
     // 一致性才是需求 —— 我们不允许与 git 各说各话）。
