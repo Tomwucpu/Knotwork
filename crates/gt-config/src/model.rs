@@ -221,6 +221,31 @@ pub struct DiagnosticsConfig {
     pub log_to_file: bool,
 }
 
+/// 窗口布局尺寸（全局共享，不随仓库切换重置）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayoutConfig {
+    /// 左侧提交/更改面板宽度（逻辑像素）。
+    pub commit_panel_width: u16,
+    /// 底部 Git 工具窗高度（逻辑像素）。
+    pub git_panel_height: u16,
+    /// 底部 Git 日志的分支树宽度（逻辑像素）。
+    pub branch_tree_width: u16,
+    /// 底部 Git 日志的提交详情宽度（逻辑像素）。
+    pub details_panel_width: u16,
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            commit_panel_width: 380,
+            git_panel_height: 300,
+            branch_tree_width: 228,
+            details_panel_width: 340,
+        }
+    }
+}
+
 /// 用户级配置根。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -241,6 +266,8 @@ pub struct UserConfig {
     pub diagnostics: DiagnosticsConfig,
     /// 最近打开的仓库（FR-MR-02）。
     pub recent: RecentRepos,
+    /// 窗口布局尺寸。
+    pub layout: LayoutConfig,
     /// 快捷键覆盖（命令 id → 键序列）；完整快捷键系统在 M2 交付。
     pub keybindings: BTreeMap<String, String>,
 }
@@ -254,7 +281,8 @@ impl UserConfig {
     /// # Errors
     /// 文本不是合法 TOML，或字段类型不匹配时返回错误。
     pub fn from_toml(text: &str) -> std::result::Result<Self, toml::de::Error> {
-        toml::from_str(text)
+        let config: Self = toml::from_str(text)?;
+        Ok(config)
     }
 
     /// 序列化为 TOML 文本。
@@ -270,7 +298,7 @@ impl UserConfig {
 mod tests {
     use super::{
         AppearanceConfig, BranchProtectionConfig, CacheBudget, DiagnosticsConfig,
-        GitBehaviorConfig, LogLevel, RemoteSettings, UpdateStrategy, UserConfig,
+        GitBehaviorConfig, LayoutConfig, LogLevel, RemoteSettings, UpdateStrategy, UserConfig,
     };
 
     #[test]
@@ -291,7 +319,34 @@ mod tests {
         assert!(config.branches.protected_patterns.is_empty());
         assert!(config.remote.stored_token_hosts.is_empty());
         assert!(config.recent.is_empty());
+        assert_eq!(
+            config.layout,
+            LayoutConfig {
+                commit_panel_width: 380,
+                git_panel_height: 300,
+                branch_tree_width: 228,
+                details_panel_width: 340,
+            }
+        );
         assert!(config.keybindings.is_empty());
+    }
+
+    #[test]
+    fn layout_dimensions_load_verbatim() {
+        let config = UserConfig::from_toml(
+            r"
+            [layout]
+            commit_panel_width = 10
+            git_panel_height = 9000
+            branch_tree_width = 0
+            details_panel_width = 65535
+            ",
+        )
+        .expect("布局配置应可解析");
+        assert_eq!(config.layout.commit_panel_width, 10);
+        assert_eq!(config.layout.git_panel_height, 9000);
+        assert_eq!(config.layout.branch_tree_width, 0);
+        assert_eq!(config.layout.details_panel_width, 65535);
     }
 
     #[test]

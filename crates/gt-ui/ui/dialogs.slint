@@ -675,6 +675,180 @@ export component CommitCtxMenu inherits Rectangle {
     }
 }
 
+// ================================================================ 单文件上下文菜单
+
+export component ChangeCtxMenu inherits Rectangle {
+    in property <length> ctx-x: 0px;
+    in property <length> ctx-y: 0px;
+    // 0 = 已暂存，1 = 未暂存。
+    in property <int> group: 1;
+    in property <bool> is-untracked: false;
+    in property <bool> is-conflict: false;
+    in property <bool> read-only: false;
+    callback action(string);
+    callback close();
+
+    background: transparent;
+
+    TouchArea {
+        clicked => { root.close(); }
+    }
+
+    Rectangle {
+        width: 236px;
+        height: menu.preferred-height + 8px;
+        x: min(root.ctx-x, root.width - 248px);
+        y: min(root.ctx-y, root.height - self.height - 16px);
+        background: Palette.panel;
+        border-color: Palette.border;
+        border-width: 1px;
+        border-radius: Palette.radius;
+
+        menu := VerticalLayout {
+            x: 4px;
+            y: 4px;
+            width: parent.width - 8px;
+            spacing: 1px;
+
+            MenuItem {
+                text: Texts.s51;
+                enabled: root.group == 1 && !root.read-only;
+                clicked => { root.action("stage"); }
+            }
+            MenuItem {
+                text: Texts.s52;
+                enabled: root.group == 0 && !root.read-only;
+                clicked => { root.action("unstage"); }
+            }
+            MenuItem {
+                text: Texts.s53;
+                enabled: !root.read-only && !root.is-untracked && !root.is-conflict;
+                clicked => { root.action("discard"); }
+            }
+            MenuItem {
+                text: Texts.s54;
+                enabled: root.is-untracked && !root.read-only;
+                clicked => { root.action("delete"); }
+            }
+            MenuItem {
+                text: Texts.s55;
+                enabled: root.is-untracked && !root.read-only;
+                clicked => { root.action("ignore"); }
+            }
+            MenuItem {
+                text: Texts.s56;
+                enabled: root.is-untracked && !root.read-only;
+                clicked => { root.action("ignore-exclude"); }
+            }
+
+            Divider { }
+
+            MenuItem {
+                text: Texts.s203;
+                enabled: !root.is-untracked;
+                clicked => { root.action("blame"); }
+            }
+            MenuItem {
+                text: Texts.s42;
+                enabled: !root.is-untracked;
+                clicked => { root.action("history"); }
+            }
+        }
+    }
+}
+
+
+// ================================================================ 提交列表显示选项
+
+// 提交工具窗头部的 eye 菜单（IDEA：分组依据 / 显示）。
+// 作为窗口级浮层弹出而不是嵌在提交面板里：面板的竖向布局由父布局推导，
+// 在其中再挂一个 `height: parent.height` 的子元素会触发 Slint 的布局递归。
+export component ChangeOptionsMenu inherits Rectangle {
+    in property <length> ctx-x: 0px;
+    in property <length> ctx-y: 0px;
+    in property <bool> by-directory: false;
+    in property <bool> by-module: false;
+    in property <bool> show-ignored: false;
+    callback toggle-directory();
+    callback toggle-module();
+    callback toggle-ignored();
+    callback close();
+
+    background: transparent;
+
+    TouchArea {
+        clicked => { root.close(); }
+    }
+
+    Rectangle {
+        width: 232px;
+        height: menu.preferred-height + 8px;
+        x: min(root.ctx-x, root.width - 240px);
+        y: min(root.ctx-y, root.height - self.height - 16px);
+        background: Palette.panel;
+        border-color: Palette.border;
+        border-width: 1px;
+        border-radius: Palette.radius;
+
+        menu := VerticalLayout {
+            x: 4px;
+            y: 4px;
+            width: parent.width - 8px;
+            spacing: 1px;
+
+            Rectangle {
+                height: 24px;
+
+                Text {
+                    x: 8px;
+                    text: Texts.s207;
+                    color: Palette.text-dim;
+                    font-size: Palette.font-meta;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+            }
+
+            MenuItem {
+                text: Texts.s208;
+                checkable: true;
+                checked: root.by-directory;
+                clicked => { root.toggle-directory(); }
+            }
+
+            MenuItem {
+                text: Texts.s209;
+                checkable: true;
+                checked: root.by-module;
+                clicked => { root.toggle-module(); }
+            }
+
+            Divider { }
+
+            Rectangle {
+                height: 24px;
+
+                Text {
+                    x: 8px;
+                    text: Texts.s210;
+                    color: Palette.text-dim;
+                    font-size: Palette.font-meta;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+            }
+
+            MenuItem {
+                text: Texts.s206;
+                checkable: true;
+                checked: root.show-ignored;
+                clicked => { root.toggle-ignored(); }
+            }
+        }
+    }
+}
+
+
 // ================================================================ 最近项目上下文菜单
 
 // 与 CommitCtxMenu 同构：贴着触发按钮弹出、点空白关闭，实例化处必须排在

@@ -1026,10 +1026,13 @@ fn execute(
                 // 变基进度是"第 3/7 个"的来源；直接读 `.git/rebase-merge`，
                 // 不需要 git CLI（FR-MRG-02）。
                 rebase: gt_backend::read_rebase_progress(&repo.location().git_dir),
+                modules: repo.modules(),
             })))
         }
-        RequestKind::Status => {
-            let changes = repo.status().map_err(user_message)?;
+        RequestKind::Status { include_ignored } => {
+            let changes = repo
+                .status_with_ignored(*include_ignored)
+                .map_err(user_message)?;
             Ok(Outcome::Status(Box::new(changes)))
         }
         RequestKind::LogPage(request) => execute_log_page(repo, handle, request, token),
@@ -2075,7 +2078,7 @@ mod tests {
 
         std::fs::write(root.join("a.txt"), "hello\nworld\n").expect("改文件");
         service
-            .request(handle.id(), RequestKind::Status, sender.clone())
+            .request(handle.id(), RequestKind::Status { include_ignored: false }, sender.clone())
             .expect("投递状态");
         let delivery = wait_delivery(&receiver, Duration::from_secs(10));
         let Outcome::Status(changes) = delivery.outcome else {
@@ -2177,7 +2180,7 @@ mod tests {
         let (service, _console) = service();
         let (sender, _receiver) = unbounded();
         let err = service
-            .request(gt_core::RepoId::from_raw(999), RequestKind::Status, sender)
+            .request(gt_core::RepoId::from_raw(999), RequestKind::Status { include_ignored: false }, sender)
             .expect_err("未注册仓库必须被拒");
         assert!(matches!(err, crate::task::RequestError::UnknownRepo(_)));
         assert_eq!(service.pool().pending(), 0);
@@ -2196,7 +2199,7 @@ mod tests {
         // 立刻作废，窗口永远拿不到完整的首屏。
         let requested = [
             RequestKind::Overview,
-            RequestKind::Status,
+            RequestKind::Status { include_ignored: false },
             RequestKind::LogPage(super::first_log_page()),
         ];
         for kind in &requested {
@@ -2241,7 +2244,7 @@ mod tests {
         let mut last = crate::generation::Generation::INITIAL;
         for _ in 0..8 {
             last = service
-                .request(handle.id(), RequestKind::Status, sender.clone())
+                .request(handle.id(), RequestKind::Status { include_ignored: false }, sender.clone())
                 .expect("投递");
         }
 
@@ -2392,7 +2395,7 @@ mod tests {
         assert_eq!(service.repo_count(), 0);
 
         let (sender, _receiver) = unbounded();
-        assert!(service.request(id, RequestKind::Status, sender).is_err());
+        assert!(service.request(id, RequestKind::Status { include_ignored: false }, sender).is_err());
 
         service.shutdown();
         let _ = std::fs::remove_dir_all(&root);

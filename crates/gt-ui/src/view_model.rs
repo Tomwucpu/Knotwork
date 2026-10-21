@@ -13,10 +13,10 @@
 //! 本模块**只做纯转换**（输入领域模型 → 输出行结构），不接触 I/O 与线程，
 //! 因此可以脱离 Slint 运行时直接单测。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use gt_backend::{
-    BlameLine, CommandRecord, FileHistoryEntry, PushPreview, RemoteInfo, RemoteListing,
+    BlameLine, CommandRecord, FileHistoryEntry, PushPreview, RemoteInfo, RemoteListing, RepoModule,
 };
 use gt_core::{ChangeSet, CommitMeta, HeadKind, RefInfo, RefKind, RepoState, StatusBucket};
 use gt_diff::{DiffLine, DiffPayload, FileDiff, LineKind};
@@ -382,39 +382,91 @@ fn diff_row(line: &DiffLine) -> DiffRow {
     }
 }
 
+/// 提交面板的展示口径。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChangeGrouping {
+    /// 按目录树分组。
+    pub by_directory: bool,
+    /// 按模块（Cargo 工作区成员）分组。
+    pub by_module: bool,
+    /// 是否显示「已忽略的文件」分组。
+    pub show_ignored: bool,
+}
+
+/// [`build_change_rows`] 的折叠状态与分组输入。
+pub struct ChangeViewOptions<'a> {
+    /// 「已暂存」分组是否折叠。
+    pub staged_collapsed: bool,
+    /// 「未暂存」分组是否折叠。
+    pub unstaged_collapsed: bool,
+    /// 「已忽略的文件」分组是否折叠。
+    pub ignored_collapsed: bool,
+    /// 目录 / 模块 / 忽略文件的展示开关。
+    pub grouping: ChangeGrouping,
+    /// 已折叠的模块 / 目录节点键（见 `node_key` 的生成规则）。
+    pub collapsed_nodes: &'a BTreeSet<String>,
+    /// Cargo 工作区成员；为空时模块分组退化为顶层目录。
+    pub modules: &'a [RepoModule],
+    /// 不属于任何模块的文件归入此模块（取仓库名）。
+    pub root_module_name: &'a str,
+}
+
 /// 构造本地更改行。
 ///
-/// 「已暂存 / 未暂存」分组头与文件行共用同一个列表模型（kind：
-/// 0 = 文件，1 = 分组头），这样 `ListView` 仍是唯一滚动容器，虚拟化不受影响。
-/// 文件行的 `row-index` 回指 `ChangeSet.entries` 下标；分组头为 -1。
+/// 「已暂存 / 未暂存 / 已忽略」分组头、模块节点、目录节点与文件行共用
+/// 同一个列表模型（kind：0 = 文件，1 = 分组头，2 = 模块，3 = 目录），
+/// 这样 `ListView` 仍是唯一滚动容器，虚拟化不受影响。
+/// 文件行的 `row_index` 回指 `ChangeSet.entries` 下标；非文件行为 -1。
 #[must_use]
 pub fn build_change_rows(
     changes: &ChangeSet,
     selected: Option<usize>,
-    staged_collapsed: bool,
-    unstaged_collapsed: bool,
+    view: &ChangeViewOptions<'_>,
 ) -> Vec<ChangeRow> {
     let mut staged = Vec::new();
     let mut unstaged = Vec::new();
+    let mut ignored = Vec::new();
     for (index, entry) in changes.entries.iter().enumerate() {
-        if entry.bucket() == StatusBucket::Staged {
-            staged.push(index);
-        } else {
+        match entry.bucket() {
+            StatusBucket::Staged => staged.push(index),
+            StatusBucket::Ignored => ignored.push(index),
             // 冲突、未跟踪、工作区修改都归入「未暂存」；与 IDEA 的分组口径一致。
-            unstaged.push(index);
+            StatusBucket::Conflicted | StatusBucket::Untracked | StatusBucket::Modified => {
+                unstaged.push(index);
+            }
         }
     }
 
-    let mut rows = Vec::with_capacity(staged.len() + unstaged.len() + 2);
-    push_change_group(&mut rows, changes, &staged, 0, staged_collapsed, selected);
+    let mut rows = Vec::with_capacity(staged.len() + unstaged.len() + ignored.len() + 3);
+    push_change_group(
+        &mut rows,
+        changes,
+        &staged,
+        0,
+        view.staged_collapsed,
+        selected,
+        view,
+    );
     push_change_group(
         &mut rows,
         changes,
         &unstaged,
         1,
-        unstaged_collapsed,
+        view.unstaged_collapsed,
         selected,
+        view,
     );
+    if view.grouping.show_ignored {
+        push_change_group(
+            &mut rows,
+            changes,
+            &ignored,
+            2,
+            view.ignored_collapsed,
+            selected,
+            view,
+        );
+    }
     rows
 }
 
@@ -425,6 +477,7 @@ fn push_change_group(
     group: i32,
     collapsed: bool,
     selected: Option<usize>,
+    view: &ChangeViewOptions<'_>,
 ) {
     let count = i32::try_from(indices.len()).unwrap_or(i32::MAX);
     rows.push(ChangeRow {
@@ -440,40 +493,405 @@ fn push_change_group(
         is_selected: false,
         is_conflict: false,
         is_untracked: false,
+        is_ignored: false,
+        depth: 0,
+        name: SharedString::new(),
+        parent_path: SharedString::new(),
+        node_key: SharedString::new(),
+        node_path: SharedString::new(),
+        icon_kind: SharedString::new(),
     });
     if collapsed {
         return;
     }
+
+    if view.grouping.by_module {
+        push_module_rows(rows, changes, indices, group, selected, view);
+    } else if view.grouping.by_directory {
+        let tree = build_directory_tree(changes, indices, "");
+        push_directory_rows(rows, changes, &tree, "", "", 1, group, selected, view);
+    } else {
+        for &index in indices {
+            push_file_row(rows, changes, index, group, 1, selected, view, "");
+        }
+    }
+}
+
+/// 目录树节点：只保存文件下标，目录按名称排序。
+#[derive(Default)]
+struct ChangeDirNode {
+    dirs: BTreeMap<String, ChangeDirNode>,
+    files: Vec<usize>,
+}
+
+fn push_module_rows(
+    rows: &mut Vec<ChangeRow>,
+    changes: &ChangeSet,
+    indices: &[usize],
+    group: i32,
+    selected: Option<usize>,
+    view: &ChangeViewOptions<'_>,
+) {
+    // 模块根路径 → (展示名, 文件下标)。根模块用空串，排序时自然居首。
+    let mut buckets: BTreeMap<String, (String, Vec<usize>)> = BTreeMap::new();
     for &index in indices {
-        let entry = &changes.entries[index];
-        let is_untracked = entry.index == gt_core::StatusFlag::Untracked
-            || entry.worktree == gt_core::StatusFlag::Untracked;
+        let path = changes.entries[index].path.as_str();
+        let (root, name) = if view.modules.is_empty() {
+            // 非 Cargo 仓库：模块分组退化为顶层目录。
+            path.split_once('/').map_or(
+                ("", view.root_module_name),
+                |(first, _)| (first, first),
+            )
+        } else {
+            module_for_path(view.modules, path).map_or(
+                ("", view.root_module_name),
+                |module| (module.path.as_str(), module.name.as_str()),
+            )
+        };
+        buckets
+            .entry(root.to_owned())
+            .or_insert_with(|| (name.to_owned(), Vec::new()))
+            .1
+            .push(index);
+    }
+
+    for (root, (name, files)) in buckets {
+        let key = node_key(group, 'm', &root);
+        let collapsed = view.collapsed_nodes.contains(&key);
         rows.push(ChangeRow {
-            row_index: i32::try_from(index).unwrap_or(i32::MAX),
-            kind: 0,
+            row_index: -1,
+            kind: 2,
             group,
-            count,
-            collapsed: false,
-            path: SharedString::from(entry.porcelain_path()),
-            code: SharedString::from(match entry.conflict {
-                Some(kind) => {
-                    let (x, y) = kind.code();
-                    format!("{x}{y}")
-                }
-                None => format!("{}{}", entry.index.letter(), entry.worktree.letter()),
-            }),
-            bucket: SharedString::from(entry.bucket().label()),
-            note: SharedString::from(match entry.conflict {
-                Some(kind) => kind.label().to_owned(),
-                None => entry
-                    .old_path
-                    .as_ref()
-                    .map_or_else(String::new, |old| text::trf("原路径 {}", &[old])),
-            }),
-            is_selected: selected == Some(index),
-            is_conflict: entry.is_conflicted(),
-            is_untracked,
+            count: i32::try_from(files.len()).unwrap_or(i32::MAX),
+            collapsed,
+            path: SharedString::new(),
+            code: SharedString::new(),
+            bucket: SharedString::new(),
+            note: SharedString::new(),
+            is_selected: false,
+            is_conflict: false,
+            is_untracked: false,
+            is_ignored: false,
+            depth: 1,
+            name: SharedString::from(name),
+            parent_path: SharedString::new(),
+            node_key: SharedString::from(key),
+            node_path: SharedString::from(root.clone()),
+            icon_kind: SharedString::new(),
         });
+        if collapsed {
+            continue;
+        }
+        if view.grouping.by_directory {
+            let tree = build_directory_tree(changes, &files, &root);
+            push_directory_rows(rows, changes, &tree, &root, "", 2, group, selected, view);
+        } else {
+            let mut files = files;
+            files.sort_by(|left, right| {
+                changes.entries[*left]
+                    .path
+                    .cmp(&changes.entries[*right].path)
+            });
+            for index in files {
+                push_file_row(rows, changes, index, group, 2, selected, view, &root);
+            }
+        }
+    }
+}
+
+/// 找出路径所属模块；模块根自身或其后代才算命中。
+fn module_for_path<'a>(modules: &'a [RepoModule], path: &str) -> Option<&'a RepoModule> {
+    modules
+        .iter()
+        .filter(|module| {
+            module.path.is_empty()
+                || path
+                    .strip_prefix(&module.path)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .max_by_key(|module| module.path.len())
+}
+
+/// 按模块根剥离前缀，得到目录树内部的相对路径。
+fn strip_module_root<'a>(path: &'a str, module_root: &str) -> &'a str {
+    if module_root.is_empty() {
+        return path;
+    }
+    match path.strip_prefix(module_root) {
+        Some("") => "",
+        Some(rest) => rest.strip_prefix('/').unwrap_or(path),
+        None => path,
+    }
+}
+
+/// 由文件下标构造目录树。折叠的未跟踪目录（`dir/`）按文件叶子处理。
+fn build_directory_tree(
+    changes: &ChangeSet,
+    indices: &[usize],
+    module_root: &str,
+) -> ChangeDirNode {
+    let mut tree = ChangeDirNode::default();
+    for &index in indices {
+        let path = changes.entries[index].path.as_str();
+        let relative = strip_module_root(path.trim_end_matches('/'), module_root);
+        let mut segments: Vec<&str> = relative.split('/').collect();
+        let _file = segments.pop();
+        let mut node = &mut tree;
+        for segment in segments {
+            node = node.dirs.entry(segment.to_owned()).or_default();
+        }
+        node.files.push(index);
+    }
+    tree
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_directory_rows(
+    rows: &mut Vec<ChangeRow>,
+    changes: &ChangeSet,
+    node: &ChangeDirNode,
+    module_root: &str,
+    relative_prefix: &str,
+    depth: i32,
+    group: i32,
+    selected: Option<usize>,
+    view: &ChangeViewOptions<'_>,
+) {
+    // 目录在前、文件在后，与 IDEA 的树形排序一致。
+    for (name, child) in &node.dirs {
+        let (label, compacted) = compact_directory(name, child);
+        let relative = if relative_prefix.is_empty() {
+            label.clone()
+        } else {
+            format!("{relative_prefix}/{label}")
+        };
+        let full_path = if module_root.is_empty() {
+            relative.clone()
+        } else {
+            format!("{module_root}/{relative}")
+        };
+        let key = node_key(group, 'd', &full_path);
+        let collapsed = view.collapsed_nodes.contains(&key);
+        rows.push(ChangeRow {
+            row_index: -1,
+            kind: 3,
+            group,
+            count: directory_file_count(compacted),
+            collapsed,
+            path: SharedString::new(),
+            code: SharedString::new(),
+            bucket: SharedString::new(),
+            note: SharedString::new(),
+            is_selected: false,
+            is_conflict: false,
+            is_untracked: false,
+            is_ignored: false,
+            depth,
+            name: SharedString::from(label),
+            parent_path: SharedString::new(),
+            node_key: SharedString::from(key),
+            node_path: SharedString::from(full_path),
+            icon_kind: SharedString::new(),
+        });
+        if !collapsed {
+            push_directory_rows(
+                rows,
+                changes,
+                compacted,
+                module_root,
+                &relative,
+                depth + 1,
+                group,
+                selected,
+                view,
+            );
+        }
+    }
+
+    let mut files = node.files.clone();
+    files.sort_by(|left, right| {
+        changes.entries[*left]
+            .path
+            .cmp(&changes.entries[*right].path)
+    });
+    for index in files {
+        push_file_row(rows, changes, index, group, depth, selected, view, module_root);
+    }
+}
+
+/// 单链目录压缩：`crates → gt-ui → src` 显示为一行 `crates/gt-ui/src`。
+fn compact_directory<'a>(name: &str, node: &'a ChangeDirNode) -> (String, &'a ChangeDirNode) {
+    let mut label = name.to_owned();
+    let mut current = node;
+    while current.files.is_empty() && current.dirs.len() == 1 {
+        let Some((next_name, next_node)) = current.dirs.iter().next() else {
+            break;
+        };
+        label.push('/');
+        label.push_str(next_name);
+        current = next_node;
+    }
+    (label, current)
+}
+
+fn directory_file_count(node: &ChangeDirNode) -> i32 {
+    let nested: usize = node.dirs.values().map(directory_file_count_usize).sum();
+    i32::try_from(node.files.len() + nested).unwrap_or(i32::MAX)
+}
+
+fn directory_file_count_usize(node: &ChangeDirNode) -> usize {
+    node.files.len() + node.dirs.values().map(directory_file_count_usize).sum::<usize>()
+}
+
+/// 模块 / 目录节点的折叠键。分组号参与键，避免同一路径在不同分区互相影响。
+fn node_key(group: i32, kind: char, path: &str) -> String {
+    format!("{group}|{kind}|{path}")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_file_row(
+    rows: &mut Vec<ChangeRow>,
+    changes: &ChangeSet,
+    index: usize,
+    group: i32,
+    depth: i32,
+    selected: Option<usize>,
+    view: &ChangeViewOptions<'_>,
+    module_root: &str,
+) {
+    let entry = &changes.entries[index];
+    let is_untracked = entry.index == gt_core::StatusFlag::Untracked
+        || entry.worktree == gt_core::StatusFlag::Untracked;
+    let name = file_display_name(&entry.path);
+    let parent_path = file_parent_path(&entry.path, !view.grouping.by_directory, module_root);
+    rows.push(ChangeRow {
+        row_index: i32::try_from(index).unwrap_or(i32::MAX),
+        kind: 0,
+        group,
+        count: 0,
+        collapsed: false,
+        path: SharedString::from(entry.porcelain_path()),
+        code: SharedString::from(match entry.conflict {
+            Some(kind) => {
+                let (x, y) = kind.code();
+                format!("{x}{y}")
+            }
+            None => format!("{}{}", entry.index.letter(), entry.worktree.letter()),
+        }),
+        bucket: SharedString::from(entry.bucket().label()),
+        note: SharedString::from(match entry.conflict {
+            Some(kind) => kind.label().to_owned(),
+            None => entry
+                .old_path
+                .as_ref()
+                .map_or_else(String::new, |old| text::trf("原路径 {}", &[old])),
+        }),
+        is_selected: selected == Some(index),
+        is_conflict: entry.is_conflicted(),
+        is_untracked,
+        is_ignored: entry.bucket() == StatusBucket::Ignored,
+        depth,
+        name: SharedString::from(name),
+        parent_path: SharedString::from(parent_path),
+        node_key: SharedString::new(),
+        node_path: SharedString::new(),
+        icon_kind: SharedString::from(file_icon_kind(&entry.path)),
+    });
+}
+
+/// 文件行的显示名：仅文件名；折叠的未跟踪目录保留尾随 `/`。
+fn file_display_name(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    let name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if path.ends_with('/') {
+        format!("{name}/")
+    } else {
+        name.to_owned()
+    }
+}
+
+/// 未启用目录分组时，文件行显示的父目录（相对当前模块根）。
+fn file_parent_path(path: &str, show_parent: bool, module_root: &str) -> String {
+    if !show_parent {
+        return String::new();
+    }
+    let trimmed = path.trim_end_matches('/');
+    let Some((parent, _)) = trimmed.rsplit_once('/') else {
+        return String::new();
+    };
+    strip_module_root(parent, module_root).to_owned()
+}
+
+/// 文件类型图标键。Slint 侧 `FileTypeIcon` 按这个键选素材；
+/// 未收录的语言回落到 text，未识别的扩展名回落到 unknown。
+fn file_icon_kind(path: &str) -> &'static str {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let lower = name.to_ascii_lowercase();
+
+    if lower.starts_with("dockerfile") || lower == "containerfile" || lower == ".dockerignore" {
+        return "docker";
+    }
+    if lower.ends_with(".gradle.kts") || lower == "build.gradle" || lower == "settings.gradle" {
+        return "gradle";
+    }
+    if lower == ".gitignore" {
+        return "gitignore";
+    }
+    if lower == ".editorconfig" {
+        return "editorconfig";
+    }
+    if lower == "manifest.mf" {
+        return "manifest";
+    }
+    if lower.starts_with(".env") {
+        return "properties";
+    }
+
+    let Some((stem, ext)) = lower.rsplit_once('.') else {
+        return "text";
+    };
+    if stem.is_empty() {
+        return "text";
+    }
+    match ext {
+        "java" => "java",
+        "js" | "mjs" | "cjs" | "jsx" => "js",
+        "ts" | "tsx" | "mts" | "cts" => "ts",
+        "vue" => "vue",
+        "cs" => "cs",
+        "c" => "c",
+        "cpp" | "cc" | "cxx" | "h" | "hh" | "hpp" | "hxx" => "cpp",
+        "rs" => "rust",
+        "html" | "htm" | "xhtml" => "html",
+        "css" | "scss" | "sass" | "less" => "css",
+        "json" | "json5" | "jsonc" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "xml" | "xsd" | "xsl" | "xslt" | "wsdl" => "xml",
+        "properties" | "ini" | "cfg" | "conf" => "properties",
+        "lock" => "config",
+        "md" | "markdown" | "mdx" => "markdown",
+        "csv" | "tsv" => "csv",
+        "sql" => "sql",
+        "sh" | "bash" | "zsh" | "fish" | "ps1" | "psm1" | "bat" | "cmd" => "shell",
+        "patch" | "diff" => "patch",
+        "graphql" | "gql" => "graphql",
+        "tf" | "tfvars" | "hcl" => "terraform",
+        "ipynb" => "jupyter",
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "ico" | "tif" | "tiff" => "image",
+        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" | "jar" | "war" | "ear" => {
+            "archive"
+        }
+        "ttf" | "otf" | "woff" | "woff2" | "eot" => "font",
+        "exe" | "dll" | "so" | "dylib" | "bin" | "o" | "a" | "lib" | "class" | "pyc" | "wasm"
+        | "db" | "sqlite" => "binary",
+        // expui 基础图标集没有这些语言图标：按文本文件展示，避免误用 unknown。
+        "py" | "pyi" | "pyw" | "go" | "php" | "rb" | "kt" | "kts" | "swift" | "scala" | "lua"
+        | "pl" | "pm" | "r" | "dart" | "m" | "mm" | "tex" | "proto" | "cmake" | "mk" | "svelte"
+        | "astro" | "elm" | "ex" | "exs" | "erl" | "clj" | "cljs" | "fs" | "fsx" | "vb" | "asm"
+        | "s" | "pas" | "groovy" | "coffee" | "sol" | "zig" | "nim" | "v" | "d" | "jl" | "tcl"
+        | "awk" | "txt" | "log" | "text" => "text",
+        _ => "unknown",
     }
 }
 
@@ -918,7 +1336,7 @@ mod tests {
         build_graph_cells, build_log_rows, build_push_rows, build_ref_rows, build_remote_rows,
         credential_help, diff_selection_hint, discard_confirmation, discard_selection_confirmation,
         network_error_text, ordered_refs, push_hints, push_preview_text, relative_time,
-        state_banner,
+        state_banner, ChangeGrouping, ChangeViewOptions,
     };
     use std::collections::BTreeSet;
 
@@ -928,12 +1346,26 @@ mod tests {
     fn values<T: Clone>(model: &ModelRc<T>) -> Vec<T> {
         model.iter().collect()
     }
+    use gt_backend::RepoModule;
     use gt_core::{
         ChangeKind, ChangeSet, CommitMeta, ConflictKind, FileChange, HeadInfo, HeadKind, Oid,
         RefInfo, RefKind, RepoState, StatusEntry, StatusFlag,
     };
     use gt_diff::{DiffHunk, DiffLine, DiffPayload, DiffStats, FileDiff, LineKind};
     use gt_graph::LaneLayout;
+
+    /// 默认展示口径：不分组、不显示忽略文件。
+    fn view_for(collapsed_nodes: &BTreeSet<String>) -> ChangeViewOptions<'_> {
+        ChangeViewOptions {
+            staged_collapsed: false,
+            unstaged_collapsed: false,
+            ignored_collapsed: false,
+            grouping: ChangeGrouping::default(),
+            collapsed_nodes,
+            modules: &[],
+            root_module_name: "repo",
+        }
+    }
 
     fn commit(id: u8, summary: &str, author_time: i64) -> CommitMeta {
         CommitMeta {
@@ -1305,7 +1737,8 @@ mod tests {
             StatusEntry::new("s.txt", StatusFlag::Added, StatusFlag::Unmodified),
             StatusEntry::new("m.txt", StatusFlag::Unmodified, StatusFlag::Modified),
         ]);
-        let rows = build_change_rows(&set, Some(0), false, false);
+        let empty = BTreeSet::new();
+        let rows = build_change_rows(&set, Some(0), &view_for(&empty));
         assert_eq!(rows.len(), 6, "2 个分组头 + 4 个文件行");
         // 已暂存组：头 + s.txt；未暂存组：头 + c.txt + u.txt + m.txt。
         assert_eq!(rows[0].kind, 1);
@@ -1328,13 +1761,33 @@ mod tests {
     }
 
     #[test]
+    fn file_icon_kinds_follow_names_and_extensions() {
+        assert_eq!(super::file_icon_kind("src/Main.java"), "java");
+        assert_eq!(super::file_icon_kind("Dockerfile.dev"), "docker");
+        assert_eq!(super::file_icon_kind(".gitignore"), "gitignore");
+        assert_eq!(super::file_icon_kind("Cargo.toml"), "toml");
+        assert_eq!(super::file_icon_kind("Cargo.lock"), "config");
+        assert_eq!(super::file_icon_kind("assets/logo.svg"), "image");
+        assert_eq!(super::file_icon_kind("README"), "text");
+        assert_eq!(super::file_icon_kind("release.7z"), "archive");
+        assert_eq!(super::file_icon_kind("src/view_model.rs"), "rust");
+        assert_eq!(super::file_icon_kind("package.json"), "json");
+        assert_eq!(super::file_icon_kind("main.py"), "text");
+        assert_eq!(super::file_icon_kind("blob.unknownext"), "unknown");
+    }
+
+    #[test]
     fn change_rows_collapse_keeps_group_header() {
         let set = ChangeSet::new(vec![StatusEntry::new(
             "a.txt",
             StatusFlag::Modified,
             StatusFlag::Unmodified,
         )]);
-        let rows = build_change_rows(&set, None, true, true);
+        let empty = BTreeSet::new();
+        let mut view = view_for(&empty);
+        view.staged_collapsed = true;
+        view.unstaged_collapsed = true;
+        let rows = build_change_rows(&set, None, &view);
         assert_eq!(rows.len(), 2, "折叠后只保留两个分组头");
         assert!(rows.iter().all(|row| row.kind == 1 && row.collapsed));
         assert_eq!(rows[0].count, 1);
@@ -1345,10 +1798,234 @@ mod tests {
     fn change_rows_show_old_path_for_renames() {
         let mut entry = StatusEntry::new("b.rs", StatusFlag::Renamed, StatusFlag::Unmodified);
         entry.old_path = Some("a.rs".to_owned());
-        let rows = build_change_rows(&ChangeSet::new(vec![entry]), None, false, false);
+        let empty = BTreeSet::new();
+        let rows = build_change_rows(&ChangeSet::new(vec![entry]), None, &view_for(&empty));
         let file = rows.iter().find(|row| row.kind == 0).expect("文件行");
         assert_eq!(file.path.as_str(), "a.rs -> b.rs");
         assert!(file.note.as_str().contains("a.rs"));
+    }
+
+    #[test]
+    fn change_rows_group_by_directory_builds_tree() {
+        let set = ChangeSet::new(vec![
+            StatusEntry::new("README.md", StatusFlag::Unmodified, StatusFlag::Modified),
+            StatusEntry::new("src/a.rs", StatusFlag::Unmodified, StatusFlag::Modified),
+            StatusEntry::new(
+                "src/nested/b.rs",
+                StatusFlag::Unmodified,
+                StatusFlag::Modified,
+            ),
+        ]);
+        let empty = BTreeSet::new();
+        let mut view = view_for(&empty);
+        view.grouping.by_directory = true;
+        let rows = build_change_rows(&set, None, &view);
+
+        assert_eq!(rows[0].kind, 1);
+        assert_eq!(rows[1].kind, 1);
+        assert_eq!(rows[1].count, 3);
+        assert_eq!(
+            (rows[2].kind, rows[2].name.as_str(), rows[2].count, rows[2].depth),
+            (3, "src", 2, 1),
+            "目录节点先于文件，并统计子树文件数"
+        );
+        assert_eq!(rows[2].node_path.as_str(), "src");
+        assert_eq!(
+            (rows[3].kind, rows[3].name.as_str(), rows[3].count, rows[3].depth),
+            (3, "nested", 1, 2)
+        );
+        assert_eq!(rows[3].node_path.as_str(), "src/nested");
+        assert_eq!(
+            (rows[4].kind, rows[4].path.as_str(), rows[4].depth),
+            (0, "src/nested/b.rs", 3)
+        );
+        assert_eq!(
+            (rows[5].kind, rows[5].path.as_str(), rows[5].depth),
+            (0, "src/a.rs", 2)
+        );
+        assert_eq!(
+            (rows[6].kind, rows[6].path.as_str(), rows[6].depth),
+            (0, "README.md", 1)
+        );
+    }
+
+    #[test]
+    fn change_rows_compact_single_child_directories() {
+        let set = ChangeSet::new(vec![StatusEntry::new(
+            "crates/gt-ui/src/lib.rs",
+            StatusFlag::Unmodified,
+            StatusFlag::Modified,
+        )]);
+        let empty = BTreeSet::new();
+        let mut view = view_for(&empty);
+        view.grouping.by_directory = true;
+        let rows = build_change_rows(&set, None, &view);
+
+        assert_eq!(rows[2].kind, 3);
+        assert_eq!(rows[2].name.as_str(), "crates/gt-ui/src");
+        assert_eq!(rows[2].count, 1);
+        assert_eq!(rows[3].kind, 0);
+        assert_eq!(rows[3].depth, 2);
+    }
+
+    #[test]
+    fn change_rows_group_by_cargo_modules() {
+        let set = ChangeSet::new(vec![
+            StatusEntry::new("docs/guide.md", StatusFlag::Unmodified, StatusFlag::Modified),
+            StatusEntry::new(
+                "crates/gt-ui/src/lib.rs",
+                StatusFlag::Unmodified,
+                StatusFlag::Modified,
+            ),
+        ]);
+        let modules = vec![
+            RepoModule {
+                name: "demo".to_owned(),
+                path: String::new(),
+            },
+            RepoModule {
+                name: "gt-ui".to_owned(),
+                path: "crates/gt-ui".to_owned(),
+            },
+        ];
+        let empty = BTreeSet::new();
+        let mut view = view_for(&empty);
+        view.grouping.by_module = true;
+        view.modules = &modules;
+        let rows = build_change_rows(&set, None, &view);
+
+        let module_rows: Vec<(&str, i32)> = rows
+            .iter()
+            .filter(|row| row.kind == 2)
+            .map(|row| (row.name.as_str(), row.depth))
+            .collect();
+        assert_eq!(module_rows, vec![("demo", 1), ("gt-ui", 1)]);
+        let module_paths: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.kind == 2)
+            .map(|row| row.node_path.as_str())
+            .collect();
+        assert_eq!(module_paths, vec!["", "crates/gt-ui"]);
+        let files: Vec<(&str, i32)> = rows
+            .iter()
+            .filter(|row| row.kind == 0)
+            .map(|row| (row.path.as_str(), row.depth))
+            .collect();
+        assert_eq!(
+            files,
+            vec![("docs/guide.md", 2), ("crates/gt-ui/src/lib.rs", 2)]
+        );
+    }
+
+    #[test]
+    fn change_rows_module_grouping_falls_back_to_top_level() {
+        let set = ChangeSet::new(vec![
+            StatusEntry::new("README.md", StatusFlag::Unmodified, StatusFlag::Modified),
+            StatusEntry::new("crates/tool.rs", StatusFlag::Unmodified, StatusFlag::Modified),
+        ]);
+        let empty = BTreeSet::new();
+        let mut view = view_for(&empty);
+        view.grouping.by_module = true;
+        let rows = build_change_rows(&set, None, &view);
+
+        let module_rows: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.kind == 2)
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(module_rows, vec!["repo", "crates"]);
+    }
+
+    #[test]
+    fn change_rows_show_name_and_parent_in_flat_mode() {
+        let set = ChangeSet::new(vec![
+            StatusEntry::new(
+                "crates/alpha/src/lib.rs",
+                StatusFlag::Unmodified,
+                StatusFlag::Modified,
+            ),
+            StatusEntry::new("README.md", StatusFlag::Unmodified, StatusFlag::Modified),
+            StatusEntry::untracked("docs/"),
+        ]);
+        let empty = BTreeSet::new();
+        let rows = build_change_rows(&set, None, &view_for(&empty));
+        let files: Vec<(&str, &str)> = rows
+            .iter()
+            .filter(|row| row.kind == 0)
+            .map(|row| (row.name.as_str(), row.parent_path.as_str()))
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                ("lib.rs", "crates/alpha/src"),
+                ("README.md", ""),
+                ("docs/", ""),
+            ]
+        );
+    }
+
+    #[test]
+    fn module_grouping_shows_parent_relative_to_module() {
+        let set = ChangeSet::new(vec![StatusEntry::new(
+            "crates/gt-ui/src/lib.rs",
+            StatusFlag::Unmodified,
+            StatusFlag::Modified,
+        )]);
+        let modules = vec![RepoModule {
+            name: "gt-ui".to_owned(),
+            path: "crates/gt-ui".to_owned(),
+        }];
+        let empty = BTreeSet::new();
+        let mut view = view_for(&empty);
+        view.grouping.by_module = true;
+        view.modules = &modules;
+        let rows = build_change_rows(&set, None, &view);
+        let file = rows.iter().find(|row| row.kind == 0).expect("文件行");
+        assert_eq!(file.name.as_str(), "lib.rs");
+        assert_eq!(file.parent_path.as_str(), "src");
+    }
+
+    #[test]
+    fn change_rows_show_ignored_is_opt_in() {
+        let set = ChangeSet::new(vec![
+            StatusEntry::untracked("new.txt"),
+            StatusEntry::ignored("target/"),
+        ]);
+        let empty = BTreeSet::new();
+        let default_rows = build_change_rows(&set, None, &view_for(&empty));
+        assert!(
+            default_rows.iter().all(|row| row.group != 2 && !row.is_ignored),
+            "默认不显示忽略分组"
+        );
+
+        let mut view = view_for(&empty);
+        view.grouping.show_ignored = true;
+        let rows = build_change_rows(&set, None, &view);
+        let ignored_header = rows
+            .iter()
+            .find(|row| row.kind == 1 && row.group == 2)
+            .expect("已忽略分组头");
+        assert_eq!(ignored_header.count, 1);
+        let ignored_file = rows.iter().find(|row| row.is_ignored).expect("忽略文件行");
+        assert_eq!(ignored_file.path.as_str(), "target/");
+        assert_eq!(ignored_file.code.as_str(), "!!");
+        assert!(!ignored_file.is_untracked);
+    }
+
+    #[test]
+    fn collapsed_directory_hides_children() {
+        let set = ChangeSet::new(vec![
+            StatusEntry::new("src/a.rs", StatusFlag::Unmodified, StatusFlag::Modified),
+            StatusEntry::new("src/b.rs", StatusFlag::Unmodified, StatusFlag::Modified),
+        ]);
+        let mut collapsed = BTreeSet::new();
+        collapsed.insert("1|d|src".to_owned());
+        let mut view = view_for(&collapsed);
+        view.grouping.by_directory = true;
+        let rows = build_change_rows(&set, None, &view);
+        assert_eq!(rows.len(), 3, "两个分组头 + 折叠的目录节点");
+        assert!(rows[2].collapsed);
+        assert_eq!(rows[2].count, 2);
     }
 
     #[test]
@@ -1840,6 +2517,7 @@ pub fn build_compare_rows(
             code: SharedString::from(change.kind.letter().to_string()),
             status: SharedString::from(change.kind.label()),
             selected: selected == Some(index),
+            icon_kind: SharedString::from(file_icon_kind(&change.path)),
         })
         .collect()
 }

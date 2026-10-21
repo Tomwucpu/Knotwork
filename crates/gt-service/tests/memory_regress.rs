@@ -193,7 +193,9 @@ fn repeated_read_operations_do_not_grow_rss() {
         };
         let paged = round_trip(RequestKind::LogPage(second));
         assert!(paged.is_ok(), "翻页失败：{paged:?}");
-        let status = round_trip(RequestKind::Status);
+        let status = round_trip(RequestKind::Status {
+            include_ignored: false,
+        });
         assert!(status.is_ok(), "状态失败：{status:?}");
         let changes = round_trip(RequestKind::TreeChanges {
             old: Some("HEAD~1".to_owned()),

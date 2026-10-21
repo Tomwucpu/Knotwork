@@ -10,11 +10,13 @@
 // OptionToggle / CtxMenuItem），旧调用点零改动即可获得新观感。
 
 import { Palette, Metrics } from "theme.slint";
+import { Texts } from "texts.slint";
 import { IdeaIcon } from "icons.slint";
 
 
 export component IdeaButton inherits Rectangle {
     in property <string> text;
+    in property <string> tooltip: "";
     in property <bool> enabled: true;
     in property <bool> danger: false;
     // ghost | outline | primary
@@ -52,6 +54,10 @@ export component IdeaButton inherits Rectangle {
         enabled: root.enabled;
         clicked => { root.clicked(); }
     }
+
+    if root.tooltip != "": Tooltip {
+        text: @markdown("\{root.tooltip}");
+    }
 }
 
 export component FlatButton inherits IdeaButton { }
@@ -59,9 +65,12 @@ export component FlatButton inherits IdeaButton { }
 
 export component IdeaIconButton inherits Rectangle {
     in property <string> icon;
+    in property <string> tooltip: "";
     in property <bool> enabled: true;
     in property <bool> active: false;
     in property <color> tint: Palette.icon;
+    // 个别按钮（如视图选项）需要比工具栏默认 16px 更大的图标。
+    in property <length> icon-size: Metrics.icon-size;
     callback clicked();
 
     width: Metrics.icon-button;
@@ -74,7 +83,7 @@ export component IdeaIconButton inherits Rectangle {
             : (touch.has-hover || root.active ? Palette.action-hover : transparent));
 
     IdeaIcon {
-        icon-size: Metrics.icon-size;
+        icon-size: root.icon-size;
         tint: !root.enabled
             ? Palette.text-faint
             : (touch.has-hover ? Palette.icon-hover : root.tint);
@@ -86,6 +95,10 @@ export component IdeaIconButton inherits Rectangle {
     touch := TouchArea {
         enabled: root.enabled;
         clicked => { root.clicked(); }
+    }
+
+    if root.tooltip != "": Tooltip {
+        text: @markdown("\{root.tooltip}");
     }
 }
 
@@ -342,6 +355,7 @@ export component FilterButton inherits Rectangle {
         padding-right: 6px;
         spacing: 4px;
         alignment: center;
+        cross-axis-alignment: center;
 
         label := Text {
             text: root.text;
@@ -376,10 +390,11 @@ export component IdeaRefBadge inherits Rectangle {
     background: Palette.badge-bg;
 
     HorizontalLayout {
-        padding-left: 4px;
-        padding-right: 6px;
-        spacing: 3px;
+        padding-left: 5px;
+        padding-right: 5px;
+        spacing: 4px;
         alignment: center;
+        cross-axis-alignment: center;
 
         IdeaIcon {
             name: root.kind == 3 ? "tag" : "branch";
@@ -405,6 +420,9 @@ export component MenuItem inherits Rectangle {
     in property <string> shortcut: "";
     in property <bool> enabled: true;
     in property <bool> danger: false;
+    // 可勾选菜单项（分组依据 / 显示选项）：勾选列始终占位，文本才能对齐。
+    in property <bool> checkable: false;
+    in property <bool> checked: false;
     callback clicked();
 
     height: 28px;
@@ -414,7 +432,21 @@ export component MenuItem inherits Rectangle {
     HorizontalLayout {
         padding-left: 8px;
         padding-right: 8px;
-        spacing: 16px;
+        spacing: 8px;
+
+        if root.checkable: Rectangle {
+            width: 14px;
+            height: 100%;
+
+            IdeaIcon {
+                name: "check";
+                icon-size: 14px;
+                tint: Palette.accent-strong;
+                visible: root.checked;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+        }
 
         Text {
             horizontal-stretch: 1;
@@ -441,6 +473,68 @@ export component MenuItem inherits Rectangle {
 
 export component CtxMenuItem inherits MenuItem { }
 
+
+export component SplitterHandle inherits Rectangle {
+    // vertical = 竖向分隔条（左右拖拽），false = 横向分隔条（上下拖拽）。
+    in property <bool> vertical: true;
+    in property <bool> enabled: true;
+    // 尺寸对象在分隔条右侧/上方时置 true：拖动方向与尺寸增减相反。
+    in property <bool> reverse: false;
+    in-out property <length> size: 380px;
+    in property <length> min-size: 220px;
+    in property <length> max-size: 100000px;
+    callback resized();
+
+    property <bool> dragging: false;
+    property <length> drag-start-size: 0px;
+    // 记录按下时的绝对指针坐标（相对窗口）。不能用分隔条自身的 mouse-x/y：
+    // 分隔条会跟随拖拽移动，相对坐标每帧都会跳回原点，表现为来回抖动。
+    property <length> drag-start-pointer: 0px;
+
+    background: transparent;
+
+    Rectangle {
+        width: root.vertical ? 1px : parent.width;
+        height: root.vertical ? parent.height : 1px;
+        x: root.vertical ? (parent.width - self.width) / 2 : 0px;
+        y: root.vertical ? 0px : (parent.height - self.height) / 2;
+        background: touch.has-hover || root.dragging ? Palette.accent-strong : Palette.line;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.vertical ? col-resize : row-resize;
+        moved => {
+            if root.dragging {
+                root.size = clamp(
+                    root.vertical
+                        ? root.drag-start-size
+                            + (root.reverse ? -1 : 1)
+                                * (self.absolute-position.x + self.mouse-x - root.drag-start-pointer)
+                        : root.drag-start-size
+                            + (root.reverse ? -1 : 1)
+                                * (root.drag-start-pointer - (self.absolute-position.y + self.mouse-y)),
+                    root.min-size,
+                    root.max-size
+                );
+            }
+        }
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                root.dragging = true;
+                root.drag-start-size = root.size;
+                root.drag-start-pointer = root.vertical
+                    ? self.absolute-position.x + self.mouse-x
+                    : self.absolute-position.y + self.mouse-y;
+            } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                if root.dragging {
+                    root.dragging = false;
+                    root.resized();
+                }
+            }
+        }
+    }
+}
 
 export component Divider inherits Rectangle {
     height: 1px;
@@ -474,6 +568,7 @@ export component ToolWindowHeader inherits Rectangle {
         padding-left: 12px;
         padding-right: 4px;
         spacing: 2px;
+        cross-axis-alignment: center;
 
         Text {
             horizontal-stretch: 1;
@@ -486,12 +581,14 @@ export component ToolWindowHeader inherits Rectangle {
 
         IdeaIconButton {
             icon: "more";
+            tooltip: Texts.s201;
             visible: root.show-more;
             clicked => { root.toggle-more(); }
         }
 
         IdeaIconButton {
-            icon: "remove";
+            icon: "close";
+            tooltip: Texts.s202;
             visible: root.show-minimize;
             clicked => { root.toggle-minimize(); }
         }

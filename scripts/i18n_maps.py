@@ -159,6 +159,13 @@ SLINT_MAP = {
     "全部引用": "All refs",
     "（条目过多，已截断）": "(too many entries, truncated)",
     "点击一条提交即在差异面板预览该提交对此文件的改动": "Click a commit to preview its changes to this file in the diff panel",
+    "全部展开": "Expand all",
+    "视图选项": "View options",
+    "已忽略的文件": "Ignored Files",
+    "分组依据": "Group by",
+    "目录": "Directory",
+    "模块": "Module",
+    "显示": "Show",
 }
 
 RUST_MAP = {
@@ -316,6 +323,7 @@ RUST_MAP = {
     "系统密钥链不可用，无法在本工具内保存 token": "System keychain unavailable; cannot store tokens in-app",
     "尚未保存任何 token": "No tokens stored yet",
     "已保存 token 的主机：{}": "Hosts with stored tokens: {}",
+    "已忽略的文件不参与提交": "Ignored files cannot be committed",
     # ---- app/windows.rs（设置保存状态）----
     "已保存并应用（staging 模式、主题与语言即时生效；日志级别在下次启动生效）": "Saved & applied (staging mode, theme and language take effect instantly; log level on next start)",
     "已应用到本窗口，但写盘失败：{err}": "Applied to this window, but writing the config failed: {err}",

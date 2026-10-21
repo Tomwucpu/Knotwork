@@ -93,8 +93,8 @@ pub use remote::{
     RemoteOps, PUSH_PREVIEW_LIMIT,
 };
 pub use repo::{
-    collapse_linear, topo_order, BlobPair, GitRepo, GraphNode, RepoLocation, SharedGitRepo,
-    TOPO_MAX_NODES,
+    collapse_linear, topo_order, BlobPair, GitRepo, GraphNode, RepoLocation, RepoModule,
+    SharedGitRepo, TOPO_MAX_NODES,
 };
 pub use work::{
     BranchOp, CommitRequest, IgnoreTarget, RepoWriter, UpstreamRow, WriteOutcome, LOCK_FILE_NAME,

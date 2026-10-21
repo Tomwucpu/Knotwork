@@ -323,6 +323,49 @@ fn status_matches_git_cli_across_scenarios() {
     }
 }
 
+/// 「显示已忽略的文件」是显式开关：默认状态不含 `!!`，开启后与
+/// `git status --porcelain --ignored` 逐行一致。
+#[test]
+fn ignored_files_are_opt_in_and_match_git_cli() {
+    let Some(_) = GitCli::detect() else {
+        eprintln!("跳过：未找到 git 可执行文件");
+        return;
+    };
+
+    let fixture = Fixture::new("ignored").expect("创建夹具");
+    fixture.seed_base();
+    fixture.write("debug.log", "ignored\n");
+    fixture.write("logs/trace.log", "ignored\n");
+
+    let repo = fixture.open();
+    let default = repo.status().expect("默认状态");
+    assert!(
+        default
+            .entries
+            .iter()
+            .all(|entry| entry.bucket() != gt_core::StatusBucket::Ignored),
+        "默认状态不得包含忽略条目：{:?}",
+        default.entries
+    );
+    assert!(!default.entries.iter().any(|entry| entry.path == "debug.log"));
+
+    let with_ignored = repo.status_with_ignored(true).expect("含忽略状态");
+    let ignored: Vec<&str> = with_ignored
+        .entries
+        .iter()
+        .filter(|entry| entry.bucket() == gt_core::StatusBucket::Ignored)
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert!(
+        ignored.contains(&"debug.log"),
+        "开启后应包含忽略文件：{ignored:?}"
+    );
+
+    let cli = sorted_lines(&fixture.git(&["status", "--porcelain=v1", "--ignored"]));
+    let engine = sorted_lines(&with_ignored.to_porcelain());
+    assert_eq!(engine, cli, "含忽略状态应与 git status --ignored 一致");
+}
+
 #[test]
 fn unicode_paths_match_git_cli_byte_for_byte() {
     let Some(_) = GitCli::detect() else {
