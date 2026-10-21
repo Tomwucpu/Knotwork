@@ -16,16 +16,17 @@ export {
 }
 import {
     FlatButton, TabButton, Field, OptionToggle, Divider, VDivider, SectionLabel,
-    IdeaButton, IdeaIconButton, ToolbarSeparator, FilterButton, IdeaSearchField, IdeaCheckbox,
-    ToolWindowHeader,
+    IdeaButton, IdeaIconButton, FilterButton, IdeaSearchField, IdeaCheckbox,
+    ToolWindowHeader, SplitterHandle,
 } from "widgets.slint";
 import { IdeaIcon } from "icons.slint";
 import {
-    LogRowView, DiffRowView, ChangeRowView, ChangeGroupRowView, ConsoleRowView, BlameRowView,
-    CommitFileRowView,
+    LogRowView, DiffRowView, ChangeRowView, ChangeGroupRowView, ChangeNodeRowView, ConsoleRowView,
+    BlameRowView, CommitFileRowView,
 } from "rows.slint";
 import {
-    ConfirmDialog, SettingsDialog, PushDialog, RemotesDialog, CommitCtxMenu, RecentCtxMenu,
+    ConfirmDialog, SettingsDialog, PushDialog, RemotesDialog, CommitCtxMenu, ChangeCtxMenu,
+    ChangeOptionsMenu, RecentCtxMenu,
     OpDialog, IplanDialog, CflDialog, CompareDialog, FileHistoryDialog,
 } from "dialogs.slint";
 
@@ -110,13 +111,21 @@ export component MainWindow inherits Window {
     in-out property <bool> selection-is-untracked: false;
     in-out property <bool> staged-collapsed: false;
     in-out property <bool> unstaged-collapsed: false;
+    // 提交列表展示选项（IDEA 头部 eye 菜单）。
+    in-out property <bool> change-group-directory: true;
+    in-out property <bool> change-group-module: false;
+    in-out property <bool> show-ignored-files: false;
+    in-out property <bool> change-options-visible: false;
+    in-out property <length> change-options-x: 0px;
+    in-out property <length> change-options-y: 0px;
     // 提交工具窗收起状态（纯界面状态，不落配置）。
     in-out property <bool> commit-collapsed: false;
 
     // ---- 提交（FR-CMT-01/02）----
     in-out property <string> commit-message: "";
     in-out property <bool> commit-amend: false;
-    in-out property <bool> commit-reset-author: false;
+    // 提交消息框高度（顶部边缘可拖拽调整）。
+    in-out property <length> commit-message-height: 110px;
     in-out property <string> commit-hint: "";
     in-out property <bool> commit-enabled: true;
     in-out property <bool> staging-mode: true;
@@ -194,6 +203,14 @@ export component MainWindow inherits Window {
     in-out property <length> ctx-y: 0px;
     in-out property <string> ctx-subject: "";
     in-out property <bool> ctx-is-head: false;
+
+    // ---- 单文件上下文菜单 ----
+    in-out property <bool> change-ctx-visible: false;
+    in-out property <length> change-ctx-x: 0px;
+    in-out property <length> change-ctx-y: 0px;
+    in-out property <int> change-ctx-group: 1;
+    in-out property <bool> change-ctx-untracked: false;
+    in-out property <bool> change-ctx-conflict: false;
 
     // ---- M4：通用操作对话框（合并/变基/重置/补丁/标签）----
     // 用一个对话框承载五种"填一个参数再确认"的操作：它们的交互形态完全一致，
@@ -277,7 +294,6 @@ export component MainWindow inherits Window {
 
     callback poll();
     callback refresh();
-    callback open-repo(string);
     callback browse-repo();
     callback select-log(int);
     callback select-change(int);
@@ -293,17 +309,25 @@ export component MainWindow inherits Window {
     // 写操作
     callback stage-selected();
     callback unstage-selected();
+    callback stage-change(int);
+    callback unstage-change(int);
+    callback stage-path(string);
+    callback unstage-path(string);
     callback stage-all();
     callback unstage-all();
     callback toggle-change-group(int);
+    callback toggle-change-grouping(int);
+    callback toggle-show-ignored();
+    callback toggle-change-node(string);
+    callback expand-all-changes();
+    callback collapse-all-changes();
     callback discard-selected();
     callback delete-selected();
     callback ignore-selected(int);
     callback commit();
     callback commit-and-push();
-    callback set-commit-message(string);
+    callback commit-message-edited(string);
     callback toggle-amend(bool);
-    callback toggle-reset-author(bool);
     callback toggle-diff-row(int);
     callback stage-hunks();
     callback unstage-hunks();
@@ -314,7 +338,6 @@ export component MainWindow inherits Window {
     callback branch-rename();
     callback branch-delete(bool);
     callback branch-upstream();
-    callback checkout-selected-commit();
     callback delete-tag();
 
     // 搜索与图选项
@@ -361,6 +384,7 @@ export component MainWindow inherits Window {
     callback close-commit-menu();
     // 菜单项统一走一个回调：动作标识由 Rust 侧解释，避免十三个几乎相同的回调。
     callback commit-action(string);
+    callback change-action(string);
 
     // ---- M4：通用操作对话框 ----
     callback set-op-input(string);
@@ -432,6 +456,8 @@ export component MainWindow inherits Window {
     init => {
         Palette.dark = root.dark-theme;
         Texts.en = root.english-ui;
+        root.viewport-width = root.width;
+        root.viewport-height = root.height;
     }
     changed dark-theme => { Palette.dark = root.dark-theme; }
     changed english-ui => { Texts.en = root.english-ui; }
@@ -443,6 +469,14 @@ export component MainWindow inherits Window {
     property <length> viewport-height: 650px;
     changed width => { root.viewport-width = root.width; }
     changed height => { root.viewport-height = root.height; }
+
+    // ---- 可拖拽布局 ----
+    // 尺寸不设上下限：拖到 0 只会把对应面板收窄/压扁，分隔条仍在原处可拖回。
+    in-out property <length> commit-panel-width: Metrics.commit-panel-width;
+    in-out property <length> git-panel-height: 300px;
+    in-out property <length> branch-tree-width: 228px;
+    in-out property <length> details-panel-width: Metrics.details-panel-width;
+    callback layout-changed();
 
     changed blame-anchor => {
         if root.blame-anchor >= 0 {
@@ -462,6 +496,140 @@ export component MainWindow inherits Window {
         padding: 0px;
         spacing: 0px;
 
+        // ---------------------------------------------------- 顶部标题栏
+        // 常驻：未打开仓库时只保留品牌与设置；打开仓库后承载远端操作。
+        Rectangle {
+            height: Metrics.title-bar-height;
+            background: Palette.bar;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 8px;
+                spacing: 8px;
+                cross-axis-alignment: center;
+
+                VerticalLayout {
+                    width: 220px;
+                    alignment: center;
+                    spacing: 0px;
+
+                    Text {
+                        text: root.repo-title;
+                        color: Palette.text;
+                        font-size: Palette.font-title;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    if root.has-repo: Text {
+                        text: root.repo-path;
+                        color: Palette.text-faint;
+                        font-size: Palette.font-xs;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                if root.has-repo: Rectangle {
+                    height: 24px;
+                    border-radius: Palette.radius-sm;
+                    border-width: 1px;
+                    border-color: Palette.line;
+
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        alignment: center;
+                        cross-axis-alignment: center;
+
+                        Text {
+                            text: root.branch-text;
+                            color: Palette.green;
+                            font-size: Palette.font-md;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            max-width: 180px;
+                        }
+                    }
+                }
+
+                if root.has-repo && root.viewport-width >= 1000px: Text {
+                    text: root.head-text;
+                    color: Palette.text-faint;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                if root.has-repo && root.viewport-width >= 1140px: Text {
+                    text: root.remote-current;
+                    color: Palette.text-faint;
+                    font-size: Palette.font-xs;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                if root.has-repo: VDivider { }
+
+                if root.has-repo: FlatButton {
+                    text: Texts.s195;
+                    enabled: !root.cli-missing && !root.network-busy;
+                    clicked => { root.fetch-selected(); }
+                }
+
+                if root.has-repo: FlatButton {
+                    text: Texts.s196;
+                    enabled: !root.cli-missing && !root.network-busy;
+                    clicked => { root.fetch-all(); }
+                }
+
+                if root.has-repo: VDivider { }
+
+                if root.has-repo: FlatButton {
+                    text: Texts.s197;
+                    enabled: !root.cli-missing && !root.network-busy && !root.read-only;
+                    clicked => { root.update-project(); }
+                }
+
+                if root.has-repo: FlatButton {
+                    text: Texts.s198;
+                    enabled: !root.cli-missing && !root.network-busy && !root.read-only;
+                    clicked => { root.push-request(); }
+                }
+
+                if root.has-repo: VDivider { }
+
+                if root.has-repo: FlatButton {
+                    text: Texts.s5;
+                    enabled: !root.cli-missing;
+                    clicked => { root.open-remotes(); }
+                }
+
+                IdeaIconButton {
+                    icon: "settings";
+                    tooltip: Texts.s6;
+                    clicked => { root.open-settings(); }
+                }
+
+                if root.has-repo: IdeaIconButton {
+                    icon: "refresh";
+                    tooltip: Texts.s7;
+                    enabled: !root.cli-missing && !root.network-busy;
+                    clicked => { root.refresh(); }
+                }
+            }
+
+            Rectangle {
+                width: parent.width;
+                height: 1px;
+                y: parent.height - self.height;
+                background: Palette.line;
+            }
+        }
+
         // ---------------------------------------------------- 状态横幅
         Rectangle {
             height: root.state-banner-visible ? 28px : 0px;
@@ -472,6 +640,7 @@ export component MainWindow inherits Window {
                 padding-left: 12px;
                 padding-right: 8px;
                 spacing: 8px;
+                cross-axis-alignment: center;
 
                 Text {
                     text: root.state-text;
@@ -549,6 +718,7 @@ export component MainWindow inherits Window {
                 padding-left: 12px;
                 padding-right: 8px;
                 spacing: 8px;
+                cross-axis-alignment: center;
 
                 Text {
                     text: root.network-label + "…";
@@ -584,6 +754,7 @@ export component MainWindow inherits Window {
                 padding-left: 12px;
                 padding-right: 8px;
                 spacing: 8px;
+                cross-axis-alignment: center;
 
                 Text {
                     horizontal-stretch: 1;
@@ -608,9 +779,17 @@ export component MainWindow inherits Window {
             spacing: 0px;
 
             // 上半：提交工具窗 + 差异编辑器
-            HorizontalLayout {
+            // 外层 Rectangle 显式 min-height: 0 + clip：底栏拉高时先压缩并裁切上半区，
+            // 避免上部内容的固有高度把状态栏顶出窗口。
+            Rectangle {
                 vertical-stretch: 1;
-                spacing: 0px;
+                min-height: 0px;
+                clip: true;
+                background: Palette.bg;
+
+                HorizontalLayout {
+                    height: 100%;
+                    spacing: 0px;
 
                 // ---- 提交折叠后的窄条
                 Rectangle {
@@ -620,6 +799,7 @@ export component MainWindow inherits Window {
 
                     IdeaIconButton {
                         icon: "changes";
+                        tooltip: Texts.s200;
                         x: (parent.width - self.width) / 2;
                         y: 6px;
                         clicked => { root.commit-collapsed = false; }
@@ -628,9 +808,7 @@ export component MainWindow inherits Window {
 
                 // ---- 提交工具窗
                 Rectangle {
-                    width: root.commit-collapsed
-                        ? 0px
-                        : (root.viewport-width < 1100px ? 320px : Metrics.commit-panel-width);
+                    width: root.commit-collapsed ? 0px : root.commit-panel-width;
                     visible: !root.commit-collapsed;
                     background: Palette.panel;
                     clip: true;
@@ -645,7 +823,7 @@ export component MainWindow inherits Window {
                             toggle-minimize => { root.commit-collapsed = true; }
                         }
 
-                        // 工具栏：刷新 / 批量暂存 / 批量反暂存 / 丢弃 / 设置
+                        // 工具栏：视图选项 / 全部折叠 / 全部展开 / 批量暂存 / 批量反暂存 / 丢弃
                         Rectangle {
                             height: Metrics.toolbar-height;
                             background: Palette.panel;
@@ -654,40 +832,70 @@ export component MainWindow inherits Window {
                                 padding-left: 6px;
                                 padding-right: 6px;
                                 spacing: 2px;
+                                cross-axis-alignment: center;
 
-                                IdeaIconButton {
-                                    icon: "refresh";
-                                    clicked => { root.refresh(); }
-                                }
-
-                                ToolbarSeparator { }
-
+                                // 视图按钮右下角的直角三角形表示它带有下拉菜单。
                                 IdeaIconButton {
                                     icon: "add";
+                                    tooltip: Texts.s166;
                                     enabled: !root.read-only;
                                     clicked => { root.stage-all(); }
                                 }
 
                                 IdeaIconButton {
                                     icon: "remove";
+                                    tooltip: Texts.s167;
                                     enabled: !root.read-only;
                                     clicked => { root.unstage-all(); }
                                 }
 
-                                ToolbarSeparator { }
+                                Rectangle {
+                                    width: Metrics.icon-button;
+                                    height: Metrics.icon-button;
+
+                                    options-button := IdeaIconButton {
+                                        x: 0;
+                                        y: 0;
+                                        icon: "eye";
+                                        icon-size: 18px;
+                                        tooltip: Texts.s186;
+                                        active: root.change-options-visible;
+                                        clicked => {
+                                            root.change-options-x = options-button.absolute-position.x;
+                                            root.change-options-y = options-button.absolute-position.y + options-button.height;
+                                            root.change-options-visible = true;
+                                        }
+                                    }
+
+                                    IdeaIcon {
+                                        name: "menu-corner";
+                                        icon-size: 6px;
+                                        tint: root.change-options-visible ? Palette.icon-hover : Palette.text-faint;
+                                        x: parent.width - 6px;
+                                        y: parent.height - 6px;
+                                    }
+                                }
 
                                 IdeaIconButton {
-                                    icon: "revert";
-                                    enabled: !root.read-only;
-                                    tint: root.read-only ? Palette.text-faint : Palette.red;
-                                    clicked => { root.discard-selected(); }
+                                    icon: "collapse-all";
+                                    tooltip: Texts.s170;
+                                    clicked => { root.collapse-all-changes(); }
+                                }
+
+                                IdeaIconButton {
+                                    icon: "expand-all";
+                                    tooltip: Texts.s205;
+                                    clicked => { root.expand-all-changes(); }
                                 }
 
                                 Rectangle { horizontal-stretch: 1; }
 
                                 IdeaIconButton {
-                                    icon: "settings";
-                                    clicked => { root.open-settings(); }
+                                    icon: "revert";
+                                    tooltip: Texts.s37;
+                                    enabled: !root.read-only;
+                                    tint: root.read-only ? Palette.text-faint : Palette.red;
+                                    clicked => { root.discard-selected(); }
                                 }
                             }
                         }
@@ -695,26 +903,22 @@ export component MainWindow inherits Window {
                         Divider { }
 
                         // 已暂存 / 未暂存 + 文件行
-                        ListView {
-                            height: max(
-                                50px,
-                                root.viewport-height - 573px
-                                    - (root.state-banner-visible ? 28px : 0px)
-                                    - (root.read-only ? 28px : 0px)
-                                    - (root.cli-missing ? 44px : 0px)
-                                    - (root.network-busy ? 28px : 0px)
-                                    - (root.network-error-visible ? 62px : 0px));
+                        commit-list := ListView {
+                            vertical-stretch: 1;
+                            min-height: 84px;
                             for row[index] in root.change-rows: Rectangle {
-                                height: row.kind == 1 ? 28px : Metrics.list-row-height;
+                                height: 24px;
                                 width: 100%;
 
                                 if row.kind == 1: ChangeGroupRowView {
                                     width: 100%;
                                     height: 100%;
-                                    title: row.group == 0 ? Texts.s162 : Texts.s163;
+                                    title: row.group == 0 ? Texts.s162
+                                        : (row.group == 1 ? Texts.s163 : Texts.s206);
                                     group: row.group;
                                     count: row.count;
                                     collapsed: row.collapsed;
+                                    show-action: row.group != 2;
                                     toggled => { root.toggle-change-group(row.group); }
                                     action => {
                                         if row.group == 0 {
@@ -725,26 +929,99 @@ export component MainWindow inherits Window {
                                     }
                                 }
 
+                                if row.kind == 2 || row.kind == 3: ChangeNodeRowView {
+                                    width: 100%;
+                                    height: 100%;
+                                    name: row.name;
+                                    count: row.count;
+                                    depth: row.depth;
+                                    collapsed: row.collapsed;
+                                    is-module: row.kind == 2;
+                                    group: row.group;
+                                    is-ignored: row.group == 2;
+                                    read-only: root.read-only;
+                                    allow-action: row.node-path != "";
+                                    toggled => { root.toggle-change-node(row.node-key); }
+                                    stage-clicked => { root.stage-path(row.node-path); }
+                                    unstage-clicked => { root.unstage-path(row.node-path); }
+                                }
+
                                 if row.kind == 0: ChangeRowView {
                                     width: 100%;
                                     height: 100%;
                                     row-index: row.row-index;
                                     group: row.group;
-                                    path: row.path;
-                                    code: row.code;
+                                    depth: row.depth;
+                                    name: row.name;
+                                    parent-path: row.parent-path;
                                     bucket: row.bucket;
                                     note: row.note;
+                                    icon-kind: row.icon-kind;
                                     is-selected: row.is-selected;
                                     is-conflict: row.is-conflict;
                                     is-untracked: row.is-untracked;
+                                    is-ignored: row.is-ignored;
+                                    read-only: root.read-only;
                                     clicked => { root.select-change(row.row-index); }
+                                    stage-clicked => { root.stage-change(row.row-index); }
+                                    unstage-clicked => { root.unstage-change(row.row-index); }
+                                    context-clicked(x, y) => {
+                                        if !row.is-ignored {
+                                            root.select-change(row.row-index);
+                                            root.change-ctx-x = x;
+                                            root.change-ctx-y = y;
+                                            root.change-ctx-group = row.group;
+                                            root.change-ctx-untracked = row.is-untracked;
+                                            root.change-ctx-conflict = row.is-conflict;
+                                            root.change-ctx-visible = true;
+                                        }
+                                    }
                                 }
                             }
                         }
 
-                        // 提交消息区
+                        // 修订 / 提交提示（对齐 IDEA：位于消息框上方）
                         Rectangle {
-                            height: 110px;
+                            height: root.viewport-height >= 560px ? 30px : 0px;
+                            visible: root.viewport-height >= 560px;
+                            background: Palette.panel;
+
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 8px;
+                                spacing: 10px;
+                                cross-axis-alignment: center;
+
+                                IdeaCheckbox {
+                                    text: Texts.s183;
+                                    checked: root.commit-amend;
+                                    toggled => { root.toggle-amend(!root.commit-amend); }
+                                }
+
+                                Rectangle { horizontal-stretch: 1; }
+
+                                Text {
+                                    text: root.commit-hint;
+                                    color: Palette.text-faint;
+                                    font-size: Palette.font-meta;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+
+                        // 提交消息区：只允许在上边界拖拽调整高度
+                        SplitterHandle {
+                            vertical: false;
+                            width: 100%;
+                            height: 5px;
+                            size <=> root.commit-message-height;
+                            min-size: 48px;
+                            max-size: clamp(root.viewport-height - 420px, 48px, 320px);
+                        }
+
+                        Rectangle {
+                            height: root.commit-message-height;
                             background: Palette.panel;
 
                             VerticalLayout {
@@ -771,6 +1048,7 @@ export component MainWindow inherits Window {
                                         wrap: word-wrap;
                                         color: Palette.text;
                                         font-size: Palette.font-md;
+                                        edited => { root.commit-message-edited(root.commit-message); }
                                     }
 
                                     Text {
@@ -786,41 +1064,6 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        // 修订 / 保留作者 / 提交提示
-                        Rectangle {
-                            height: 30px;
-                            background: Palette.panel;
-
-                            HorizontalLayout {
-                                padding-left: 10px;
-                                padding-right: 8px;
-                                spacing: 10px;
-
-                                IdeaCheckbox {
-                                    text: Texts.s183;
-                                    checked: root.commit-amend;
-                                    toggled => { root.toggle-amend(!root.commit-amend); }
-                                }
-
-                                IdeaCheckbox {
-                                    text: Texts.s184;
-                                    checked: root.commit-reset-author;
-                                    enabled: root.commit-amend;
-                                    toggled => { root.toggle-reset-author(!root.commit-reset-author); }
-                                }
-
-                                Rectangle { horizontal-stretch: 1; }
-
-                                Text {
-                                    text: root.commit-hint;
-                                    color: Palette.text-faint;
-                                    font-size: Palette.font-meta;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                }
-                            }
-                        }
-
                         // 提交动作区
                         Rectangle {
                             height: 46px;
@@ -830,6 +1073,7 @@ export component MainWindow inherits Window {
                                 padding-left: 10px;
                                 padding-right: 8px;
                                 spacing: 6px;
+                                cross-axis-alignment: center;
 
                                 IdeaButton {
                                     horizontal-stretch: 1;
@@ -846,21 +1090,24 @@ export component MainWindow inherits Window {
                                     enabled: !root.read-only && root.commit-enabled && !root.cli-missing;
                                     clicked => { root.commit-and-push(); }
                                 }
-
-                                IdeaIconButton {
-                                    icon: "settings";
-                                    clicked => { root.open-settings(); }
-                                }
                             }
                         }
                     }
                 }
 
-                VDivider { }
+                SplitterHandle {
+                    vertical: true;
+                    width: 5px;
+                    height: 100%;
+                    size <=> root.commit-panel-width;
+                    min-size: 0px;
+                    resized => { root.layout-changed(); }
+                }
 
                 // ---- 差异编辑器
                 Rectangle {
                     horizontal-stretch: 1;
+                    min-width: 0px;
                     background: Palette.bg;
                     clip: true;
 
@@ -879,9 +1126,10 @@ export component MainWindow inherits Window {
                                     padding-left: 10px;
                                     padding-right: 8px;
                                     spacing: 6px;
+                                    cross-axis-alignment: center;
 
                                     Text {
-                                        width: 240px;
+                                        width: root.viewport-width >= 1100px ? 240px : 160px;
                                         text: root.diff-title;
                                         color: Palette.text;
                                         font-size: Palette.font-md;
@@ -891,6 +1139,7 @@ export component MainWindow inherits Window {
                                     }
 
                                     Text {
+                                        visible: root.viewport-width >= 1200px;
                                         text: root.diff-stats;
                                         color: Palette.text-faint;
                                         font-size: Palette.font-meta;
@@ -900,6 +1149,7 @@ export component MainWindow inherits Window {
                                     Rectangle { horizontal-stretch: 1; }
 
                                     Text {
+                                        visible: root.viewport-width >= 1200px;
                                         text: root.diff-hint;
                                         color: Palette.text-faint;
                                         font-size: Palette.font-meta;
@@ -1128,6 +1378,7 @@ export component MainWindow inherits Window {
                                     padding-left: 10px;
                                     padding-right: 8px;
                                     spacing: 6px;
+                                    cross-axis-alignment: center;
 
                                     FlatButton {
                                         text: Texts.s41;
@@ -1194,13 +1445,25 @@ export component MainWindow inherits Window {
                     }
                 }
             }
+            }
 
             // ---------------------------------------------------- Git 日志工具窗
+            SplitterHandle {
+                vertical: false;
+                width: 100%;
+                height: 5px;
+                size <=> root.git-panel-height;
+                min-size: 0px;
+                resized => { root.layout-changed(); }
+            }
+
             Rectangle {
-                height: 300px;
+                height: root.git-panel-height;
+                clip: true;
                 background: Palette.panel;
 
                 VerticalLayout {
+                    height: parent.height;
                     spacing: 0px;
 
                     // 标签栏
@@ -1212,6 +1475,7 @@ export component MainWindow inherits Window {
                             padding-left: 4px;
                             padding-right: 4px;
                             spacing: 0px;
+                            cross-axis-alignment: center;
 
                             TabButton {
                                 text: "Git";
@@ -1234,17 +1498,6 @@ export component MainWindow inherits Window {
                                 }
                             }
 
-                            Rectangle { horizontal-stretch: 1; }
-
-                            IdeaIconButton {
-                                icon: "refresh";
-                                clicked => { root.refresh(); }
-                            }
-
-                            IdeaIconButton {
-                                icon: "settings";
-                                clicked => { root.open-settings(); }
-                            }
                         }
 
                         Rectangle {
@@ -1256,14 +1509,14 @@ export component MainWindow inherits Window {
                     }
 
                     // ---- Git 日志
-                    HorizontalLayout {
+                    if root.bottom-tab == 0: HorizontalLayout {
                         vertical-stretch: 1;
-                        visible: root.bottom-tab == 0;
                         spacing: 0px;
 
                         // 分支树 + 分支操作
                         Rectangle {
-                            width: root.viewport-width < 1060px ? 190px : 228px;
+                            width: root.branch-tree-width;
+                            clip: true;
                             background: Palette.panel;
 
                             VerticalLayout {
@@ -1279,7 +1532,8 @@ export component MainWindow inherits Window {
                                 }
 
                                 ListView {
-                                    height: 116px;
+                                    vertical-stretch: 1;
+                                    min-height: 40px;
                                     for entry[index] in root.sidebar-refs: Rectangle {
                                         height: 24px;
                                         background: entry.selected
@@ -1291,6 +1545,7 @@ export component MainWindow inherits Window {
                                             padding-left: 2px;
                                             padding-right: 6px;
                                             spacing: 4px;
+                                            cross-axis-alignment: center;
 
                                             IdeaIcon {
                                                 name: entry.collapsed ? "chevron-right" : "chevron-down";
@@ -1324,6 +1579,7 @@ export component MainWindow inherits Window {
                                             padding-left: 18px;
                                             padding-right: 6px;
                                             spacing: 6px;
+                                            cross-axis-alignment: center;
 
                                             IdeaIcon {
                                                 name: entry.kind-id == 2 ? "tag" : "branch";
@@ -1350,6 +1606,7 @@ export component MainWindow inherits Window {
                                                 vertical-alignment: center;
                                                 horizontal-alignment: right;
                                             }
+
                                         }
 
                                         ref-touch := TouchArea {
@@ -1359,6 +1616,20 @@ export component MainWindow inherits Window {
                                                 } else if entry.row-kind == 1 {
                                                     root.select-ref(entry.ref-index);
                                                 }
+                                            }
+                                        }
+
+                                        if entry.row-kind == 1 && entry.kind-id == 2 && ref-touch.has-hover: IdeaIconButton {
+                                            icon: "remove";
+                                            tooltip: Texts.s23;
+                                            width: 20px;
+                                            height: 20px;
+                                            x: parent.width - self.width - 4px;
+                                            y: (parent.height - self.height) / 2;
+                                            tint: Palette.red;
+                                            clicked => {
+                                                root.select-ref(entry.ref-index);
+                                                root.delete-tag();
                                             }
                                         }
                                     }
@@ -1374,6 +1645,7 @@ export component MainWindow inherits Window {
 
                                 HorizontalLayout {
                                     spacing: 4px;
+                                    cross-axis-alignment: center;
                                     FlatButton { text: Texts.s16; enabled: !root.read-only; clicked => { root.branch-create(true); } }
                                     FlatButton { text: Texts.s17; enabled: !root.read-only; clicked => { root.branch-create(false); } }
                                     FlatButton { text: Texts.s18; enabled: !root.read-only; clicked => { root.branch-checkout(); } }
@@ -1381,6 +1653,7 @@ export component MainWindow inherits Window {
 
                                 HorizontalLayout {
                                     spacing: 4px;
+                                    cross-axis-alignment: center;
                                     FlatButton { text: Texts.s19; enabled: !root.read-only; clicked => { root.branch-rename(); } }
                                     FlatButton { text: Texts.s20; enabled: !root.read-only; danger: true; clicked => { root.branch-delete(false); } }
                                     FlatButton { text: Texts.s21; enabled: !root.read-only; clicked => { root.branch-upstream(); } }
@@ -1388,11 +1661,26 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        VDivider { }
+                        SplitterHandle {
+                            vertical: true;
+                            width: 5px;
+                            height: 100%;
+                            size <=> root.branch-tree-width;
+                            min-size: 0px;
+                            resized => { root.layout-changed(); }
+                        }
 
                         // 提交表
-                        VerticalLayout {
+                        // 包一层可裁切的外框：内容最小宽度不再反向撑死三栏布局，
+                        // 拖动详情/分支栏时提交表可以先让位。
+                        Rectangle {
                             horizontal-stretch: 1;
+                            min-width: 0px;
+                            clip: true;
+                            background: Palette.panel;
+
+                        VerticalLayout {
+                            height: 100%;
                             spacing: 0px;
 
                             Rectangle {
@@ -1403,6 +1691,7 @@ export component MainWindow inherits Window {
                                     padding-left: 8px;
                                     padding-right: 8px;
                                     spacing: 4px;
+                                    cross-axis-alignment: center;
 
                                     IdeaSearchField {
                                         width: 240px;
@@ -1416,11 +1705,13 @@ export component MainWindow inherits Window {
 
                                     IdeaIconButton {
                                         icon: "search";
+                                        tooltip: Texts.s27;
                                         clicked => { root.run-search(); }
                                     }
 
                                     IdeaIconButton {
                                         icon: "close";
+                                        tooltip: Texts.s28;
                                         enabled: root.search-active;
                                         clicked => { root.clear-search(); }
                                     }
@@ -1463,7 +1754,7 @@ export component MainWindow inherits Window {
                             Divider { }
 
                             ListView {
-                                height: 235px;
+                                vertical-stretch: 1;
                                 for row[index] in root.log-rows: LogRowView {
                                         height: Metrics.log-row-height;
                                         short-id: row.short-id;
@@ -1486,14 +1777,24 @@ export component MainWindow inherits Window {
                                     }
                                 }
                             }
+                            }
 
-                        VDivider {
+                        SplitterHandle {
+                            vertical: true;
+                            width: 5px;
+                            height: 100%;
+                            reverse: true;
                             visible: root.viewport-width >= 1080px;
+                            enabled: root.viewport-width >= 1080px;
+                            size <=> root.details-panel-width;
+                            min-size: 0px;
+                            resized => { root.layout-changed(); }
                         }
 
                         // 提交详情：元数据 + 文件清单（点文件在主差异区打开）
                         Rectangle {
-                            width: root.viewport-width >= 1080px ? Metrics.details-panel-width : 0px;
+                            width: root.viewport-width >= 1080px ? root.details-panel-width : 0px;
+                            clip: true;
                             visible: root.viewport-width >= 1080px;
                             background: Palette.panel;
 
@@ -1591,12 +1892,13 @@ export component MainWindow inherits Window {
                                 }
 
                                 ListView {
-                                    height: 88px;
+                                    vertical-stretch: 1;
+                                    min-height: 40px;
                                     for file[index] in root.commit-detail.files: CommitFileRowView {
                                             height: Metrics.list-row-height;
                                             path: file.path;
-                                            code: file.code;
                                             status: file.status;
+                                            icon-kind: file.icon-kind;
                                             selected: file.selected;
                                             clicked => { root.select-commit-file(index); }
                                         }
@@ -1606,9 +1908,8 @@ export component MainWindow inherits Window {
                     }
 
                     // ---- Console
-                    VerticalLayout {
+                    if root.bottom-tab == 1: VerticalLayout {
                         vertical-stretch: 1;
-                        visible: root.bottom-tab == 1;
                         spacing: 0px;
 
                         Rectangle {
@@ -1618,6 +1919,7 @@ export component MainWindow inherits Window {
                             HorizontalLayout {
                                 padding-left: 8px;
                                 spacing: 4px;
+                                cross-axis-alignment: center;
 
                                 FlatButton {
                                     text: Texts.s49;
@@ -1643,9 +1945,8 @@ export component MainWindow inherits Window {
                     }
 
                     // ---- Stash
-                    HorizontalLayout {
+                    if root.bottom-tab == 2: HorizontalLayout {
                         vertical-stretch: 1;
-                        visible: root.bottom-tab == 2;
                         spacing: 0px;
 
                         VerticalLayout {
@@ -1699,6 +2000,7 @@ export component MainWindow inherits Window {
                                     padding-left: 8px;
                                     padding-right: 8px;
                                     spacing: 8px;
+                                    cross-axis-alignment: center;
 
                                     Text {
                                         width: 86px;
@@ -2021,6 +2323,34 @@ export component MainWindow inherits Window {
         read-only: root.read-only;
         action(label) => { root.commit-action(label); }
         close => { root.close-commit-menu(); }
+    }
+
+    ChangeCtxMenu {
+        visible: root.change-ctx-visible;
+        ctx-x: root.change-ctx-x;
+        ctx-y: root.change-ctx-y;
+        group: root.change-ctx-group;
+        is-untracked: root.change-ctx-untracked;
+        is-conflict: root.change-ctx-conflict;
+        read-only: root.read-only;
+        action(label) => {
+            root.change-ctx-visible = false;
+            root.change-action(label);
+        }
+        close => { root.change-ctx-visible = false; }
+    }
+
+    ChangeOptionsMenu {
+        visible: root.change-options-visible;
+        ctx-x: root.change-options-x;
+        ctx-y: root.change-options-y;
+        by-directory: root.change-group-directory;
+        by-module: root.change-group-module;
+        show-ignored: root.show-ignored-files;
+        toggle-directory => { root.toggle-change-grouping(0); }
+        toggle-module => { root.toggle-change-grouping(1); }
+        toggle-ignored => { root.toggle-show-ignored(); }
+        close => { root.change-options-visible = false; }
     }
 
     OpDialog {

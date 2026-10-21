@@ -395,17 +395,7 @@ impl WindowManager {
 
         // ---- 启动页：打开仓库 ----
         //
-        // 这两个回调是启动页上的全部出口：手填路径点「打开」、或点最近仓库列表。
-        // 它们曾经漏接 —— 界面声明了回调而 Rust 侧没有处理者时，Slint 不会报错，
-        // 只会把点击静默丢弃，表现就是"点上去完全没反应"。
-        let weak = window.as_weak();
-        let slot = Rc::clone(state);
-        window.on_open_repo(move |path| {
-            if let Some(window) = weak.upgrade() {
-                open_from_start_page(&slot, &window, path.as_str());
-            }
-        });
-
+        // 最近仓库列表是启动页打开仓库的入口；选定后立刻就地打开。
         let weak = window.as_weak();
         let slot = Rc::clone(state);
         window.on_use_recent(move |path| {
@@ -553,6 +543,46 @@ impl WindowManager {
 
         let weak = window.as_weak();
         let slot = Rc::clone(state);
+        window.on_stage_change(move |index| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.stage_change(usize::try_from(index).unwrap_or(usize::MAX));
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_stage_path(move |path| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.stage_path(path.as_str());
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_unstage_path(move |path| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.unstage_path(path.as_str());
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_unstage_change(move |index| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.unstage_change(usize::try_from(index).unwrap_or(usize::MAX));
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
         window.on_stage_all(move || {
             if let Some(window) = weak.upgrade() {
                 Self::with_session(&slot, &window, Session::stage_all_changes);
@@ -574,6 +604,50 @@ impl WindowManager {
                 Self::with_session(&slot, &window, |session| {
                     session.toggle_change_group(group);
                 });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_toggle_change_grouping(move |kind| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.toggle_change_grouping(kind);
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_toggle_show_ignored(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::toggle_show_ignored);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_toggle_change_node(move |key| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.toggle_change_node(key.as_str());
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_expand_all_changes(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::expand_all_changes);
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_collapse_all_changes(move || {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, Session::collapse_all_changes);
             }
         });
 
@@ -619,10 +693,15 @@ impl WindowManager {
             }
         });
 
+        // Slint 双向绑定只更新窗口属性；Session 另行保存提交消息，
+        // 不回传的话提交检查会一直按空消息把按钮判为禁用。
+        let weak = window.as_weak();
         let slot = Rc::clone(state);
-        window.on_set_commit_message(move |text| {
-            if let Some(session) = slot.borrow_mut().session.as_mut() {
-                session.set_commit_message(text.as_str());
+        window.on_commit_message_edited(move |message| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| {
+                    session.set_commit_message(message.as_str());
+                });
             }
         });
 
@@ -631,14 +710,6 @@ impl WindowManager {
         window.on_toggle_amend(move |amend| {
             if let Some(window) = weak.upgrade() {
                 Self::with_session(&slot, &window, |session| session.set_amend(amend));
-            }
-        });
-
-        let weak = window.as_weak();
-        let slot = Rc::clone(state);
-        window.on_toggle_reset_author(move |reset| {
-            if let Some(window) = weak.upgrade() {
-                Self::with_session(&slot, &window, |session| session.set_reset_author(reset));
             }
         });
 
@@ -733,14 +804,6 @@ impl WindowManager {
         window.on_delete_tag(move || {
             if let Some(window) = weak.upgrade() {
                 Self::with_session(&slot, &window, Session::delete_selected_tag);
-            }
-        });
-
-        let weak = window.as_weak();
-        let slot = Rc::clone(state);
-        window.on_checkout_selected_commit(move || {
-            if let Some(window) = weak.upgrade() {
-                Self::with_session(&slot, &window, Session::request_checkout_selected_commit);
             }
         });
 
@@ -844,6 +907,29 @@ impl WindowManager {
         window.on_close_settings(move || {
             if let Some(window) = weak.upgrade() {
                 window.set_settings_visible(false);
+            }
+        });
+
+        // ---- 布局尺寸（全局共享，拖拽松手后落盘）----
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_layout_changed(move || {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            {
+                let shared = {
+                    let guard = slot.borrow();
+                    Rc::clone(&guard.config)
+                };
+                let mut config = shared.borrow_mut();
+                config.layout.commit_panel_width = length_to_u16(window.get_commit_panel_width());
+                config.layout.git_panel_height = length_to_u16(window.get_git_panel_height());
+                config.layout.branch_tree_width = length_to_u16(window.get_branch_tree_width());
+                config.layout.details_panel_width = length_to_u16(window.get_details_panel_width());
+            }
+            if let Err(err) = persist_shared(&slot) {
+                tracing::warn!(%err, "保存布局尺寸失败");
             }
         });
 
@@ -1146,6 +1232,24 @@ impl WindowManager {
             if let Some(window) = weak.upgrade() {
                 Self::with_session(&slot, &window, |session| {
                     session.commit_action(action.as_str());
+                });
+            }
+        });
+
+        let weak = window.as_weak();
+        let slot = Rc::clone(state);
+        window.on_change_action(move |action| {
+            if let Some(window) = weak.upgrade() {
+                Self::with_session(&slot, &window, |session| match action.as_str() {
+                    "stage" => session.stage_selected_change(),
+                    "unstage" => session.unstage_selected_change(),
+                    "discard" => session.request_discard_change(),
+                    "delete" => session.request_delete_untracked(),
+                    "ignore" => session.ignore_selected(false),
+                    "ignore-exclude" => session.ignore_selected(true),
+                    "blame" => session.request_blame_selected(),
+                    "history" => session.request_file_history_selected(),
+                    _ => {}
                 });
             }
         });
@@ -1603,6 +1707,10 @@ impl WindowManager {
         window.set_set_cache_mib(i32::try_from(config.cache.memory_mib).unwrap_or(32));
         window.set_set_log_level(log_level_index(config.diagnostics.log_level));
         window.set_set_update_strategy(strategy_index(config.git.update_strategy));
+        window.set_commit_panel_width(f32::from(config.layout.commit_panel_width));
+        window.set_git_panel_height(f32::from(config.layout.git_panel_height));
+        window.set_branch_tree_width(f32::from(config.layout.branch_tree_width));
+        window.set_details_panel_width(f32::from(config.layout.details_panel_width));
 
         let mut guard = state.borrow_mut();
         if guard.empty {
@@ -1633,6 +1741,14 @@ impl Drop for WindowManager {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Slint `length` 是 `f32`；转成配置里的 `u16` 时做有限性与范围收敛。
+fn length_to_u16(value: f32) -> u16 {
+    if !value.is_finite() {
+        return 0;
+    }
+    value.round().clamp(0.0, f32::from(u16::MAX)) as u16
 }
 
 /// 保存共享配置；返回错误文本供界面提示。

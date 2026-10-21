@@ -29,7 +29,8 @@ pub mod store;
 pub use error::{ConfigError, Result};
 pub use model::{
     AppearanceConfig, BranchProtectionConfig, CacheBudget, DiagnosticsConfig, ExternalToolConfig,
-    GitBehaviorConfig, Language, LogLevel, RemoteSettings, Theme, UpdateStrategy, UserConfig,
+    GitBehaviorConfig, Language, LayoutConfig, LogLevel, RemoteSettings, Theme, UpdateStrategy,
+    UserConfig,
 };
 pub use recent::{RecentRepo, RecentRepos, MAX_RECENT_REPOS};
 pub use store::{

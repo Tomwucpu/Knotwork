@@ -1,6 +1,7 @@
 //! 仓库句柄与读路径实现（M1 走 `gix` 进程内内核）。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -50,6 +51,19 @@ impl RepoLocation {
     pub fn work_dir_or_git_dir(&self) -> &Path {
         self.work_dir.as_deref().unwrap_or(&self.git_dir)
     }
+}
+
+/// 提交面板「按模块分组」的一个模块。
+///
+/// Knotwork 没有 IDE 的工程模型，最接近 IDEA Module 的口径是 Cargo 工作区
+/// 成员：`path` 是成员的仓库相对目录，`name` 取包名。非 Cargo 仓库返回空表，
+/// 由界面退化为按顶层目录分组。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoModule {
+    /// 展示名（Cargo 包名；缺失时用目录名）。
+    pub name: String,
+    /// 仓库相对目录前缀（`/` 分隔；空串表示仓库根）。
+    pub path: String,
 }
 
 /// 一对文件内容，用于文件级 diff 的两侧输入。
@@ -170,6 +184,18 @@ impl GitRepo {
     #[must_use]
     pub fn observer(&self) -> SharedObserver {
         Arc::clone(&self.observer)
+    }
+
+    /// 提交面板「按模块分组」的模块表（Cargo 工作区成员）。
+    ///
+    /// 裸仓库没有工作区可读，返回空表；非 Cargo 仓库同样返回空表，
+    /// 由界面退化为按顶层目录分组。
+    #[must_use]
+    pub fn modules(&self) -> Vec<RepoModule> {
+        self.location
+            .work_dir
+            .as_deref()
+            .map_or_else(Vec::new, detect_repo_modules)
     }
 
     /// 转成可跨线程共享的句柄（共享 odb 缓存；各线程自行生成本地句柄）。
@@ -448,13 +474,32 @@ impl GitRepo {
     /// # Errors
     /// 状态迭代失败时返回 [`BackendError::Status`]。
     pub fn status(&self) -> Result<ChangeSet> {
+        self.status_with_ignored(false)
+    }
+
+    /// [`Self::status`] 的「显示忽略文件」版本。
+    ///
+    /// `include_ignored` 为真时额外遍历 `.gitignore` 命中的条目，并以
+    /// `!!` 条目加入结果（忽略目录按目录折叠，对齐 `git status --ignored`）。
+    /// 忽略文件只在提交面板勾选「显示已忽略的文件」时请求，避免默认刷新
+    /// 为一棵巨大的 `target/` 树付出遍历代价。
+    ///
+    /// # Errors
+    /// 状态迭代失败时返回 [`BackendError::Status`]。
+    pub fn status_with_ignored(&self, include_ignored: bool) -> Result<ChangeSet> {
         let began = Instant::now();
 
-        let platform = self
+        let mut platform = self
             .inner
             .status(gix::progress::Discard)
             .map_err(|err| BackendError::Status(err.to_string()))?
             .untracked_files(gix::status::UntrackedFiles::Collapsed);
+
+        if include_ignored {
+            platform = platform.dirwalk_options(|options| {
+                options.emit_ignored(Some(gix::dir::walk::EmissionMode::CollapseDirectory))
+            });
+        }
 
         let iter = platform
             .into_iter(std::iter::empty::<gix::bstr::BString>())
@@ -475,7 +520,12 @@ impl GitRepo {
             }
         }
 
-        self.record("git status --porcelain=v1（内置引擎）", began, None);
+        let command = if include_ignored {
+            "git status --porcelain=v1 --ignored（内置引擎）"
+        } else {
+            "git status --porcelain=v1（内置引擎）"
+        };
+        self.record(command, began, None);
         Ok(accumulator.into_change_set())
     }
 
@@ -995,6 +1045,8 @@ struct StatusAccumulator {
     worktree: BTreeMap<String, StatusFlag>,
     /// 未跟踪路径（porcelain 的 `??`）；独立成行，不参与 `X`/`Y` 合并。
     untracked: BTreeSet<String>,
+    /// 已忽略路径（porcelain 的 `!!`）；仅在请求中显式开启时才会出现。
+    ignored: BTreeSet<String>,
     /// 冲突路径 → 冲突类型（porcelain 的 `UU`/`AA`/…）。
     conflicted: BTreeMap<String, ConflictKind>,
 }
@@ -1042,6 +1094,18 @@ impl StatusAccumulator {
     ) {
         use gix::status::index_worktree::iter::Summary;
 
+        // 忽略条目不是 `Summary`（gix 会把它们过滤成 None），必须在摘要前识别。
+        if let gix::status::index_worktree::Item::DirectoryContents { entry, .. } = item {
+            if matches!(entry.status, gix::dir::entry::Status::Ignored(_)) {
+                let mut path = bs(item.rela_path());
+                if entry.disk_kind == Some(gix::dir::entry::Kind::Directory) {
+                    path.push('/');
+                }
+                self.ignored.insert(path);
+                return;
+            }
+        }
+
         let Some(summary) = item.summary() else {
             // 仅表示索引条目需要更新，或目录遍历产生的非未跟踪项 —— 不构成状态变化。
             return;
@@ -1086,11 +1150,12 @@ impl StatusAccumulator {
             staged,
             worktree,
             untracked,
+            ignored,
             conflicted,
         } = self;
 
         let mut entries: Vec<StatusEntry> = Vec::with_capacity(
-            conflicted.len() + staged.len().max(worktree.len()) + untracked.len(),
+            conflicted.len() + staged.len().max(worktree.len()) + untracked.len() + ignored.len(),
         );
 
         // 冲突路径在 porcelain 里只输出冲突码，不再输出 `X`/`Y`。
@@ -1122,11 +1187,19 @@ impl StatusAccumulator {
         }
 
         // 未跟踪独立成行（见 [`StatusAccumulator`] 的说明）。
-        for path in untracked {
-            if conflicted.contains_key(&path) {
+        for path in &untracked {
+            if conflicted.contains_key(path) {
                 continue;
             }
-            entries.push(StatusEntry::untracked(path));
+            entries.push(StatusEntry::untracked(path.clone()));
+        }
+
+        // 忽略条目同样独立成行；默认路径下集合为空，不产生额外开销。
+        for path in ignored {
+            if untracked.contains(&path) || conflicted.contains_key(&path) {
+                continue;
+            }
+            entries.push(StatusEntry::ignored(path));
         }
 
         ChangeSet::new(entries)
@@ -1156,6 +1229,109 @@ fn is_collapsed_directory(item: &gix::status::index_worktree::Item) -> bool {
         }
         _ => false,
     }
+}
+
+/// 从仓库根 `Cargo.toml` 读取工作区成员，作为「模块」分组的模块表。
+///
+/// 只处理工作区成员与根包两种形态：成员支持 `crates/*` 这类末段通配，
+/// 复杂 glob 直接忽略（宁可少一个模块，也不猜错归属）。非 Cargo 仓库
+/// 返回空表，由界面退化为按顶层目录分组。
+fn detect_repo_modules(root: &Path) -> Vec<RepoModule> {
+    let Ok(manifest) = fs::read_to_string(root.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let Ok(value) = manifest.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+
+    let mut member_dirs = BTreeSet::new();
+    let mut excluded = BTreeSet::new();
+    if let Some(workspace) = value.get("workspace") {
+        if let Some(members) = workspace.get("members").and_then(toml::Value::as_array) {
+            for member in members.iter().filter_map(toml::Value::as_str) {
+                collect_member_dirs(root, member, &mut member_dirs);
+            }
+        }
+        if let Some(excludes) = workspace.get("exclude").and_then(toml::Value::as_array) {
+            for path in excludes.iter().filter_map(toml::Value::as_str) {
+                excluded.insert(normalize_relative_path(path));
+            }
+        }
+    }
+
+    let mut modules = Vec::new();
+    for rel in member_dirs {
+        if is_excluded_member(&rel, &excluded) {
+            continue;
+        }
+        let manifest = fs::read_to_string(root.join(&rel).join("Cargo.toml")).ok();
+        let parsed = manifest.and_then(|text| text.parse::<toml::Value>().ok());
+        let name = parsed
+            .as_ref()
+            .and_then(|value| value.get("package"))
+            .and_then(|package| package.get("name"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                Path::new(&rel)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            });
+        let Some(name) = name else {
+            continue;
+        };
+        modules.push(RepoModule { name, path: rel });
+    }
+
+    // 根包（非工作区仓库，或同时是 package 的虚拟根）。
+    if let Some(name) = value
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+    {
+        if modules.iter().all(|module| !module.path.is_empty()) {
+            modules.push(RepoModule {
+                name: name.to_owned(),
+                path: String::new(),
+            });
+        }
+    }
+
+    modules.sort_by(|left, right| left.path.cmp(&right.path));
+    modules
+}
+
+/// 展开一个 workspace member：支持末段 `*` 通配，其它 glob 语法忽略。
+fn collect_member_dirs(root: &Path, member: &str, out: &mut BTreeSet<String>) {
+    let member = normalize_relative_path(member);
+    if let Some(prefix) = member.strip_suffix("/*") {
+        let Ok(entries) = fs::read_dir(root.join(prefix)) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.path().join("Cargo.toml").is_file() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                out.insert(format!("{prefix}/{name}"));
+            }
+        }
+    } else if !member.contains(['*', '?', '[']) {
+        out.insert(member);
+    }
+}
+
+/// 统一成仓库相对路径：`/` 分隔、无首尾斜杠。
+fn normalize_relative_path(path: &str) -> String {
+    path.replace('\\', "/").trim_matches('/').to_owned()
+}
+
+/// member 是否被 workspace.exclude 覆盖（含子目录）。
+fn is_excluded_member(member: &str, excluded: &BTreeSet<String>) -> bool {
+    excluded.iter().any(|path| {
+        member == path
+            || member
+                .strip_prefix(path)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 /// 由索引三阶段推导冲突类型（`git status` 的 `XY` 冲突码）。
@@ -1684,5 +1860,89 @@ mod tests {
             }),
             " --no-merges --topo-order"
         );
+    }
+
+    /// 模块识别：工作区成员（含末段通配、exclude、根包）按包名收录。
+    #[test]
+    fn cargo_workspace_members_become_modules() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        let root = std::env::temp_dir().join(format!(
+            "knotwork-modules-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["crates/alpha", "crates/beta", "crates/skip", "app"] {
+            std::fs::create_dir_all(root.join(dir)).expect("建模块目录");
+        }
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"
+[workspace]
+members = ["crates/*", "app"]
+exclude = ["crates/skip"]
+
+[package]
+name = "root-demo"
+"#,
+        )
+        .expect("写根清单");
+        std::fs::write(
+            root.join("crates/alpha/Cargo.toml"),
+            "[package]\nname = \"alpha-core\"\n",
+        )
+        .expect("写 alpha");
+        std::fs::write(
+            root.join("crates/beta/Cargo.toml"),
+            "[package]\nname = \"beta-ui\"\n",
+        )
+        .expect("写 beta");
+        std::fs::write(
+            root.join("crates/skip/Cargo.toml"),
+            "[package]\nname = \"skip-me\"\n",
+        )
+        .expect("写 skip");
+        std::fs::write(
+            root.join("app/Cargo.toml"),
+            "[package]\nname = \"demo-app\"\n",
+        )
+        .expect("写 app");
+
+        let modules = super::detect_repo_modules(&root);
+        let pairs: Vec<(&str, &str)> = modules
+            .iter()
+            .map(|module| (module.path.as_str(), module.name.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("", "root-demo"),
+                ("app", "demo-app"),
+                ("crates/alpha", "alpha-core"),
+                ("crates/beta", "beta-ui"),
+            ],
+            "成员按路径排序，exclude 生效，根包单列"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 模块识别：没有 Cargo 清单时返回空表（界面退化为顶层目录）。
+    #[test]
+    fn non_cargo_repo_has_no_modules() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        let root = std::env::temp_dir().join(format!(
+            "knotwork-no-modules-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("建临时目录");
+        assert!(super::detect_repo_modules(&root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

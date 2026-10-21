@@ -57,15 +57,18 @@ export struct LogRow {
 
 // 本地更改列表的一行。
 //
-// 列表把「已暂存 / 未暂存」分组头与文件行放在同一个 ListView 里：
-// `kind == 1` 是分组头，`row-index == -1`；文件行用 `row-index` 回指
-// `ChangeSet.entries` 的下标，点击时不能再用 ListView 的行号。
+// 列表把「已暂存 / 未暂存 / 已忽略」分组头、模块节点、目录节点与文件行
+// 放在同一个 ListView 里：`kind == 1` 是分组头（`row-index == -1`），
+// `kind == 2` 是模块节点，`kind == 3` 是目录节点；文件行用 `row-index`
+// 回指 `ChangeSet.entries` 的下标，点击时不能再用 ListView 的行号。
 export struct ChangeRow {
     row-index: int,
     kind: int,
+    // 0 = 已暂存，1 = 未暂存，2 = 已忽略。
     group: int,
     count: int,
     collapsed: bool,
+    // 完整路径（重命名时为 `旧 -> 新`）；供右键/诊断使用，不作为行文本。
     path: string,
     code: string,
     bucket: string,
@@ -73,6 +76,19 @@ export struct ChangeRow {
     is-selected: bool,
     is-conflict: bool,
     is-untracked: bool,
+    is-ignored: bool,
+    // 树形层级：0 = 分组/模块下第一层，每进一层目录 +1。
+    depth: int,
+    // 显示名：文件行 = 文件名，模块/目录行 = 折叠后的目录名。
+    name: string,
+    // 未启用目录分组时，文件行在名称右侧显示的父目录（淡灰色）。
+    parent-path: string,
+    // 模块 / 目录节点的折叠键；文件行为空。
+    node-key: string,
+    // 模块 / 目录节点的仓库相对路径（文件夹批量操作按此前缀筛选）；其它行为空。
+    node-path: string,
+    // 文件类型图标键（java / json / markdown …），映射见 icons.slint。
+    icon-kind: string,
 }
 
 // Diff 的一行。
@@ -169,6 +185,8 @@ export struct CompareRow {
     code: string,
     status: string,
     selected: bool,
+    // 文件类型图标键（java / json / markdown …），映射见 icons.slint。
+    icon-kind: string,
 }
 
 // 日志详情栏：提交元数据 + 变更文件清单。

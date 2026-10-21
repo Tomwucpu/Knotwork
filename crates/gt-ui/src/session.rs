@@ -29,7 +29,7 @@ use gt_backend::{
     CherryPickRequest, FetchRequest, MergeRequest, MergeStrategy, PatchApplyRequest, PatchSource,
     PullRequest, PullStrategy, PushRequest, PushTarget, RebaseAction, RebaseControl, RebasePlan,
     RebaseProgress, RebaseRequest, RemoteEdit, RemoteInfo, RemoteListing, ResetMode, ResetRequest,
-    RevertRequest, StashEntry, StashOp, TagOp,
+    RevertRequest, RepoModule, StashEntry, StashOp, TagOp,
 };
 use gt_core::{
     ChangeSet, CommitCheck, CommitCheckInput, CommitMeta, HeadInfo, LogNode, RepoState,
@@ -53,7 +53,7 @@ use crate::view_model::{
     discard_confirmation, discard_selection_confirmation, empty_commit_detail, head_text,
     network_error_text, ordered_refs, push_hints, push_preview_text, rc_model,
     rebase_action_from_code, rebase_skip_confirmation, reset_confirmation, resolution_from_code,
-    stash_drop_confirmation, state_banner, take_side_confirmation,
+    stash_drop_confirmation, state_banner, take_side_confirmation, ChangeGrouping, ChangeViewOptions,
 };
 
 /// 距离已加载末尾多少行时预取下一页。
@@ -623,9 +623,16 @@ pub struct Session {
     // ---- 视图状态 ----
     changes: ChangeSet,
     selected_change: Option<usize>,
-    /// 提交面板的两个分组是否折叠。
+    /// 提交面板的三个分组是否折叠。
     staged_collapsed: bool,
     unstaged_collapsed: bool,
+    ignored_collapsed: bool,
+    /// 提交面板的目录 / 模块分组口径与「显示已忽略的文件」开关。
+    change_grouping: ChangeGrouping,
+    /// 已折叠的模块 / 目录节点键（见 `view_model::node_key` 的格式）。
+    collapsed_change_nodes: BTreeSet<String>,
+    /// Cargo 工作区模块表（来自概览；非 Cargo 仓库为空）。
+    modules: Vec<RepoModule>,
     log: LogState,
     selected_log: Option<usize>,
 
@@ -651,7 +658,6 @@ pub struct Session {
     // ---- 提交与分支 ----
     commit_message: String,
     commit_amend: bool,
-    commit_reset_author: bool,
     branch_input: String,
     selected_ref: Option<usize>,
     /// 引用分组折叠状态：HEAD / 本地 / 远程 / 标签 / 其他。
@@ -747,6 +753,7 @@ pub struct Session {
 impl Session {
     /// 新建会话；`console_capacity` 是 Console 面板的环形缓冲容量。
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn new(
         service: Arc<GitService>,
         handle: Arc<RepoHandle>,
@@ -773,6 +780,14 @@ impl Session {
             selected_change: None,
             staged_collapsed: false,
             unstaged_collapsed: false,
+            ignored_collapsed: false,
+            change_grouping: ChangeGrouping {
+                by_directory: true,
+                by_module: false,
+                show_ignored: false,
+            },
+            collapsed_change_nodes: BTreeSet::new(),
+            modules: Vec::new(),
             log: LogState::default(),
             selected_log: None,
             search_query: String::new(),
@@ -790,7 +805,6 @@ impl Session {
             diff_selectable: false,
             commit_message: String::new(),
             commit_amend: false,
-            commit_reset_author: false,
             branch_input: String::new(),
             selected_ref: None,
             refs_collapsed: [false; 5],
@@ -1032,14 +1046,25 @@ impl Session {
         }
 
         if dirty.changes {
+            let root_module_name = self.handle.display_name();
             window.set_change_rows(rc_model(build_change_rows(
                 &self.changes,
                 self.selected_change,
-                self.staged_collapsed,
-                self.unstaged_collapsed,
+                &ChangeViewOptions {
+                    staged_collapsed: self.staged_collapsed,
+                    unstaged_collapsed: self.unstaged_collapsed,
+                    ignored_collapsed: self.ignored_collapsed,
+                    grouping: self.change_grouping,
+                    collapsed_nodes: &self.collapsed_change_nodes,
+                    modules: &self.modules,
+                    root_module_name: &root_module_name,
+                },
             )));
             window.set_staged_collapsed(self.staged_collapsed);
             window.set_unstaged_collapsed(self.unstaged_collapsed);
+            window.set_change_group_directory(self.change_grouping.by_directory);
+            window.set_change_group_module(self.change_grouping.by_module);
+            window.set_show_ignored_files(self.change_grouping.show_ignored);
             window.set_change_summary(self.change_summary().into());
             let untracked = self
                 .selected_change
@@ -1159,7 +1184,6 @@ impl Session {
         window.set_staging_mode(self.staging_mode);
         window.set_commit_message(self.commit_message.clone().into());
         window.set_commit_amend(self.commit_amend);
-        window.set_commit_reset_author(self.commit_reset_author);
     }
 
     /// 写远端管理遮罩（列表 / 输入框 / 策略 / 凭据说明）。
@@ -1321,11 +1345,14 @@ impl Session {
         self.dirty.changes = true;
         self.clear_diff_state();
 
-        let untracked = entry.index == gt_core::StatusFlag::Untracked;
+        let new_file = matches!(
+            entry.index,
+            gt_core::StatusFlag::Untracked | gt_core::StatusFlag::Ignored
+        );
         let staged_view = entry.is_staged() && !entry.has_unstaged();
         self.diff_staged_view = staged_view;
 
-        let sides = if untracked {
+        let sides = if new_file {
             (DiffSide::Empty, DiffSide::Worktree)
         } else if staged_view {
             // 已暂存：HEAD（或空树，尚未有提交时）vs 索引。
@@ -1398,12 +1425,6 @@ impl Session {
         self.dirty.commit = true;
     }
 
-    /// 切换"重置作者"。
-    pub fn set_reset_author(&mut self, reset: bool) {
-        self.commit_reset_author = reset;
-        self.dirty.commit = true;
-    }
-
     /// 请求提交（先过检查，再投递写请求）。
     pub fn request_commit(&mut self) {
         self.commit_then_push = false;
@@ -1431,7 +1452,7 @@ impl Session {
             WriteRequest::Commit(gt_backend::CommitRequest {
                 message: self.commit_message.clone(),
                 amend: self.commit_amend,
-                reset_author: self.commit_reset_author,
+                reset_author: false,
                 allow_empty: false,
             }),
             PendingWrite::Commit,
@@ -1476,6 +1497,10 @@ impl Session {
 
     /// 暂存当前选中的更改。
     pub fn stage_selected_change(&mut self) {
+        if self.selected_change_is_ignored() {
+            self.show_toast(text::tr("已忽略的文件不参与提交"));
+            return;
+        }
         let Some(paths) = self.selected_paths() else {
             self.show_toast(text::tr("请先选择一个文件"));
             return;
@@ -1492,13 +1517,93 @@ impl Session {
         self.submit_write(WriteRequest::Unstage(paths), PendingWrite::Other);
     }
 
+    /// 暂存单个文件（行内悬停按钮；不改变当前选择）。
+    pub fn stage_change(&mut self, index: usize) {
+        let Some(entry) = self.changes.entries.get(index) else {
+            return;
+        };
+        if entry.is_conflicted()
+            || matches!(
+                entry.bucket(),
+                StatusBucket::Staged | StatusBucket::Ignored
+            )
+        {
+            return;
+        }
+        self.submit_write(
+            WriteRequest::Stage(vec![entry.path.clone()]),
+            PendingWrite::Other,
+        );
+    }
+
+    /// 反暂存单个文件（行内悬停按钮；不改变当前选择）。
+    pub fn unstage_change(&mut self, index: usize) {
+        let Some(entry) = self.changes.entries.get(index) else {
+            return;
+        };
+        if !entry.is_staged() || entry.is_conflicted() {
+            return;
+        }
+        self.submit_write(
+            WriteRequest::Unstage(vec![entry.path.clone()]),
+            PendingWrite::Other,
+        );
+    }
+
+    /// 暂存某个目录 / 模块下的全部文件（文件夹行悬停按钮）。
+    pub fn stage_path(&mut self, prefix: &str) {
+        let paths: Vec<String> = self
+            .changes
+            .entries
+            .iter()
+            .filter(|entry| {
+                !entry.is_conflicted()
+                    && !matches!(
+                        entry.bucket(),
+                        StatusBucket::Staged | StatusBucket::Ignored
+                    )
+                    && path_is_under(&entry.path, prefix)
+            })
+            .map(|entry| entry.path.clone())
+            .collect();
+        if paths.is_empty() {
+            self.show_toast(text::tr("没有可暂存的文件"));
+            return;
+        }
+        self.submit_write(WriteRequest::Stage(paths), PendingWrite::Other);
+    }
+
+    /// 反暂存某个目录 / 模块下的全部文件（文件夹行悬停按钮）。
+    pub fn unstage_path(&mut self, prefix: &str) {
+        let paths: Vec<String> = self
+            .changes
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.is_staged()
+                    && !entry.is_conflicted()
+                    && path_is_under(&entry.path, prefix)
+            })
+            .map(|entry| entry.path.clone())
+            .collect();
+        if paths.is_empty() {
+            self.show_toast(text::tr("没有可反暂存的文件"));
+            return;
+        }
+        self.submit_write(WriteRequest::Unstage(paths), PendingWrite::Other);
+    }
+
     /// 暂存「未暂存」分组中的全部文件（冲突文件留给三路编辑器）。
     pub fn stage_all_changes(&mut self) {
         let paths: Vec<String> = self
             .changes
             .entries
             .iter()
-            .filter(|entry| entry.bucket() != StatusBucket::Staged && !entry.is_conflicted())
+            .filter(|entry| {
+                entry.bucket() != StatusBucket::Staged
+                    && entry.bucket() != StatusBucket::Ignored
+                    && !entry.is_conflicted()
+            })
             .map(|entry| entry.path.clone())
             .collect();
         if paths.is_empty() {
@@ -1524,18 +1629,71 @@ impl Session {
         self.submit_write(WriteRequest::Unstage(paths), PendingWrite::Other);
     }
 
-    /// 折叠 / 展开提交面板的分组（0 = 已暂存，1 = 未暂存）。
+    /// 折叠 / 展开提交面板的分组（0 = 已暂存，1 = 未暂存，2 = 已忽略）。
     pub fn toggle_change_group(&mut self, group: i32) {
-        if group == 0 {
-            self.staged_collapsed = !self.staged_collapsed;
-        } else {
-            self.unstaged_collapsed = !self.unstaged_collapsed;
+        match group {
+            0 => self.staged_collapsed = !self.staged_collapsed,
+            1 => self.unstaged_collapsed = !self.unstaged_collapsed,
+            2 => self.ignored_collapsed = !self.ignored_collapsed,
+            _ => return,
+        }
+        self.dirty.changes = true;
+    }
+
+    /// 切换分组口径（0 = 目录，1 = 模块）。
+    ///
+    /// 两项可同时开启：模块在外层、目录在内层，与 IDEA 的多级分组一致。
+    pub fn toggle_change_grouping(&mut self, kind: i32) {
+        match kind {
+            0 => self.change_grouping.by_directory = !self.change_grouping.by_directory,
+            1 => self.change_grouping.by_module = !self.change_grouping.by_module,
+            _ => return,
+        }
+        self.dirty.changes = true;
+    }
+
+    /// 切换「显示已忽略的文件」。
+    ///
+    /// 忽略条目由状态请求的 `include_ignored` 决定，因此开关变化必须重发
+    /// 一次状态请求；在飞的旧请求会被代次闸门作废。
+    pub fn toggle_show_ignored(&mut self) {
+        self.change_grouping.show_ignored = !self.change_grouping.show_ignored;
+        self.dirty.changes = true;
+        self.status_in_flight = false;
+        self.request_status();
+    }
+
+    /// 展开全部：分组头与所有模块 / 目录节点一并展开。
+    pub fn expand_all_changes(&mut self) {
+        self.staged_collapsed = false;
+        self.unstaged_collapsed = false;
+        self.ignored_collapsed = false;
+        self.collapsed_change_nodes.clear();
+        self.dirty.changes = true;
+    }
+
+    /// 折叠全部：收起三个分组头（模块 / 目录折叠状态保留，展开分组后恢复）。
+    pub fn collapse_all_changes(&mut self) {
+        self.staged_collapsed = true;
+        self.unstaged_collapsed = true;
+        self.ignored_collapsed = true;
+        self.dirty.changes = true;
+    }
+
+    /// 折叠 / 展开一个模块或目录节点。
+    pub fn toggle_change_node(&mut self, key: &str) {
+        if !self.collapsed_change_nodes.remove(key) {
+            self.collapsed_change_nodes.insert(key.to_owned());
         }
         self.dirty.changes = true;
     }
 
     /// 请求丢弃当前选中更改的修改（需强确认）。
     pub fn request_discard_change(&mut self) {
+        if self.selected_change_is_ignored() {
+            self.show_toast(text::tr("已忽略的文件不参与提交"));
+            return;
+        }
         let Some(paths) = self.selected_paths() else {
             self.show_toast(text::tr("请先选择一个文件"));
             return;
@@ -1581,6 +1739,13 @@ impl Session {
             .selected_change
             .and_then(|index| self.changes.entries.get(index))?;
         Some(vec![entry.path.clone()])
+    }
+
+    /// 当前选中的是否是「已忽略」条目（只读展示，不参与任何写操作）。
+    fn selected_change_is_ignored(&self) -> bool {
+        self.selected_change
+            .and_then(|index| self.changes.entries.get(index))
+            .is_some_and(|entry| entry.bucket() == StatusBucket::Ignored)
     }
 
     // -------------------------------------------------------- hunk / 行级写操作
@@ -2629,7 +2794,13 @@ impl Session {
         }
         self.status_in_flight = self
             .service
-            .request(self.handle.id(), RequestKind::Status, self.sender.clone())
+            .request(
+                self.handle.id(),
+                RequestKind::Status {
+                    include_ignored: self.change_grouping.show_ignored,
+                },
+                self.sender.clone(),
+            )
             .is_ok();
     }
 
@@ -2723,6 +2894,11 @@ impl Session {
                 self.user_email.clone_from(&overview.user_email);
                 self.read_only.clone_from(&overview.read_only);
                 self.rebase.clone_from(&overview.rebase);
+                if self.modules != overview.modules {
+                    self.modules.clone_from(&overview.modules);
+                    // 模块表变化会改变「按模块分组」的行结构。
+                    self.dirty.changes = true;
+                }
                 self.dirty.header = true;
                 self.dirty.refs = true;
                 self.dirty.commit = true;
@@ -3017,10 +3193,20 @@ impl Session {
     }
 }
 
+/// 路径是否位于目录前缀之下（空前缀表示仓库根）。
+///
+/// 折叠的未跟踪目录在状态里带尾随 `/`，因此 `docs/` 必须匹配前缀 `docs`。
+fn path_is_under(path: &str, prefix: &str) -> bool {
+    prefix.is_empty()
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// 更新策略 → 界面下标（0 合并 / 1 变基 / 2 仅快进）。
 #[must_use]
-fn strategy_index(strategy: PullStrategy) -> i32 {
-    match strategy {
+fn strategy_index(strategy: PullStrategy) -> i32 {    match strategy {
         PullStrategy::Merge => 0,
         PullStrategy::Rebase => 1,
         PullStrategy::FastForwardOnly => 2,
@@ -4353,7 +4539,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_log_page, Confirm, LogState, LOG_PAGE_SIZE, PREFETCH_MARGIN};
+    use super::{append_log_page, path_is_under, Confirm, LogState, LOG_PAGE_SIZE, PREFETCH_MARGIN};
     use gt_core::{CommitMeta, Oid};
 
     fn commit(byte: u8, parents: Vec<Oid>) -> CommitMeta {
@@ -4629,4 +4815,13 @@ mod tests {
 
     /// 预取窗口应当远小于单页，否则会在第一页就立刻再请求一页。
     const _: () = assert!(PREFETCH_MARGIN < LOG_PAGE_SIZE);
+
+    #[test]
+    fn path_prefix_matching_is_segment_aware() {
+        assert!(path_is_under("src/a.rs", "src"));
+        assert!(path_is_under("docs/", "docs"), "折叠目录带尾随斜杠也要命中");
+        assert!(path_is_under("a.rs", ""), "空前缀表示仓库根");
+        assert!(!path_is_under("src-tools/a.rs", "src"), "不能按字符前缀误判");
+        assert!(!path_is_under("src", "src/a.rs"));
+    }
 }

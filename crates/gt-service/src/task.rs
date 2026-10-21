@@ -553,7 +553,10 @@ pub enum RequestKind {
     /// 分成三次请求只会多两次线程往返。
     Overview,
     /// 工作区状态（Local Changes 视图）。
-    Status,
+    Status {
+        /// 是否把 `.gitignore` 命中的条目一并返回（提交面板「显示已忽略的文件」）。
+        include_ignored: bool,
+    },
     /// 日志页。
     LogPage(LogPageRequest),
     /// 两个修订之间的文件级变更。
@@ -713,7 +716,7 @@ impl RequestKind {
     pub const fn lane(&self) -> RequestLane {
         match self {
             Self::Overview => RequestLane::Overview,
-            Self::Status => RequestLane::Status,
+            Self::Status { .. } => RequestLane::Status,
             Self::LogPage(_) | Self::Search(_) | Self::CommitFiles { .. } => RequestLane::Log,
             // 差异族（含 Blame / 文件历史）共用一条视图通道：它们都在"看
             // 某个文件的内容"，新请求作废旧请求是正确的语义。
@@ -737,7 +740,7 @@ impl RequestKind {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Overview => "仓库概览",
-            Self::Status => "工作区状态",
+            Self::Status { .. } => "工作区状态",
             Self::LogPage(_) => "日志页",
             Self::TreeChanges { .. } => "文件级变更",
             Self::CommitFiles { .. } => "提交文件列表",
@@ -830,6 +833,8 @@ pub struct RepoOverview {
     pub user_email: Option<String>,
     /// 变基进度（FR-MRG-02 的"第 x/y 个"）；无进行中的变基时为 [`None`]。
     pub rebase: Option<RebaseProgress>,
+    /// 提交面板「按模块分组」的模块表（Cargo 工作区成员；可为空）。
+    pub modules: Vec<gt_backend::RepoModule>,
 }
 
 /// 日志页结果。
@@ -973,7 +978,7 @@ mod tests {
     fn request_labels_cover_every_kind() {
         let kinds = [
             RequestKind::Overview,
-            RequestKind::Status,
+            RequestKind::Status { include_ignored: false },
             RequestKind::LogPage(LogPageRequest::default()),
             RequestKind::TreeChanges {
                 old: Some("HEAD~1".to_owned()),
@@ -995,7 +1000,7 @@ mod tests {
     #[test]
     fn every_kind_maps_to_exactly_one_lane() {
         assert_eq!(RequestKind::Overview.lane(), RequestLane::Overview);
-        assert_eq!(RequestKind::Status.lane(), RequestLane::Status);
+        assert_eq!(RequestKind::Status { include_ignored: false }.lane(), RequestLane::Status);
         assert_eq!(
             RequestKind::LogPage(LogPageRequest::default()).lane(),
             RequestLane::Log
@@ -1088,7 +1093,7 @@ mod tests {
 
         let delivery = Delivery {
             generation: Generation::INITIAL,
-            kind: RequestKind::Status,
+            kind: RequestKind::Status { include_ignored: false },
             outcome: Outcome::Failed("x".to_owned()),
         };
         assert_eq!(delivery.clone(), delivery);

@@ -2,6 +2,9 @@
 //
 // 用法：IdeaIcon { name: "refresh"; tint: Palette.icon; }
 // 图标统一按 16px 画布绘制，点击热区由外层 IconButton 负责。
+//
+// FileTypeIcon 使用 expui 的彩色文件类型图标（不走 colorize），
+// 暗色主题自动切到 `_dark` 变体。
 
 import { Palette, Metrics } from "theme.slint";
 
@@ -30,6 +33,9 @@ export component IdeaIcon inherits Image {
         : root.name == "branch" ? @image-url("icons/branch.svg")
         : root.name == "tag" ? @image-url("icons/tag.svg")
         : root.name == "folder" ? @image-url("icons/folder.svg")
+        : root.name == "module" ? @image-url("icons/module.svg")
+        : root.name == "check" ? @image-url("icons/check.svg")
+        : root.name == "menu-corner" ? @image-url("icons/menu-corner.svg")
         : root.name == "commit" ? @image-url("icons/commit.svg")
         : root.name == "fetch" ? @image-url("icons/fetch.svg")
         : root.name == "push" ? @image-url("icons/push.svg")
@@ -41,4 +47,51 @@ export component IdeaIcon inherits Image {
         : root.name == "undo" ? @image-url("icons/undo.svg")
         : root.name == "redo" ? @image-url("icons/redo.svg")
         : @image-url("icons/file.svg");
+}
+
+// 彩色文件类型图标。kind 由 Rust 侧 file_icon_kind() 按文件名/扩展名归一化，
+// 未知类型回落到 text（文本）或 unknown（二进制/不识别）。
+export component FileTypeIcon inherits Image {
+    in property <string> kind: "text";
+    in property <length> icon-size: 14px;
+
+    width: root.icon-size;
+    height: root.icon-size;
+    image-fit: contain;
+
+    source: root.kind == "java" ? (Palette.dark ? @image-url("icons/filetypes/java_dark.svg") : @image-url("icons/filetypes/java.svg"))
+        : root.kind == "js" ? (Palette.dark ? @image-url("icons/filetypes/javaScript_dark.svg") : @image-url("icons/filetypes/javaScript.svg"))
+        : root.kind == "ts" ? (Palette.dark ? @image-url("icons/filetypes/typeScript_dark.svg") : @image-url("icons/filetypes/typeScript.svg"))
+        : root.kind == "vue" ? @image-url("icons/filetypes/vue.svg")
+        : root.kind == "cs" ? (Palette.dark ? @image-url("icons/filetypes/Csharp_dark.svg") : @image-url("icons/filetypes/Csharp.svg"))
+        : root.kind == "c" ? (Palette.dark ? @image-url("icons/filetypes/c_dark.svg") : @image-url("icons/filetypes/c.svg"))
+        : root.kind == "cpp" ? (Palette.dark ? @image-url("icons/filetypes/cpp_dark.svg") : @image-url("icons/filetypes/cpp.svg"))
+        : root.kind == "rust" ? @image-url("icons/filetypes/rust.svg")
+        : root.kind == "html" ? (Palette.dark ? @image-url("icons/filetypes/html_dark.svg") : @image-url("icons/filetypes/html.svg"))
+        : root.kind == "css" ? (Palette.dark ? @image-url("icons/filetypes/css_dark.svg") : @image-url("icons/filetypes/css.svg"))
+        : root.kind == "json" ? (Palette.dark ? @image-url("icons/filetypes/json_dark.svg") : @image-url("icons/filetypes/json.svg"))
+        : root.kind == "yaml" ? (Palette.dark ? @image-url("icons/filetypes/yaml_dark.svg") : @image-url("icons/filetypes/yaml.svg"))
+        : root.kind == "toml" ? (Palette.dark ? @image-url("icons/filetypes/toml_dark.svg") : @image-url("icons/filetypes/toml.svg"))
+        : root.kind == "xml" ? (Palette.dark ? @image-url("icons/filetypes/xml_dark.svg") : @image-url("icons/filetypes/xml.svg"))
+        : root.kind == "properties" ? (Palette.dark ? @image-url("icons/filetypes/properties_dark.svg") : @image-url("icons/filetypes/properties.svg"))
+        : root.kind == "config" ? (Palette.dark ? @image-url("icons/filetypes/config_dark.svg") : @image-url("icons/filetypes/config.svg"))
+        : root.kind == "markdown" ? (Palette.dark ? @image-url("icons/filetypes/markdown_dark.svg") : @image-url("icons/filetypes/markdown.svg"))
+        : root.kind == "csv" ? (Palette.dark ? @image-url("icons/filetypes/csv_dark.svg") : @image-url("icons/filetypes/csv.svg"))
+        : root.kind == "sql" ? (Palette.dark ? @image-url("icons/filetypes/sql_dark.svg") : @image-url("icons/filetypes/sql.svg"))
+        : root.kind == "shell" ? (Palette.dark ? @image-url("icons/filetypes/shell_dark.svg") : @image-url("icons/filetypes/shell.svg"))
+        : root.kind == "docker" ? (Palette.dark ? @image-url("icons/filetypes/docker_dark.svg") : @image-url("icons/filetypes/docker.svg"))
+        : root.kind == "gradle" ? (Palette.dark ? @image-url("icons/filetypes/gradle_dark.svg") : @image-url("icons/filetypes/gradle.svg"))
+        : root.kind == "gitignore" ? @image-url("icons/filetypes/gitignore.svg")
+        : root.kind == "editorconfig" ? (Palette.dark ? @image-url("icons/filetypes/editorConfig_dark.svg") : @image-url("icons/filetypes/editorConfig.svg"))
+        : root.kind == "manifest" ? (Palette.dark ? @image-url("icons/filetypes/manifest_dark.svg") : @image-url("icons/filetypes/manifest.svg"))
+        : root.kind == "patch" ? (Palette.dark ? @image-url("icons/filetypes/patch_dark.svg") : @image-url("icons/filetypes/patch.svg"))
+        : root.kind == "graphql" ? (Palette.dark ? @image-url("icons/filetypes/graphql_dark.svg") : @image-url("icons/filetypes/graphql.svg"))
+        : root.kind == "terraform" ? (Palette.dark ? @image-url("icons/filetypes/terraform_dark.svg") : @image-url("icons/filetypes/terraform.svg"))
+        : root.kind == "jupyter" ? (Palette.dark ? @image-url("icons/filetypes/jupyter_dark.svg") : @image-url("icons/filetypes/jupyter.svg"))
+        : root.kind == "font" ? (Palette.dark ? @image-url("icons/filetypes/font_dark.svg") : @image-url("icons/filetypes/font.svg"))
+        : root.kind == "image" ? (Palette.dark ? @image-url("icons/filetypes/image_dark.svg") : @image-url("icons/filetypes/image.svg"))
+        : root.kind == "archive" ? (Palette.dark ? @image-url("icons/filetypes/archive_dark.svg") : @image-url("icons/filetypes/archive.svg"))
+        : root.kind == "binary" ? (Palette.dark ? @image-url("icons/filetypes/binaryData_dark.svg") : @image-url("icons/filetypes/binaryData.svg"))
+        : root.kind == "unknown" ? (Palette.dark ? @image-url("icons/filetypes/unknown_dark.svg") : @image-url("icons/filetypes/unknown.svg"))
+        : (Palette.dark ? @image-url("icons/filetypes/text_dark.svg") : @image-url("icons/filetypes/text.svg"));
 }

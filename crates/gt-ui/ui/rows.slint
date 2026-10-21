@@ -7,7 +7,7 @@
 import { Palette, Metrics } from "theme.slint";
 import { Texts } from "texts.slint";
 import { BlameRow, GraphCell, RefBadge } from "model.slint";
-import { IdeaIcon } from "icons.slint";
+import { IdeaIcon, FileTypeIcon } from "icons.slint";
 import { IdeaRefBadge } from "widgets.slint";
 
 
@@ -34,6 +34,7 @@ export component LogRowView inherits Rectangle {
 
     HorizontalLayout {
         spacing: 0px;
+        cross-axis-alignment: center;
 
         // 泳道图：每列一个格子，格子内部自绘连线与节点。
         Rectangle {
@@ -89,6 +90,7 @@ export component LogRowView inherits Rectangle {
             HorizontalLayout {
                 padding-left: 4px;
                 spacing: 4px;
+                cross-axis-alignment: center;
 
                 for badge in root.refs: IdeaRefBadge {
                     text: badge.name;
@@ -140,8 +142,8 @@ export component LogRowView inherits Rectangle {
                 // 菜单贴在该行的左边缘展开：`PointerEvent` 不提供光标坐标，
                 // 而"点击哪一行就在哪一行旁边弹出"本来就是上下文菜单的语义。
                 root.context-clicked(
-                    touch.absolute-position.x + 48px,
-                    touch.absolute-position.y);
+                    touch.absolute-position.x + touch.mouse-x,
+                    touch.absolute-position.y + touch.mouse-y);
             }
         }
     }
@@ -222,8 +224,8 @@ export component DiffRowView inherits Rectangle {
 
 export component CommitFileRowView inherits Rectangle {
     in property <string> path;
-    in property <string> code;
     in property <string> status;
+    in property <string> icon-kind;
     in property <bool> selected;
     callback clicked();
 
@@ -236,20 +238,11 @@ export component CommitFileRowView inherits Rectangle {
         padding-left: 6px;
         padding-right: 8px;
         spacing: 6px;
+        cross-axis-alignment: center;
 
-        IdeaIcon {
-            name: "file";
+        FileTypeIcon {
+            kind: root.icon-kind;
             icon-size: 14px;
-            tint: Palette.text-faint;
-        }
-
-        Text {
-            width: 22px;
-            text: root.code;
-            color: Palette.amber;
-            font-size: Palette.font-meta;
-            font-family: Palette.mono-font;
-            vertical-alignment: center;
         }
 
         Text {
@@ -283,20 +276,28 @@ export component ChangeGroupRowView inherits Rectangle {
     in property <int> group;
     in property <int> count;
     in property <bool> collapsed;
+    // 已忽略分组只读展示，不提供全部暂存 / 反暂存动作。
+    in property <bool> show-action: true;
     callback toggled();
     callback action();
 
     height: 28px;
-    background: touch.has-hover ? Palette.hover : Palette.panel;
+    background: touch.has-hover || action-touch.has-hover ? Palette.hover : Palette.panel;
+
+    // 行热区放在内容之前，右侧动作按钮才能拿到点击。
+    touch := TouchArea {
+        clicked => { root.toggled(); }
+    }
 
     HorizontalLayout {
         padding-left: 10px;
         padding-right: 6px;
         spacing: 6px;
+        cross-axis-alignment: center;
 
         IdeaIcon {
             name: root.collapsed ? "chevron-right" : "chevron-down";
-            icon-size: 12px;
+            icon-size: 14px;
             tint: Palette.text-faint;
         }
 
@@ -321,6 +322,7 @@ export component ChangeGroupRowView inherits Rectangle {
             width: 22px;
             height: 22px;
             border-radius: Palette.radius-xs;
+            visible: root.show-action && (touch.has-hover || action-touch.has-hover);
             background: action-touch.has-hover ? Palette.action-hover : transparent;
 
             IdeaIcon {
@@ -336,55 +338,57 @@ export component ChangeGroupRowView inherits Rectangle {
             }
         }
     }
-
-    touch := TouchArea {
-        clicked => { root.toggled(); }
-    }
 }
 
 
-export component ChangeRowView inherits Rectangle {
-    in property <int> row-index;
+// 模块 / 目录节点：缩进由 depth 决定，点击整行折叠或展开。
+// 悬停时右侧出现按目录 / 模块批量暂存或反暂存的按钮。
+export component ChangeNodeRowView inherits Rectangle {
+    in property <string> name;
+    in property <int> count;
+    in property <int> depth;
+    in property <bool> collapsed;
+    in property <bool> is-module;
     in property <int> group;
-    in property <string> path;
-    in property <string> code;
-    in property <string> bucket;
-    in property <string> note;
-    in property <bool> is-selected;
-    in property <bool> is-conflict;
-    in property <bool> is-untracked;
-    callback clicked();
+    in property <bool> is-ignored;
+    in property <bool> read-only;
+    // 根模块的 node-path 为空，前缀筛选会覆盖全部模块，因此不提供批量按钮。
+    in property <bool> allow-action: true;
+    callback toggled();
+    callback stage-clicked();
+    callback unstage-clicked();
+
+    property <bool> action-visible: root.allow-action && !root.read-only && !root.is-ignored
+        && (root.group == 0 || root.group == 1);
 
     height: Metrics.list-row-height;
-    background: root.is-selected
-        ? Palette.selection
-        : (touch.has-hover ? Palette.hover : transparent);
+    background: row-touch.has-hover || node-action-touch.has-hover ? Palette.hover : transparent;
+
+    row-touch := TouchArea {
+        clicked => { root.toggled(); }
+    }
 
     HorizontalLayout {
-        padding-left: 30px;
-        padding-right: 8px;
+        // 20px 步长 = 箭头 14px + 间距 6px：下一级箭头正好对齐父文件夹图标。
+        padding-left: 10px + root.depth * 20px;
+        padding-right: 4px;
         spacing: 6px;
+        cross-axis-alignment: center;
 
         IdeaIcon {
-            name: "file";
+            name: root.collapsed ? "chevron-right" : "chevron-down";
             icon-size: 14px;
-            tint: root.is-selected ? Palette.icon-hover : Palette.text-faint;
+            tint: Palette.text-faint;
+        }
+
+        IdeaIcon {
+            name: root.is-module ? "module" : "folder";
+            icon-size: 14px;
+            tint: Palette.icon;
         }
 
         Text {
-            width: 20px;
-            text: root.code;
-            color: root.is-conflict
-                ? Palette.red
-                : (root.is-untracked ? Palette.text-faint : Palette.amber);
-            font-size: Palette.font-meta;
-            font-family: Palette.mono-font;
-            vertical-alignment: center;
-        }
-
-        Text {
-            horizontal-stretch: 1;
-            text: root.path;
+            text: root.name;
             color: Palette.text;
             font-size: Palette.font-md;
             vertical-alignment: center;
@@ -392,7 +396,116 @@ export component ChangeRowView inherits Rectangle {
         }
 
         Text {
-            width: 150px;
+            text: root.count + Texts.s164;
+            color: Palette.text-faint;
+            font-size: Palette.font-meta;
+            vertical-alignment: center;
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+
+        Rectangle {
+            width: 22px;
+            height: 22px;
+            border-radius: Palette.radius-xs;
+            visible: root.action-visible && (row-touch.has-hover || node-action-touch.has-hover);
+            background: node-action-touch.has-hover ? Palette.action-hover : transparent;
+
+            IdeaIcon {
+                name: root.group == 0 ? "remove" : "add";
+                icon-size: 14px;
+                tint: Palette.icon;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+
+            node-action-touch := TouchArea {
+                clicked => {
+                    if root.group == 0 {
+                        root.unstage-clicked();
+                    } else {
+                        root.stage-clicked();
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+export component ChangeRowView inherits Rectangle {
+    in property <int> row-index;
+    in property <int> group;
+    in property <int> depth;
+    in property <string> name;
+    in property <string> parent-path;
+    in property <string> bucket;
+    in property <string> note;
+    in property <string> icon-kind;
+    in property <bool> is-selected;
+    in property <bool> is-conflict;
+    in property <bool> is-untracked;
+    in property <bool> is-ignored;
+    in property <bool> read-only;
+    callback clicked();
+    callback context-clicked(length, length);
+    callback stage-clicked();
+    callback unstage-clicked();
+
+    property <bool> action-visible: !root.read-only && !root.is-ignored && !root.is-conflict
+        && (root.group == 0 || root.group == 1);
+
+    height: Metrics.list-row-height;
+    background: root.is-selected
+        ? Palette.selection
+        : (row-touch.has-hover || action-touch.has-hover ? Palette.hover : transparent);
+
+    // 整行点击 / 右键热区放在内容之前：后面的悬停按钮才能拿到点击。
+    row-touch := TouchArea {
+        clicked => { root.clicked(); }
+        pointer-event(event) => {
+            if event.button == PointerEventButton.right && event.kind == PointerEventKind.down {
+                root.context-clicked(
+                    row-touch.absolute-position.x + row-touch.mouse-x,
+                    row-touch.absolute-position.y + row-touch.mouse-y);
+            }
+        }
+    }
+
+    HorizontalLayout {
+        // 文件行跳过折叠箭头，但仍预留「箭头 14px + 间距 6px」，
+        // 让文件图标与同级目录图标落在同一列。
+        padding-left: 10px + root.depth * 20px + 20px;
+        padding-right: 4px;
+        spacing: 6px;
+        cross-axis-alignment: center;
+
+        FileTypeIcon {
+            kind: root.icon-kind;
+            icon-size: 14px;
+        }
+
+        Text {
+            width: min(self.preferred-width, root.width * 0.45);
+            text: root.name;
+            color: root.is-ignored ? Palette.text-dim : Palette.text;
+            font-size: Palette.font-md;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        // 未启用目录分组时显示父目录；正常树形分组下为空，仅占弹性空间。
+        Text {
+            horizontal-stretch: 1;
+            text: root.parent-path;
+            color: Palette.text-faint;
+            font-size: Palette.font-meta;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            width: root.note == "" ? 0px : 150px;
             text: root.note;
             color: root.is-conflict ? Palette.red : Palette.text-faint;
             font-size: Palette.font-meta;
@@ -400,10 +513,34 @@ export component ChangeRowView inherits Rectangle {
             horizontal-alignment: right;
             overflow: elide;
         }
-    }
 
-    touch := TouchArea {
-        clicked => { root.clicked(); }
+        // 悬停才出现的单文件暂存 / 反暂存按钮；宽度常驻，避免文本跳动。
+        Rectangle {
+            width: 22px;
+            height: 22px;
+            border-radius: Palette.radius-xs;
+            visible: root.action-visible
+                && (row-touch.has-hover || action-touch.has-hover);
+            background: action-touch.has-hover ? Palette.action-hover : transparent;
+
+            IdeaIcon {
+                name: root.group == 0 ? "remove" : "add";
+                icon-size: 14px;
+                tint: Palette.icon;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+
+            action-touch := TouchArea {
+                clicked => {
+                    if root.group == 0 {
+                        root.unstage-clicked();
+                    } else {
+                        root.stage-clicked();
+                    }
+                }
+            }
+        }
     }
 }
 
